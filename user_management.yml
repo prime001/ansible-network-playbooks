@@ -1,0 +1,117 @@
+---
+# 003_user_management.yml
+#
+# User Management Playbook — Cisco IOS / IOS-XE
+#
+# Manages local user accounts on network devices: creates, updates, and
+# removes accounts. Enforces privilege levels and password policies.
+#
+# Credentials are loaded from Ansible Vault:
+#   ansible-vault encrypt_string 'MySecret123!' --name 'ansible_password'
+#
+# Inventory example (inventory/hosts.yml):
+#
+#   all:
+#     vars:
+#       ansible_user: "{{ vault_ansible_user }}"
+#       ansible_password: "{{ vault_ansible_password }}"
+#       ansible_network_os: ios
+#       ansible_connection: network_cli
+#       ansible_become: yes
+#       ansible_become_method: enable
+#       ansible_become_password: "{{ vault_enable_password }}"
+#     children:
+#       core_switches:
+#         hosts:
+#           core-sw-01:
+#             ansible_host: 10.0.0.1
+#           core-sw-02:
+#             ansible_host: 10.0.0.2
+#       routers:
+#         hosts:
+#           edge-rtr-01:
+#             ansible_host: 10.0.1.1
+
+- name: Manage local user accounts on network devices
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
+
+  vars:
+    # Override with --extra-vars or group_vars; secrets via vault
+    managed_users:
+      - name: netops
+        privilege: 15
+        state: present
+        # password_hash loaded from vault: vault_netops_secret
+        secret: "{{ vault_netops_secret }}"
+      - name: readonly
+        privilege: 1
+        state: present
+        secret: "{{ vault_readonly_secret }}"
+      - name: legacy_admin
+        privilege: 15
+        state: absent
+
+    audit_command: "show running-config | section ^username"
+
+  tasks:
+    - name: Verify device connectivity before making changes
+      cisco.ios.ios_command:
+        commands: "show version | include Software"
+      register: version_check
+      retries: 3
+      delay: 5
+      until: version_check is not failed
+
+    - name: Apply user account configuration
+      block:
+        - name: Configure managed user accounts
+          cisco.ios.ios_user:
+            aggregate: "{{ managed_users }}"
+            state: "{{ item.state }}"
+            privilege: "{{ item.privilege }}"
+            configured_password: "{{ item.secret }}"
+            password_type: secret
+            update_password: always
+          loop: "{{ managed_users }}"
+          loop_control:
+            label: "{{ item.name }} (priv={{ item.privilege }}, state={{ item.state }})"
+          register: user_config_result
+          notify: Save device configuration
+
+      rescue:
+        - name: Log failure details
+          ansible.builtin.debug:
+            msg: >
+              User management failed on {{ inventory_hostname }}.
+              Error: {{ ansible_failed_result.msg | default('unknown error') }}
+
+        - name: Abort play for this host on unrecoverable error
+          ansible.builtin.fail:
+            msg: "Halting — manual review required for {{ inventory_hostname }}"
+
+    - name: Retrieve current user configuration for audit
+      cisco.ios.ios_command:
+        commands:
+          - "{{ audit_command }}"
+      register: user_audit
+      changed_when: false
+
+    - name: Display post-change user audit output
+      ansible.builtin.debug:
+        msg: "{{ user_audit.stdout_lines[0] }}"
+
+    - name: Assert no legacy accounts remain in running config
+      ansible.builtin.assert:
+        that:
+          - "'username legacy_admin' not in user_audit.stdout[0]"
+        fail_msg: "Legacy account still present on {{ inventory_hostname }} — investigate immediately"
+        success_msg: "Legacy account confirmed removed from {{ inventory_hostname }}"
+
+  handlers:
+    - name: Save device configuration
+      cisco.ios.ios_command:
+        commands:
+          - command: "write memory"
+      register: save_result
+      failed_when: "'OK' not in save_result.stdout[0] and 'Building configuration' not in save_result.stdout[0]"
