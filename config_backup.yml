@@ -1,0 +1,133 @@
+---
+# 004_config_backup.yml
+# Ansible Playbook: Network Device Configuration Backup
+#
+# Purpose: Retrieves running and startup configurations from network devices,
+#          saves timestamped backups locally, and alerts on any drift detected
+#          between running and startup configs.
+#
+# Supported platforms: Cisco IOS, IOS-XE, NX-OS
+#
+# Credentials: Stored in Ansible Vault — reference vars/vault.yml
+#   ansible-vault create vars/vault.yml
+#   ansible-vault edit vars/vault.yml
+#
+# Example inventory (inventory/network.yml):
+# ---
+# all:
+#   children:
+#     cisco_ios:
+#       hosts:
+#         core-sw-01:
+#           ansible_host: 10.0.1.1
+#           ansible_network_os: ios
+#         dist-rtr-01:
+#           ansible_host: 10.0.1.2
+#           ansible_network_os: ios
+#     nxos:
+#       hosts:
+#         dc-sw-01:
+#           ansible_host: 10.0.2.1
+#           ansible_network_os: nxos
+#   vars:
+#     ansible_connection: network_cli
+#     ansible_user: "{{ vault_net_user }}"
+#     ansible_password: "{{ vault_net_pass }}"
+#     ansible_become: true
+#     ansible_become_method: enable
+#     ansible_become_password: "{{ vault_enable_pass }}"
+
+- name: Network Device Configuration Backup
+  hosts: all
+  gather_facts: false
+
+  vars:
+    backup_root: "{{ playbook_dir }}/backups"
+    timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+    backup_dir: "{{ backup_root }}/{{ inventory_hostname }}"
+    # vault_net_user, vault_net_pass, vault_enable_pass — defined in vars/vault.yml
+
+  pre_tasks:
+    - name: Ensure backup directory exists for host
+      delegate_to: localhost
+      file:
+        path: "{{ backup_dir }}"
+        state: directory
+        mode: "0750"
+
+  tasks:
+    - name: Capture running configuration
+      block:
+        - name: Fetch running-config
+          cli_command:
+            command: show running-config
+          register: running_cfg
+          retries: 3
+          delay: 5
+          until: running_cfg is not failed
+
+        - name: Save running-config to file
+          delegate_to: localhost
+          copy:
+            content: "{{ running_cfg.stdout }}"
+            dest: "{{ backup_dir }}/running-config_{{ timestamp }}.txt"
+            mode: "0640"
+
+        - name: Fetch startup-config
+          cli_command:
+            command: show startup-config
+          register: startup_cfg
+          retries: 3
+          delay: 5
+          until: startup_cfg is not failed
+
+        - name: Save startup-config to file
+          delegate_to: localhost
+          copy:
+            content: "{{ startup_cfg.stdout }}"
+            dest: "{{ backup_dir }}/startup-config_{{ timestamp }}.txt"
+            mode: "0640"
+
+        - name: Detect running vs startup config drift
+          delegate_to: localhost
+          diff:
+          vars:
+            before: "{{ startup_cfg.stdout }}"
+            after: "{{ running_cfg.stdout }}"
+          failed_when: false
+          register: config_diff
+          check_mode: true  # diff only, no changes applied
+
+        - name: Warn if unsaved changes detected
+          debug:
+            msg: >
+              WARNING: {{ inventory_hostname }} has unsaved changes —
+              running-config differs from startup-config.
+              Run 'write memory' to persist.
+          when: config_diff.changed
+
+        - name: Confirm backup completed
+          debug:
+            msg: >
+              Backup complete for {{ inventory_hostname }}.
+              Files saved to {{ backup_dir }}/
+
+      rescue:
+        - name: Log backup failure
+          delegate_to: localhost
+          lineinfile:
+            path: "{{ backup_root }}/backup_failures_{{ timestamp }}.log"
+            line: "{{ ansible_date_time.iso8601 | default(timestamp) }} FAILED {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
+            create: true
+            mode: "0640"
+
+        - name: Report failure and continue
+          debug:
+            msg: "BACKUP FAILED for {{ inventory_hostname }} — logged to backup_failures. Continuing with remaining hosts."
+
+  post_tasks:
+    - name: Summarize backup locations
+      delegate_to: localhost
+      run_once: true
+      debug:
+        msg: "All backup files written under {{ backup_root }}/"
