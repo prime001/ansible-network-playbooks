@@ -1,0 +1,157 @@
+---
+# ACL Deployment Playbook for Cisco IOS/IOS-XE Devices
+# Deploys named extended ACLs and applies them to interfaces
+# Supports idempotent merged/replaced state management via ios_acls
+#
+# Inventory example (inventory/network.yml):
+# ---
+# all:
+#   children:
+#     edge_routers:
+#       hosts:
+#         rtr-edge-01:
+#           ansible_host: 10.0.1.1
+#           ansible_network_os: ios
+#         rtr-edge-02:
+#           ansible_host: 10.0.1.2
+#           ansible_network_os: ios
+#       vars:
+#         ansible_connection: network_cli
+#         ansible_user: "{{ vault_net_user }}"
+#         ansible_password: "{{ vault_net_password }}"
+#         ansible_become: true
+#         ansible_become_method: enable
+#         ansible_become_password: "{{ vault_net_enable_password }}"
+#
+# Vault usage: ansible-vault encrypt_string 'secret' --name 'vault_net_password'
+# Run: ansible-playbook acl-deploy.yml -i inventory/network.yml --ask-vault-pass
+
+- name: Deploy and verify ACLs on edge routers
+  hosts: edge_routers
+  gather_facts: false
+
+  vars:
+    # ACL definitions — extend or override in group_vars/host_vars as needed
+    acl_name: EDGE_INBOUND_FILTER
+    acl_state: merged          # Use 'replaced' to enforce exact ACL state
+    inbound_interface: GigabitEthernet0/0
+    task_retries: 3
+    task_retry_delay: 5
+
+    acl_entries:
+      - sequence: 10
+        grant: permit
+        protocol: tcp
+        source:
+          any: true
+        destination:
+          address: 10.0.0.0
+          wildcard_bits: 0.0.255.255
+        port:
+          range:
+            start: 80
+            end: 443
+        log: true
+      - sequence: 20
+        grant: permit
+        protocol: icmp
+        source:
+          any: true
+        destination:
+          any: true
+      - sequence: 30
+        grant: deny
+        protocol: tcp
+        source:
+          any: true
+        destination:
+          any: true
+        port:
+          eq: 23
+        log: true
+      - sequence: 100
+        grant: deny
+        protocol: ip
+        source:
+          any: true
+        destination:
+          any: true
+        log: true
+
+  tasks:
+    - name: Capture pre-change ACL state
+      cisco.ios.ios_command:
+        commands:
+          - "show ip access-lists {{ acl_name }}"
+      register: acl_before
+      retries: "{{ task_retries }}"
+      delay: "{{ task_retry_delay }}"
+      until: acl_before is not failed
+      failed_when: false
+
+    - name: Display pre-change ACL (baseline)
+      ansible.builtin.debug:
+        msg: |
+          Host: {{ inventory_hostname }}
+          Pre-change ACL state:
+          {{ acl_before.stdout[0] | default('ACL not present — will be created') }}
+
+    - name: Deploy ACL configuration
+      block:
+        - name: Push named extended ACL via ios_acls
+          cisco.ios.ios_acls:
+            config:
+              - afi: ipv4
+                acls:
+                  - name: "{{ acl_name }}"
+                    acl_type: extended
+                    aces: "{{ acl_entries }}"
+            state: "{{ acl_state }}"
+          register: acl_deploy_result
+          notify: Save running config
+
+        - name: Apply ACL to inbound interface direction
+          cisco.ios.ios_command:
+            commands:
+              - "interface {{ inbound_interface }}"
+              - "ip access-group {{ acl_name }} in"
+          register: interface_apply_result
+          failed_when:
+            - interface_apply_result.failed is defined
+            - interface_apply_result.failed
+
+      rescue:
+        - name: Log ACL deployment failure
+          ansible.builtin.debug:
+            msg: >
+              WARNING: ACL deployment failed on {{ inventory_hostname }}.
+              Error: {{ ansible_failed_result.msg | default('Unknown error') }}
+
+        - name: Abort with actionable message
+          ansible.builtin.fail:
+            msg: "ACL deployment failed on {{ inventory_hostname }} — verify connectivity, credentials, and interface name."
+
+    - name: Verify ACL is present post-deploy
+      cisco.ios.ios_command:
+        commands:
+          - "show ip access-lists {{ acl_name }}"
+          - "show ip interface {{ inbound_interface }} | include access list"
+      register: acl_verify
+      retries: "{{ task_retries }}"
+      delay: "{{ task_retry_delay }}"
+      until: acl_name in acl_verify.stdout[0]
+      failed_when: acl_name not in acl_verify.stdout[0]
+
+    - name: Report deployment result
+      ansible.builtin.debug:
+        msg: |
+          {{ inventory_hostname }}: ACL '{{ acl_name }}' deployed successfully.
+          Interface binding: {{ acl_verify.stdout[1] | default('check manually') }}
+          Changed: {{ acl_deploy_result.changed }}
+
+  handlers:
+    - name: Save running config
+      cisco.ios.ios_command:
+        commands:
+          - write memory
+      listen: Save running config
