@@ -1,0 +1,119 @@
+---
+# NTP Configuration Playbook for Network Devices
+# Configures NTP servers, timezone, and authentication across IOS/IOS-XE devices
+#
+# Inventory example (inventory/network.yml):
+# ---
+# all:
+#   children:
+#     routers:
+#       hosts:
+#         rtr-core-01:
+#           ansible_host: 10.0.0.1
+#           ansible_network_os: ios
+#         rtr-core-02:
+#           ansible_host: 10.0.0.2
+#           ansible_network_os: ios
+#       vars:
+#         ansible_connection: network_cli
+#         ansible_user: "{{ vault_net_user }}"
+#         ansible_password: "{{ vault_net_password }}"
+#         ansible_become: true
+#         ansible_become_method: enable
+#         ansible_become_password: "{{ vault_net_enable_password }}"
+#
+# Vault usage: ansible-vault encrypt_string 'secret' --name 'vault_net_password'
+# Run: ansible-playbook ntp-config.yml -i inventory/network.yml --ask-vault-pass
+
+- name: Configure NTP on network devices
+  hosts: routers
+  gather_facts: false
+
+  vars:
+    # Primary and secondary NTP servers — override per host/group in inventory
+    ntp_servers:
+      - address: 216.239.35.0
+        prefer: true
+      - address: 216.239.35.4
+        prefer: false
+    ntp_source_interface: Loopback0
+    ntp_timezone: "UTC"
+    ntp_offset: 0
+    # Retry settings for unreliable links
+    task_retries: 3
+    task_retry_delay: 5
+
+  tasks:
+    - name: Gather current NTP configuration
+      cisco.ios.ios_command:
+        commands:
+          - show ntp status
+          - show ntp associations
+      register: ntp_current_state
+      retries: "{{ task_retries }}"
+      delay: "{{ task_retry_delay }}"
+      until: ntp_current_state is not failed
+
+    - name: Display current NTP state
+      ansible.builtin.debug:
+        msg: |
+          Host: {{ inventory_hostname }}
+          NTP Status: {{ ntp_current_state.stdout[0] | default('No output') }}
+
+    - name: Apply NTP server configuration
+      block:
+        - name: Configure NTP servers and source interface
+          cisco.ios.ios_ntp_global:
+            config:
+              servers:
+                - server: "{{ item.address }}"
+                  prefer: "{{ item.prefer }}"
+                  version: 4
+              source_interface: "{{ ntp_source_interface }}"
+            state: merged
+          loop: "{{ ntp_servers }}"
+          register: ntp_config_result
+          notify: Save running config
+
+        - name: Set device timezone
+          cisco.ios.ios_command:
+            commands:
+              - "clock timezone {{ ntp_timezone }} {{ ntp_offset }}"
+          register: timezone_result
+          failed_when:
+            - timezone_result.failed is defined
+            - timezone_result.failed
+
+      rescue:
+        - name: Log configuration failure
+          ansible.builtin.debug:
+            msg: >
+              WARNING: NTP configuration failed on {{ inventory_hostname }}.
+              Error: {{ ansible_failed_result.msg | default('Unknown error') }}
+
+        - name: Fail the play with a clear message
+          ansible.builtin.fail:
+            msg: "NTP configuration failed on {{ inventory_hostname }} — check connectivity and credentials."
+
+    - name: Verify NTP synchronization post-config
+      cisco.ios.ios_command:
+        commands:
+          - show ntp status
+      register: ntp_verify
+      retries: "{{ task_retries }}"
+      delay: "{{ task_retry_delay }}"
+      until: "'synchronized' in ntp_verify.stdout[0] or 'unsynchronized' in ntp_verify.stdout[0]"
+      failed_when: false
+
+    - name: Report synchronization status
+      ansible.builtin.debug:
+        msg: >
+          {{ inventory_hostname }}: NTP is
+          {{ 'SYNCHRONIZED' if 'synchronized' in ntp_verify.stdout[0] else 'NOT YET SYNCHRONIZED (may take a few minutes)' }}
+
+  handlers:
+    - name: Save running config
+      cisco.ios.ios_command:
+        commands:
+          - write memory
+      listen: Save running config
