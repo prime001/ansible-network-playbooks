@@ -1,0 +1,140 @@
+---
+# 007_facts_gathering.yml
+# Gather and report device facts across multi-vendor network inventory.
+# Collects: hardware platform, OS version, serial numbers, interface summary,
+# CDP/LLDP neighbors, and routing table size.
+#
+# Credentials: stored in Ansible Vault (ansible-vault encrypt_string)
+#   ansible-vault create group_vars/all/vault.yml
+#   vault contents: ansible_user, ansible_password, ansible_become_password
+#
+# Inventory example (inventory/hosts.yml):
+# ---
+# all:
+#   children:
+#     ios:
+#       hosts:
+#         core-sw-01:
+#           ansible_host: 10.0.1.1
+#           ansible_network_os: ios
+#         dist-rtr-01:
+#           ansible_host: 10.0.1.2
+#           ansible_network_os: ios
+#     nxos:
+#       hosts:
+#         dc-spine-01:
+#           ansible_host: 10.0.2.1
+#           ansible_network_os: nxos
+#     junos:
+#       hosts:
+#         edge-rtr-01:
+#           ansible_host: 10.0.3.1
+#           ansible_network_os: junos
+#   vars:
+#     ansible_connection: network_cli
+#     ansible_user: "{{ vault_ansible_user }}"
+#     ansible_password: "{{ vault_ansible_password }}"
+#     ansible_become: true
+#     ansible_become_method: enable
+#     ansible_become_password: "{{ vault_ansible_become_password }}"
+
+- name: Gather network device facts — hardware, software, interfaces, and neighbors
+  hosts: all
+  gather_facts: false
+
+  vars:
+    facts_output_dir: "/tmp/net_facts/{{ inventory_hostname }}"
+    timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+
+  tasks:
+
+    - name: Ensure local output directory exists
+      delegate_to: localhost
+      file:
+        path: "{{ facts_output_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Collect device facts via platform module
+      block:
+
+        - name: Gather IOS facts
+          cisco.ios.ios_facts:
+            gather_subset:
+              - hardware
+              - interfaces
+              - default
+          when: ansible_network_os == "ios"
+          register: ios_facts_result
+
+        - name: Gather NX-OS facts
+          cisco.nxos.nxos_facts:
+            gather_subset:
+              - hardware
+              - interfaces
+              - default
+          when: ansible_network_os == "nxos"
+          register: nxos_facts_result
+
+        - name: Gather Junos facts
+          junipernetworks.junos.junos_facts:
+            gather_subset:
+              - hardware
+              - interfaces
+              - default
+          when: ansible_network_os == "junos"
+          register: junos_facts_result
+
+        - name: Retrieve CDP neighbors (IOS)
+          cisco.ios.ios_command:
+            commands: show cdp neighbors detail
+            wait_for: result[0] contains "Device ID"
+            retries: 2
+            interval: 5
+          when: ansible_network_os == "ios"
+          register: cdp_output
+          failed_when:
+            - cdp_output.failed is defined
+            - cdp_output.failed
+            - "'CDP is not enabled' not in cdp_output.msg | default('')"
+
+        - name: Retrieve routing table summary (IOS)
+          cisco.ios.ios_command:
+            commands: show ip route summary
+          when: ansible_network_os == "ios"
+          register: route_summary
+
+      rescue:
+        - name: Log facts collection failure
+          delegate_to: localhost
+          copy:
+            content: |
+              FACTS COLLECTION FAILED
+              Host      : {{ inventory_hostname }}
+              Timestamp : {{ timestamp }}
+              Error     : {{ ansible_failed_result | default('unknown error') | to_nice_yaml }}
+            dest: "{{ facts_output_dir }}/FAILED_{{ timestamp }}.txt"
+            mode: "0640"
+
+        - name: Warn and continue
+          debug:
+            msg: "WARNING: facts collection failed for {{ inventory_hostname }} — see {{ facts_output_dir }}/FAILED_{{ timestamp }}.txt"
+
+    - name: Display platform summary
+      debug:
+        msg:
+          - "Host       : {{ inventory_hostname }}"
+          - "OS         : {{ ansible_network_os }}"
+          - "Model      : {{ ansible_net_model | default('n/a') }}"
+          - "Serial     : {{ ansible_net_serialnum | default('n/a') }}"
+          - "Version    : {{ ansible_net_version | default('n/a') }}"
+          - "Image      : {{ ansible_net_image | default('n/a') }}"
+          - "Interfaces : {{ ansible_net_interfaces | default({}) | length }}"
+
+    - name: Save facts snapshot to disk
+      delegate_to: localhost
+      copy:
+        content: "{{ ansible_facts | combine({'net_neighbors': cdp_output.stdout_lines | default([])}) | to_nice_yaml }}"
+        dest: "{{ facts_output_dir }}/facts_{{ timestamp }}.yml"
+        mode: "0640"
+      when: ansible_net_model is defined
