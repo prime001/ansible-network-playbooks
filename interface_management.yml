@@ -1,0 +1,143 @@
+---
+# Playbook: 008_interface_management.yml
+# Purpose : Configure and verify network interface settings on Cisco IOS/IOS-XE devices.
+#           Covers descriptions, IP addressing, admin state, speed/duplex, and MTU.
+#           Designed to be idempotent — safe to run repeatedly.
+#
+# Inventory example (inventory/network.yml):
+#   all:
+#     children:
+#       core_switches:
+#         hosts:
+#           core-sw-01:
+#             ansible_host: 10.0.0.1
+#           core-sw-02:
+#             ansible_host: 10.0.0.2
+#       edge_routers:
+#         hosts:
+#           edge-rtr-01:
+#             ansible_host: 10.0.0.10
+#     vars:
+#       ansible_network_os: ios
+#       ansible_connection: network_cli
+#       ansible_user: "{{ vault_net_username }}"       # ansible-vault encrypted
+#       ansible_password: "{{ vault_net_password }}"   # ansible-vault encrypted
+#       ansible_become: true
+#       ansible_become_method: enable
+#       ansible_become_pass: "{{ vault_enable_pass }}" # ansible-vault encrypted
+#
+# Usage:
+#   ansible-playbook -i inventory/network.yml 008_interface_management.yml \
+#     --vault-password-file ~/.vault_pass \
+#     --limit core_switches \
+#     [-e "target_interfaces=['GigabitEthernet0/1','GigabitEthernet0/2']"]
+
+- name: Interface Management — Configure and verify interface settings
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
+
+  vars:
+    # Override at runtime with -e or in group_vars; vault values injected via inventory
+    interface_config:
+      - name: GigabitEthernet0/1
+        description: "uplink-to-core"
+        ip_address: 10.1.0.1
+        prefix_length: "30"
+        admin_state: up
+        mtu: 9000
+        speed: auto
+        duplex: auto
+      - name: GigabitEthernet0/2
+        description: "server-segment-A"
+        ip_address: 172.16.10.1
+        prefix_length: "24"
+        admin_state: up
+        mtu: 1500
+        speed: "1000"
+        duplex: full
+
+  tasks:
+
+    - name: Verify device is reachable before making changes
+      cisco.ios.ios_command:
+        commands: show version
+      register: version_check
+      retries: 3
+      delay: 5
+      until: version_check is not failed
+
+    - name: Apply interface configuration
+      block:
+
+        - name: Configure interface IP, description, and admin state
+          cisco.ios.ios_l3_interfaces:
+            config:
+              - name: "{{ item.name }}"
+                ipv4:
+                  - address: "{{ item.ip_address }}/{{ item.prefix_length }}"
+            state: merged
+          loop: "{{ interface_config }}"
+          loop_control:
+            label: "{{ item.name }}"
+          register: l3_result
+
+        - name: Set interface description and admin state via cli_config
+          cisco.ios.ios_config:
+            lines:
+              - "description {{ item.description }}"
+              - "mtu {{ item.mtu }}"
+              - "speed {{ item.speed }}"
+              - "duplex {{ item.duplex }}"
+              - "{{ 'no shutdown' if item.admin_state == 'up' else 'shutdown' }}"
+            parents: "interface {{ item.name }}"
+          loop: "{{ interface_config }}"
+          loop_control:
+            label: "{{ item.name }}"
+          register: config_result
+          notify: Save running config
+
+      rescue:
+
+        - name: Log failure and abort
+          ansible.builtin.debug:
+            msg: >
+              Interface configuration failed on {{ inventory_hostname }}.
+              Task: {{ ansible_failed_task.name }}.
+              Result: {{ ansible_failed_result.msg | default('no message') }}.
+
+        - name: Abort play for this host after rescue logging
+          ansible.builtin.fail:
+            msg: "Halting {{ inventory_hostname }} — manual review required."
+
+    - name: Gather interface state post-change
+      cisco.ios.ios_command:
+        commands:
+          - show interfaces status
+          - show ip interface brief
+      register: post_change_state
+
+    - name: Display interface status summary
+      ansible.builtin.debug:
+        msg: "{{ post_change_state.stdout_lines }}"
+
+    - name: Verify configured interfaces are line-protocol up
+      cisco.ios.ios_command:
+        commands:
+          - "show interface {{ item.name }} | include line protocol"
+      register: intf_status
+      failed_when: >
+        item.admin_state == 'up' and
+        'line protocol is up' not in intf_status.stdout[0]
+      loop: "{{ interface_config }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: item.admin_state == 'up'
+
+  handlers:
+
+    - name: Save running config
+      cisco.ios.ios_command:
+        commands:
+          - write memory
+      register: save_result
+      failed_when: "'[OK]' not in save_result.stdout[0]"
