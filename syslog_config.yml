@@ -1,0 +1,97 @@
+---
+# 009_syslog_config.yml
+#
+# Ansible Playbook: Syslog Server Configuration
+#
+# Configures centralized syslog forwarding on Cisco IOS/IOS-XE devices.
+# Sets logging host, severity level, source interface, and buffering parameters.
+#
+# Credentials: stored in Ansible Vault
+#   ansible-vault encrypt_string 'MySecret' --name 'ansible_password'
+#
+# Inventory example (inventory/network.yml):
+# ---
+# all:
+#   children:
+#     routers:
+#       hosts:
+#         rtr-core-01:
+#           ansible_host: 192.168.1.1
+#         rtr-core-02:
+#           ansible_host: 192.168.1.2
+#     switches:
+#       hosts:
+#         sw-dist-01:
+#           ansible_host: 192.168.2.1
+#   vars:
+#     ansible_network_os: ios
+#     ansible_connection: network_cli
+#     ansible_user: netadmin
+#     ansible_password: !vault |
+#       $ANSIBLE_VAULT;1.1;AES256
+#       ...
+#     ansible_become: yes
+#     ansible_become_method: enable
+#     ansible_become_password: !vault |
+#       $ANSIBLE_VAULT;1.1;AES256
+#       ...
+
+- name: Configure Syslog on Network Devices
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
+
+  vars:
+    # Override at runtime: ansible-playbook 009_syslog_config.yml -e syslog_server=10.0.0.5
+    syslog_server: "10.10.10.50"
+    syslog_severity: "informational"
+    syslog_source_intf: "Loopback0"
+    syslog_buffer_size: 16384
+    syslog_facility: "local7"
+    config_retries: 3
+    config_retry_delay: 5
+
+  tasks:
+    - name: Apply syslog configuration block
+      block:
+        - name: Push syslog settings via ios_config
+          cisco.ios.ios_config:
+            lines:
+              - "logging host {{ syslog_server }}"
+              - "logging trap {{ syslog_severity }}"
+              - "logging facility {{ syslog_facility }}"
+              - "logging source-interface {{ syslog_source_intf }}"
+              - "logging buffered {{ syslog_buffer_size }} {{ syslog_severity }}"
+              - "logging on"
+            save_when: changed
+          register: syslog_config_result
+          retries: "{{ config_retries }}"
+          delay: "{{ config_retry_delay }}"
+          until: syslog_config_result is not failed
+
+        - name: Verify syslog configuration is present
+          cisco.ios.ios_command:
+            commands:
+              - show running-config | include logging
+          register: syslog_verify
+          failed_when:
+            - syslog_server not in syslog_verify.stdout[0]
+
+        - name: Display current logging configuration
+          ansible.builtin.debug:
+            msg: "{{ inventory_hostname }} logging config: {{ syslog_verify.stdout_lines[0] }}"
+
+        - name: Report config change status
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }}: syslog config
+              {{ 'CHANGED' if syslog_config_result.changed else 'already up-to-date' }}
+
+      rescue:
+        - name: Log failure details
+          ansible.builtin.debug:
+            msg: >-
+              FAILED on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}
+
+        - name: Mark host as failed without stopping the play
+          ansible.builtin.fail:
+            msg: "Syslog configuration failed on {{ inventory_hostname }} — check connectivity and privilege level."
