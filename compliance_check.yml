@@ -1,0 +1,133 @@
+---
+# 005_compliance_check.yml
+# Ansible Playbook: Network Device Security Compliance Audit
+#
+# Purpose: Audits IOS/IOS-XE devices against a baseline security policy:
+#   - SSH version and VTY transport enforcement
+#   - Service password-encryption status
+#   - SNMP version and community string hygiene
+#   - Syslog server reachability configuration
+#   - MOTD/login banner presence
+#
+# This playbook is READ-ONLY — no configuration changes are applied.
+# Results are registered and printed as a per-host compliance summary.
+#
+# Credentials: Store secrets in Ansible Vault (vars/vault.yml)
+#   ansible-vault create vars/vault.yml
+#
+# Inventory example (inventory/network.yml):
+# ---
+# all:
+#   children:
+#     network_devices:
+#       hosts:
+#         core-sw-01:
+#           ansible_host: 10.0.1.10
+#           ansible_network_os: ios
+#         edge-rtr-01:
+#           ansible_host: 10.0.1.1
+#           ansible_network_os: ios
+#       vars:
+#         ansible_connection: network_cli
+#         ansible_user: "{{ vault_net_user }}"
+#         ansible_password: "{{ vault_net_pass }}"
+#         ansible_become: true
+#         ansible_become_method: enable
+#         ansible_become_password: "{{ vault_enable_pass }}"
+#
+# Run: ansible-playbook 005_compliance_check.yml -i inventory/network.yml --ask-vault-pass
+
+- name: Security compliance audit — IOS/IOS-XE devices
+  hosts: network_devices
+  gather_facts: false
+
+  vars:
+    # Expected compliance values — override in group_vars/host_vars as needed
+    required_syslog_server: "10.0.0.50"
+    required_ssh_version: "2"
+    snmp_banned_communities:
+      - public
+      - private
+    task_retries: 3
+    task_retry_delay: 5
+
+  tasks:
+    - name: Collect security-relevant configuration sections
+      block:
+        - name: Pull compliance-relevant show output
+          cisco.ios.ios_command:
+            commands:
+              - show running-config | include ^service password-encryption
+              - show running-config | section ^line vty
+              - show running-config | include ^ip ssh version
+              - show running-config | include ^logging host
+              - show running-config | include ^snmp-server community
+              - show running-config | include ^banner (motd|login)
+          register: compliance_raw
+          retries: "{{ task_retries }}"
+          delay: "{{ task_retry_delay }}"
+          until: compliance_raw is not failed
+
+      rescue:
+        - name: Warn on collection failure and skip host
+          ansible.builtin.debug:
+            msg: "WARNING: Could not collect compliance data from {{ inventory_hostname }} — skipping. Error: {{ ansible_failed_result.msg | default('unknown') }}"
+
+        - name: Mark host as unreachable and continue
+          ansible.builtin.fail:
+            msg: "Compliance collection aborted for {{ inventory_hostname }}"
+
+    - name: Evaluate password-encryption compliance
+      ansible.builtin.set_fact:
+        check_password_enc: "{{ 'PASS' if 'service password-encryption' in compliance_raw.stdout[0] else 'FAIL' }}"
+
+    - name: Evaluate VTY SSH-only transport compliance
+      ansible.builtin.set_fact:
+        check_vty_ssh: "{{ 'PASS' if 'transport input ssh' in compliance_raw.stdout[1] else 'FAIL' }}"
+
+    - name: Evaluate SSH version 2 compliance
+      ansible.builtin.set_fact:
+        check_ssh_ver: "{{ 'PASS' if ('ip ssh version ' + required_ssh_version) in compliance_raw.stdout[2] else 'FAIL' }}"
+
+    - name: Evaluate syslog server compliance
+      ansible.builtin.set_fact:
+        check_syslog: "{{ 'PASS' if required_syslog_server in compliance_raw.stdout[3] else 'FAIL' }}"
+
+    - name: Evaluate SNMP community string hygiene
+      ansible.builtin.set_fact:
+        check_snmp: >-
+          {{
+            'FAIL' if (snmp_banned_communities | select('in', compliance_raw.stdout[4]) | list | length > 0)
+            else ('WARN — no SNMP configured' if compliance_raw.stdout[4] == '' else 'PASS')
+          }}
+
+    - name: Evaluate banner compliance
+      ansible.builtin.set_fact:
+        check_banner: "{{ 'PASS' if compliance_raw.stdout[5] != '' else 'FAIL' }}"
+
+    - name: Display compliance report for host
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          Compliance Report: {{ inventory_hostname }}
+          ============================================================
+            [{{ check_password_enc }}] Service password-encryption
+            [{{ check_vty_ssh }}] VTY transport restricted to SSH
+            [{{ check_ssh_ver }}] SSH version {{ required_ssh_version }} enforced
+            [{{ check_syslog }}] Syslog server {{ required_syslog_server }} configured
+            [{{ check_snmp }}] SNMP community hygiene (no 'public'/'private')
+            [{{ check_banner }}] Login/MOTD banner present
+          ============================================================
+
+    - name: Fail play if any critical check did not pass
+      ansible.builtin.assert:
+        that:
+          - check_password_enc == 'PASS'
+          - check_vty_ssh == 'PASS'
+          - check_ssh_ver == 'PASS'
+          - check_syslog == 'PASS'
+          - check_banner == 'PASS'
+        fail_msg: >
+          {{ inventory_hostname }} FAILED compliance audit — review the report above
+          and remediate before this device is considered policy-compliant.
+        success_msg: "{{ inventory_hostname }} passed all compliance checks."
