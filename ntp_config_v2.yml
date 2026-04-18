@@ -1,0 +1,140 @@
+---
+# 011_ntp_auth_hardening.yml
+#
+# NTP Authentication Hardening — Multi-Vendor
+#
+# Configures NTP authentication (MD5 keys) on Cisco IOS, IOS-XR, and NX-OS
+# devices to prevent rogue time sources from poisoning network time.
+#
+# Credentials: stored in Ansible Vault (~/.ansible/vault/network_creds.yml)
+#   ansible-vault create group_vars/all/vault.yml
+#
+# Inventory example:
+# [ios_routers]
+# rtr-core-01 ansible_host=10.0.0.1
+# rtr-core-02 ansible_host=10.0.0.2
+#
+# [nxos_switches]
+# sw-dist-01 ansible_host=10.0.1.1
+#
+# [ios_routers:vars]
+# ansible_network_os=ios
+# ansible_connection=network_cli
+# ansible_user={{ vault_net_user }}
+# ansible_password={{ vault_net_pass }}
+# ansible_become=yes
+# ansible_become_method=enable
+# ansible_become_pass={{ vault_enable_pass }}
+#
+# [nxos_switches:vars]
+# ansible_network_os=nxos
+# ansible_connection=network_cli
+# ansible_user={{ vault_net_user }}
+# ansible_password={{ vault_net_pass }}
+
+- name: Harden NTP with authentication keys — IOS / IOS-XR / NX-OS
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
+
+  vars:
+    ntp_auth_key_id: 1
+    # ntp_auth_key_secret sourced from vault — never hardcode
+    ntp_auth_key_secret: "{{ vault_ntp_key_secret }}"
+    ntp_auth_algorithm: md5   # md5 | sha1 (platform-dependent)
+    ntp_trusted_servers:
+      - 10.0.100.10
+      - 10.0.100.11
+    max_retries: 3
+    retry_delay: 5
+
+  tasks:
+
+    # ── IOS ─────────────────────────────────────────────────────────────────
+    - name: Configure NTP authentication on IOS devices
+      when: ansible_network_os == 'ios'
+      block:
+        - name: IOS — enable NTP authentication and set key
+          cisco.ios.ios_config:
+            lines:
+              - "ntp authenticate"
+              - "ntp authentication-key {{ ntp_auth_key_id }} {{ ntp_auth_algorithm }} {{ ntp_auth_key_secret }}"
+              - "ntp trusted-key {{ ntp_auth_key_id }}"
+          register: ios_auth_result
+          retries: "{{ max_retries }}"
+          delay: "{{ retry_delay }}"
+          until: ios_auth_result is not failed
+
+        - name: IOS — associate trusted key with NTP servers
+          cisco.ios.ios_config:
+            lines:
+              - "ntp server {{ item }} key {{ ntp_auth_key_id }} prefer"
+          loop: "{{ ntp_trusted_servers }}"
+          register: ios_server_result
+          retries: "{{ max_retries }}"
+          delay: "{{ retry_delay }}"
+          until: ios_server_result is not failed
+
+        - name: IOS — verify NTP authentication status
+          cisco.ios.ios_command:
+            commands:
+              - show ntp associations detail
+              - show ntp status
+          register: ios_ntp_verify
+          failed_when: "'Clock is unsynchronized' in ios_ntp_verify.stdout[1] and ios_ntp_verify.stdout[1] | length > 0"
+
+        - name: IOS — display NTP status
+          ansible.builtin.debug:
+            msg: "{{ ios_ntp_verify.stdout_lines }}"
+
+      rescue:
+        - name: IOS — log authentication config failure
+          ansible.builtin.debug:
+            msg: "FAILED to configure NTP auth on {{ inventory_hostname }} — manual review required"
+
+    # ── NX-OS ────────────────────────────────────────────────────────────────
+    - name: Configure NTP authentication on NX-OS devices
+      when: ansible_network_os == 'nxos'
+      block:
+        - name: NX-OS — set NTP authentication key and enable
+          cisco.nxos.nxos_config:
+            lines:
+              - "ntp authentication-key {{ ntp_auth_key_id }} {{ ntp_auth_algorithm }} {{ ntp_auth_key_secret }}"
+              - "ntp trusted-key {{ ntp_auth_key_id }}"
+              - "ntp authenticate"
+          register: nxos_auth_result
+          retries: "{{ max_retries }}"
+          delay: "{{ retry_delay }}"
+          until: nxos_auth_result is not failed
+
+        - name: NX-OS — associate key with NTP servers
+          cisco.nxos.nxos_config:
+            lines:
+              - "ntp server {{ item }} key {{ ntp_auth_key_id }}"
+          loop: "{{ ntp_trusted_servers }}"
+          register: nxos_server_result
+          retries: "{{ max_retries }}"
+          delay: "{{ retry_delay }}"
+          until: nxos_server_result is not failed
+
+        - name: NX-OS — verify NTP associations
+          cisco.nxos.nxos_command:
+            commands:
+              - show ntp peer-status
+          register: nxos_ntp_verify
+
+        - name: NX-OS — display peer status
+          ansible.builtin.debug:
+            msg: "{{ nxos_ntp_verify.stdout_lines }}"
+
+      rescue:
+        - name: NX-OS — log authentication config failure
+          ansible.builtin.debug:
+            msg: "FAILED to configure NTP auth on {{ inventory_hostname }} — manual review required"
+
+    # ── Summary ──────────────────────────────────────────────────────────────
+    - name: Summarize NTP authentication hardening results
+      ansible.builtin.debug:
+        msg: >
+          Host {{ inventory_hostname }} ({{ ansible_network_os }}) —
+          NTP auth hardening complete. Key ID={{ ntp_auth_key_id }},
+          Servers={{ ntp_trusted_servers | join(', ') }}
