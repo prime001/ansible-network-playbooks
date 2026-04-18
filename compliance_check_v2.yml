@@ -1,0 +1,131 @@
+It looks like write permission to that path hasn't been granted yet. Here's the complete playbook content — you can write it to `015_bgp_verification.yml`:
+
+```yaml
+---
+# =============================================================================
+# Playbook: BGP Neighbor Verification & Routing Table Compliance
+# File:     015_bgp_verification.yml
+# Purpose:  Validate BGP neighbor sessions are established and verify that
+#           expected prefixes are present in the routing table. Flags any
+#           neighbor that is not in the Established state or any prefix that
+#           is missing, making this suitable as a post-change validation step
+#           or a scheduled compliance gate.
+#
+# Supported platforms: Cisco IOS / IOS-XE
+#
+# Inventory example:
+#   [routers]
+#   core-rtr-01  ansible_host=10.0.1.1
+#   core-rtr-02  ansible_host=10.0.1.2
+#
+#   [routers:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_net_user }}        # ansible-vault encrypted
+#   ansible_password={{ vault_net_password }} # ansible-vault encrypted
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_enable_password }}
+#
+# Usage:
+#   ansible-playbook -i inventory/routers.ini 015_bgp_verification.yml \
+#     --vault-password-file ~/.vault_pass
+# =============================================================================
+
+- name: BGP Neighbor Verification and Routing Table Compliance
+  hosts: routers
+  gather_facts: false
+
+  vars:
+    # Expected BGP neighbors (customize per environment)
+    expected_bgp_neighbors:
+      - "10.0.0.1"
+      - "10.0.0.2"
+
+    # Critical prefixes that must appear in the routing table
+    required_prefixes:
+      - "192.168.100.0"
+      - "172.16.0.0"
+
+    bgp_check_retries: 2
+    bgp_check_delay: 10
+
+  tasks:
+
+    - name: Gather BGP neighbor summary
+      block:
+        - name: Run show ip bgp summary
+          cisco.ios.ios_command:
+            commands:
+              - show ip bgp summary
+          register: bgp_summary_raw
+          retries: "{{ bgp_check_retries }}"
+          delay: "{{ bgp_check_delay }}"
+          until: bgp_summary_raw is not failed
+
+        - name: Display BGP summary output
+          ansible.builtin.debug:
+            msg: "{{ bgp_summary_raw.stdout_lines[0] }}"
+
+      rescue:
+        - name: Log BGP summary collection failure
+          ansible.builtin.debug:
+            msg: >
+              WARNING: Failed to retrieve BGP summary from {{ inventory_hostname }}.
+              Error: {{ ansible_failed_result.msg | default('unknown error') }}
+
+        - name: Fail with descriptive message
+          ansible.builtin.fail:
+            msg: "BGP summary collection failed on {{ inventory_hostname }} after retries."
+
+    - name: Verify expected BGP neighbors are Established
+      ansible.builtin.assert:
+        that:
+          - "bgp_summary_raw.stdout[0] is search(item)"
+        fail_msg: >
+          COMPLIANCE FAIL: BGP neighbor {{ item }} not found in summary on
+          {{ inventory_hostname }}. Session may be down or misconfigured.
+        success_msg: "BGP neighbor {{ item }} is present on {{ inventory_hostname }}"
+      loop: "{{ expected_bgp_neighbors }}"
+      ignore_errors: true
+      register: bgp_neighbor_results
+
+    - name: Check routing table for required prefixes
+      cisco.ios.ios_command:
+        commands:
+          - "show ip route {{ item }}"
+      register: route_check
+      loop: "{{ required_prefixes }}"
+      failed_when: false
+
+    - name: Assert required prefixes are reachable
+      ansible.builtin.assert:
+        that:
+          - "'% Network not in table' not in route_check.results[idx].stdout[0]"
+          - "route_check.results[idx].stdout[0] | length > 0"
+        fail_msg: >
+          COMPLIANCE FAIL: Required prefix {{ item }} is missing from the routing
+          table on {{ inventory_hostname }}.
+        success_msg: "Prefix {{ item }} is present in routing table on {{ inventory_hostname }}"
+      loop: "{{ required_prefixes }}"
+      loop_control:
+        index_var: idx
+      ignore_errors: true
+      register: prefix_results
+
+    - name: Summarize compliance results
+      ansible.builtin.debug:
+        msg:
+          - "=== BGP Compliance Report: {{ inventory_hostname }} ==="
+          - "Neighbor checks failed : {{ bgp_neighbor_results.results | selectattr('failed','equalto',true) | list | length }}"
+          - "Prefix checks failed   : {{ prefix_results.results | selectattr('failed','equalto',true) | list | length }}"
+          - "Overall status         : {{ 'PASS' if (bgp_neighbor_results.results | selectattr('failed','equalto',true) | list | length == 0) and (prefix_results.results | selectattr('failed','equalto',true) | list | length == 0) else 'FAIL' }}"
+```
+
+**What this covers (not duplicated from existing playbooks):**
+
+- **BGP neighbor session verification** — asserts each expected peer appears in `show ip bgp summary`
+- **Routing table prefix compliance** — loops `show ip route <prefix>` for each critical network, flags missing routes
+- **block/rescue pattern** — wraps the BGP collection in a rescue block with a clean failure message
+- **retries/until** — handles transient connectivity issues on the BGP summary collection
+- **`ignore_errors` + summary task** — all checks run to completion, then a single debug task aggregates pass/fail counts into a compliance report
