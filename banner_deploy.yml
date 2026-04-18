@@ -1,0 +1,115 @@
+---
+# 010_banner_deploy.yml
+#
+# Banner Deploy Playbook
+# Deploys login and MOTD banners to network devices for security compliance.
+# Banners communicate authorized-use-only warnings and contact information.
+#
+# Inventory example:
+#   [network_devices]
+#   core-sw-01 ansible_host=10.0.0.1 ansible_network_os=ios
+#   dist-sw-01 ansible_host=10.0.0.2 ansible_network_os=ios
+#   edge-rtr-01 ansible_host=10.0.0.3 ansible_network_os=nxos
+#
+#   [network_devices:vars]
+#   ansible_user=netadmin
+#   ansible_password={{ vault_net_password }}     # ansible-vault encrypted
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_enable_pass }}
+#   ansible_connection=network_cli
+
+- name: Deploy login and MOTD banners to network devices
+  hosts: network_devices
+  gather_facts: false
+  vars:
+    banner_delimiter: "^"
+    login_banner_text: |
+      ******************************************************************
+      *  AUTHORIZED ACCESS ONLY                                        *
+      *  This system is for authorized users only. All activity is     *
+      *  monitored and logged. Unauthorized access is prohibited and   *
+      *  may result in civil and criminal penalties.                   *
+      *  Contact: noc@example.com | +1-800-555-0199                    *
+      ******************************************************************
+    motd_banner_text: |
+      ******************************************************************
+      *  Welcome to {{ inventory_hostname }}                           *
+      *  Managed by Network Operations Center                         *
+      *  Please log out when session is complete.                     *
+      ******************************************************************
+    banner_retries: 3
+    banner_retry_delay: 5
+
+  tasks:
+
+    - name: Deploy login banner
+      block:
+        - name: Set login banner (IOS/IOS-XE)
+          cisco.ios.ios_banner:
+            banner: login
+            text: "{{ login_banner_text }}"
+            state: present
+          register: login_banner_result
+          retries: "{{ banner_retries }}"
+          delay: "{{ banner_retry_delay }}"
+          until: login_banner_result is not failed
+          when: ansible_network_os in ['ios', 'iosxe']
+
+        - name: Set login banner (NX-OS)
+          cisco.nxos.nxos_banner:
+            banner: login
+            text: "{{ login_banner_text }}"
+            state: present
+          register: nxos_login_banner_result
+          retries: "{{ banner_retries }}"
+          delay: "{{ banner_retry_delay }}"
+          until: nxos_login_banner_result is not failed
+          when: ansible_network_os == 'nxos'
+
+        - name: Set login banner (JunOS)
+          junipernetworks.junos.junos_banner:
+            banner: login
+            text: "{{ login_banner_text }}"
+            state: present
+          register: junos_login_banner_result
+          retries: "{{ banner_retries }}"
+          delay: "{{ banner_retry_delay }}"
+          until: junos_login_banner_result is not failed
+          when: ansible_network_os == 'junos'
+
+      rescue:
+        - name: Log banner deployment failure
+          ansible.builtin.debug:
+            msg: "FAILED: Could not deploy login banner to {{ inventory_hostname }}. Error: {{ ansible_failed_result.msg | default('unknown error') }}"
+
+        - name: Fail task with descriptive message
+          ansible.builtin.fail:
+            msg: "Banner deployment failed on {{ inventory_hostname }} after {{ banner_retries }} retries."
+
+    - name: Deploy MOTD banner (IOS/IOS-XE only)
+      cisco.ios.ios_banner:
+        banner: motd
+        text: "{{ motd_banner_text }}"
+        state: present
+      register: motd_banner_result
+      when: ansible_network_os in ['ios', 'iosxe']
+      failed_when:
+        - motd_banner_result.failed is defined
+        - motd_banner_result.failed
+
+    - name: Verify banner is present via show command
+      ansible.netcommon.cli_command:
+        command: show banner login
+      register: banner_verify
+      changed_when: false
+      failed_when: "'AUTHORIZED ACCESS ONLY' not in banner_verify.stdout"
+
+    - name: Report banner deployment result
+      ansible.builtin.debug:
+        msg:
+          - "Host       : {{ inventory_hostname }}"
+          - "OS         : {{ ansible_network_os }}"
+          - "Login      : {{ 'deployed' if (login_banner_result.changed | default(false) or nxos_login_banner_result.changed | default(false) or junos_login_banner_result.changed | default(false)) else 'already present' }}"
+          - "MOTD       : {{ 'deployed' if motd_banner_result.changed | default(false) else 'skipped or already present' }}"
+          - "Verified   : banner contains expected compliance text"
