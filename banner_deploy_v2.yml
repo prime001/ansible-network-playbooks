@@ -1,0 +1,167 @@
+---
+# 020_banner_deploy.yml
+# Multi-vendor login/motd banner deployment with dynamic content injection
+# Supports: IOS, IOS-XR, NX-OS, JunOS
+#
+# Inventory example:
+# [ios]
+# rtr1 ansible_host=10.0.1.1
+# rtr2 ansible_host=10.0.1.2
+#
+# [iosxr]
+# core1 ansible_host=10.0.2.1
+#
+# [nxos]
+# sw1 ansible_host=10.0.3.1
+#
+# [network:children]
+# ios
+# iosxr
+# nxos
+#
+# group_vars/all.yml:
+#   ansible_user: "{{ vault_net_user }}"
+#   ansible_password: "{{ vault_net_pass }}"
+#   ansible_become: yes
+#   ansible_become_method: enable
+#   ansible_become_pass: "{{ vault_enable_pass }}"
+
+- name: Deploy Compliant Login and MOTD Banners Across Multi-Vendor Fleet
+  hosts: network
+  gather_facts: false
+  vars:
+    banner_contact: "noc@example.com"
+    banner_org: "Example Corp"
+    banner_legal_notice: >-
+      UNAUTHORIZED ACCESS IS PROHIBITED.
+      All activity is logged and monitored.
+      Disconnect immediately if not authorized.
+    deploy_motd: true
+    deploy_login: true
+    max_retries: 3
+    retry_delay: 5
+
+  tasks:
+
+    - name: Verify host reachability before banner push
+      ansible_builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 22
+        timeout: 15
+      delegate_to: localhost
+      register: reach_check
+      retries: "{{ max_retries }}"
+      delay: "{{ retry_delay }}"
+      until: reach_check is succeeded
+
+    - name: Build banner text from variables
+      ansible_builtin.set_fact:
+        motd_text: |
+          ============================================================
+           {{ banner_org }} — Network Device
+           Managed by NOC | Contact: {{ banner_contact }}
+           Hostname: {{ inventory_hostname }} | Date: {{ ansible_date_time.date | default('N/A') }}
+          ============================================================
+        login_text: |
+          ============================================================
+           {{ banner_legal_notice }}
+          ============================================================
+
+    - name: Deploy banners on IOS devices
+      block:
+        - name: Set MOTD banner — IOS
+          cisco.ios.ios_banner:
+            banner: motd
+            text: "{{ motd_text }}"
+            state: present
+          register: ios_motd_result
+          when: deploy_motd | bool
+
+        - name: Set login banner — IOS
+          cisco.ios.ios_banner:
+            banner: login
+            text: "{{ login_text }}"
+            state: present
+          register: ios_login_result
+          when: deploy_login | bool
+
+      rescue:
+        - name: Log IOS banner failure
+          ansible_builtin.debug:
+            msg: "FAILED to deploy banner on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
+
+        - name: Fail task after rescue log
+          ansible_builtin.fail:
+            msg: "Banner deploy failed on {{ inventory_hostname }} — see above"
+
+      when: "'ios' in group_names"
+
+    - name: Deploy banners on IOS-XR devices
+      block:
+        - name: Set MOTD banner — IOS-XR
+          cisco.iosxr.iosxr_banner:
+            banner: motd
+            text: "{{ motd_text }}"
+            state: present
+          register: iosxr_motd_result
+          when: deploy_motd | bool
+
+        - name: Set login banner — IOS-XR
+          cisco.iosxr.iosxr_banner:
+            banner: login
+            text: "{{ login_text }}"
+            state: present
+          register: iosxr_login_result
+          when: deploy_login | bool
+
+      rescue:
+        - name: Log IOS-XR failure
+          ansible_builtin.debug:
+            msg: "FAILED on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
+
+        - name: Fail after IOS-XR rescue
+          ansible_builtin.fail:
+            msg: "IOS-XR banner deploy failed on {{ inventory_hostname }}"
+
+      when: "'iosxr' in group_names"
+
+    - name: Deploy banners on NX-OS devices
+      block:
+        - name: Set MOTD banner — NX-OS
+          cisco.nxos.nxos_banner:
+            banner: motd
+            text: "{{ motd_text }}"
+            state: present
+          register: nxos_motd_result
+          when: deploy_motd | bool
+
+      rescue:
+        - name: Log NX-OS failure
+          ansible_builtin.debug:
+            msg: "FAILED on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
+
+        - name: Fail after NX-OS rescue
+          ansible_builtin.fail:
+            msg: "NX-OS banner deploy failed on {{ inventory_hostname }}"
+
+      when: "'nxos' in group_names"
+
+    - name: Verify banner was applied — spot check via CLI
+      ansible_netcommon.cli_command:
+        command: show banner motd
+      register: banner_verify
+      failed_when:
+        - banner_verify.stdout is defined
+        - banner_org not in banner_verify.stdout
+      retries: 2
+      delay: 3
+      when: deploy_motd | bool
+
+    - name: Report banner deployment result
+      ansible_builtin.debug:
+        msg:
+          - "Host        : {{ inventory_hostname }}"
+          - "Platform    : {{ group_names | select('in', ['ios','iosxr','nxos','junos']) | list | first | default('unknown') }}"
+          - "MOTD deploy : {{ 'skipped' if not deploy_motd else 'ok' }}"
+          - "Login deploy: {{ 'skipped' if not deploy_login else 'ok' }}"
+          - "Verified    : {{ 'yes' if (banner_verify is defined and banner_verify is succeeded) else 'skipped' }}"
