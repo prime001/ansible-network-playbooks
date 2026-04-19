@@ -1,0 +1,138 @@
+---
+# 017_network_inventory_report.yml
+#
+# Network Inventory Report Generator
+# Collects device facts across multi-vendor environment and produces
+# a structured CSV inventory report saved to the Ansible control node.
+#
+# Complements 007_facts_gathering.yml (raw fact dump) by normalizing
+# facts across IOS, IOS-XR, NX-OS, and JunOS into a single report.
+#
+# Inventory example:
+# [core_switches]
+# sw-core-01 ansible_host=10.1.1.1 ansible_network_os=ios
+# sw-core-02 ansible_host=10.1.1.2 ansible_network_os=nxos
+#
+# [wan_routers]
+# rtr-wan-01 ansible_host=10.1.2.1 ansible_network_os=iosxr
+# rtr-wan-02 ansible_host=10.1.2.2 ansible_network_os=junos
+#
+# [network:children]
+# core_switches
+# wan_routers
+#
+# Credentials: store in Ansible Vault
+#   ansible_user: "{{ vault_net_user }}"
+#   ansible_password: "{{ vault_net_password }}"
+#   ansible_become_password: "{{ vault_net_enable }}"  # IOS/NX-OS only
+
+- name: Generate normalized network inventory report across multi-vendor devices
+  hosts: network
+  gather_facts: false
+  connection: network_cli
+
+  vars:
+    report_dir: "/tmp/net_inventory"
+    report_file: "{{ report_dir }}/network_inventory_{{ ansible_date_time.date }}.csv"
+    query_retries: 2
+    query_retry_delay: 5
+
+  tasks:
+    - name: Ensure report output directory exists on control node
+      delegate_to: localhost
+      run_once: true
+      file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Write CSV header row
+      delegate_to: localhost
+      run_once: true
+      lineinfile:
+        path: "{{ report_file }}"
+        line: "hostname,ip,os,model,serial,version,uptime_secs,image"
+        create: true
+        insertbefore: BOF
+
+    - name: Gather platform facts from network devices
+      block:
+        - name: Collect ios/nxos facts
+          cisco.ios.ios_facts:
+            gather_subset:
+              - hardware
+              - default
+          register: ios_facts_out
+          retries: "{{ query_retries }}"
+          delay: "{{ query_retry_delay }}"
+          until: ios_facts_out is succeeded
+          when: ansible_network_os in ['ios', 'nxos']
+
+        - name: Collect iosxr facts
+          cisco.iosxr.iosxr_facts:
+            gather_subset:
+              - hardware
+              - default
+          register: xr_facts_out
+          retries: "{{ query_retries }}"
+          delay: "{{ query_retry_delay }}"
+          until: xr_facts_out is succeeded
+          when: ansible_network_os == 'iosxr'
+
+        - name: Collect junos facts
+          junipernetworks.junos.junos_facts:
+            gather_subset:
+              - hardware
+              - default
+          register: junos_facts_out
+          retries: "{{ query_retries }}"
+          delay: "{{ query_retry_delay }}"
+          until: junos_facts_out is succeeded
+          when: ansible_network_os == 'junos'
+
+      rescue:
+        - name: Log fact collection failure and continue
+          debug:
+            msg: >
+              WARNING: Failed to collect facts from {{ inventory_hostname }}
+              ({{ ansible_host }}). Skipping device in report.
+          failed_when: false
+
+    - name: Normalize facts into common variables
+      set_fact:
+        norm_hostname: "{{ ansible_net_hostname | default(inventory_hostname) }}"
+        norm_model: "{{ ansible_net_model | default('unknown') }}"
+        norm_serial: "{{ ansible_net_serialnum | default('unknown') }}"
+        norm_version: "{{ ansible_net_version | default('unknown') }}"
+        norm_uptime: "{{ ansible_net_uptime_timedate | default(ansible_net_uptime | default('unknown')) }}"
+        norm_image: "{{ ansible_net_image | default('unknown') }}"
+      when: >
+        (ios_facts_out is defined and ios_facts_out is succeeded) or
+        (xr_facts_out is defined and xr_facts_out is succeeded) or
+        (junos_facts_out is defined and junos_facts_out is succeeded)
+
+    - name: Append device row to CSV report
+      delegate_to: localhost
+      lineinfile:
+        path: "{{ report_file }}"
+        line: >-
+          {{ norm_hostname }},{{ ansible_host }},{{ ansible_network_os }},
+          {{- norm_model }},{{ norm_serial }},{{ norm_version }},
+          {{- norm_uptime }},{{ norm_image }}
+      when: norm_hostname is defined
+
+    - name: Display per-device inventory summary
+      debug:
+        msg:
+          - "Host    : {{ norm_hostname | default('N/A') }}"
+          - "OS      : {{ ansible_network_os }}"
+          - "Model   : {{ norm_model | default('N/A') }}"
+          - "Serial  : {{ norm_serial | default('N/A') }}"
+          - "Version : {{ norm_version | default('N/A') }}"
+      when: norm_hostname is defined
+
+    - name: Print report location when all devices processed
+      delegate_to: localhost
+      run_once: true
+      debug:
+        msg: "Inventory report written to {{ report_file }}"
