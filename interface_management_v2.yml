@@ -1,0 +1,130 @@
+---
+# 018_interface_error_recovery.yml
+#
+# Interface Error Monitoring and Automated Recovery
+# Polls interface counters, flags interfaces with high error rates,
+# and attempts link-bounce recovery for non-uplink ports.
+#
+# Inventory example:
+# [ios_switches]
+# sw-access-01  ansible_host=10.10.1.11
+# sw-access-02  ansible_host=10.10.1.12
+#
+# [ios_switches:vars]
+# ansible_network_os=ios
+# ansible_connection=network_cli
+# ansible_user={{ vault_net_user }}          # ansible-vault encrypted
+# ansible_password={{ vault_net_password }}  # ansible-vault encrypted
+# ansible_become=yes
+# ansible_become_method=enable
+# ansible_become_password={{ vault_enable_password }}
+#
+# error_threshold: input/output errors per cycle to trigger action (default 50)
+# protected_interfaces: comma-separated list never bounced (e.g. Gi0/0,Gi0/1)
+
+- name: Interface Error Monitoring and Automated Recovery
+  hosts: ios_switches
+  gather_facts: false
+  vars:
+    error_threshold: "{{ error_threshold | default(50) }}"
+    protected_interfaces: "{{ protected_interfaces | default(['GigabitEthernet0/0', 'GigabitEthernet0/1']) }}"
+    recovery_wait_seconds: 10
+
+  tasks:
+
+    - name: Collect interface error counters
+      cisco.ios.ios_command:
+        commands:
+          - show interfaces
+          - show interfaces counters errors
+      register: interface_output
+      retries: 3
+      delay: 5
+      until: interface_output is not failed
+
+    - name: Parse error counters via template
+      ansible.utils.cli_parse:
+        text: "{{ interface_output.stdout[1] }}"
+        parser:
+          name: ansible.netcommon.ntc_templates
+          command: show interfaces counters errors
+        set_fact: parsed_errors
+      ignore_errors: true
+
+    - name: Display raw error output when parsing unavailable
+      ansible.builtin.debug:
+        msg: "{{ interface_output.stdout[1] }}"
+      when: parsed_errors is not defined or parsed_errors | length == 0
+
+    - name: Identify interfaces exceeding error threshold
+      ansible.builtin.set_fact:
+        degraded_interfaces: >-
+          {{ parsed_errors | default([])
+             | selectattr('align_errors', 'defined')
+             | selectattr('align_errors', 'ge', error_threshold | int)
+             | map(attribute='port')
+             | list }}
+      when: parsed_errors is defined
+
+    - name: Report degraded interfaces
+      ansible.builtin.debug:
+        msg: >
+          HOST {{ inventory_hostname }} — degraded interfaces above
+          threshold ({{ error_threshold }} errors): {{ degraded_interfaces | join(', ') }}
+      when: degraded_interfaces is defined and degraded_interfaces | length > 0
+
+    - name: Bounce non-protected degraded interfaces
+      block:
+        - name: Shutdown degraded interface
+          cisco.ios.ios_config:
+            lines:
+              - shutdown
+            parents: "interface {{ item }}"
+          loop: "{{ degraded_interfaces | default([]) }}"
+          when:
+            - degraded_interfaces is defined
+            - item not in protected_interfaces
+          register: shutdown_result
+
+        - name: Wait before re-enabling
+          ansible.builtin.pause:
+            seconds: "{{ recovery_wait_seconds }}"
+          when: shutdown_result.changed
+
+        - name: Re-enable bounced interface
+          cisco.ios.ios_config:
+            lines:
+              - no shutdown
+            parents: "interface {{ item }}"
+          loop: "{{ degraded_interfaces | default([]) }}"
+          when:
+            - degraded_interfaces is defined
+            - item not in protected_interfaces
+          register: noshut_result
+          failed_when:
+            - noshut_result is failed
+            - "'Invalid' in noshut_result.msg | default('')"
+
+      rescue:
+        - name: Log recovery failure and alert
+          ansible.builtin.debug:
+            msg: >
+              RECOVERY FAILED on {{ inventory_hostname }}.
+              Manual intervention required for: {{ degraded_interfaces | join(', ') }}.
+              Error: {{ ansible_failed_result.msg | default('unknown') }}
+
+    - name: Save configuration after changes
+      cisco.ios.ios_config:
+        save_when: changed
+
+    - name: Final summary per host
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          degraded_found: "{{ degraded_interfaces | default([]) | length }}"
+          protected_skipped: >-
+            {{ degraded_interfaces | default([])
+               | intersect(protected_interfaces) }}
+          bounced: >-
+            {{ degraded_interfaces | default([])
+               | difference(protected_interfaces) }}
