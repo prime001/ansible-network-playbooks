@@ -1,0 +1,157 @@
+---
+# Ansible Playbook: Multi-Vendor Syslog Configuration with Rate-Limiting and Verification
+# Configures syslog servers, facility/severity filters, and rate-limiting across
+# Cisco IOS, NX-OS, and Juniper JunOS platforms. Verifies post-change state.
+#
+# Inventory example:
+#   [ios_routers]
+#   rtr-core-01 ansible_host=10.0.1.1
+#   rtr-core-02 ansible_host=10.0.1.2
+#
+#   [nxos_switches]
+#   sw-dist-01 ansible_host=10.0.2.1
+#
+#   [junos_devices]
+#   fw-edge-01 ansible_host=10.0.3.1
+#
+#   [network:children]
+#   ios_routers
+#   nxos_switches
+#   junos_devices
+#
+#   [network:vars]
+#   ansible_user={{ vault_net_user }}          # ansible-vault encrypted
+#   ansible_password={{ vault_net_password }}  # ansible-vault encrypted
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_enable_password }}
+#   ansible_connection=network_cli
+
+- name: Multi-Vendor Syslog Configuration — Rate-Limiting and Facility Filtering
+  hosts: network
+  gather_facts: false
+
+  vars:
+    syslog_servers:
+      - host: 10.0.100.10
+        vrf: MGMT
+      - host: 10.0.100.11
+        vrf: MGMT
+    syslog_facility: local6
+    syslog_severity: informational
+    syslog_rate_limit: 500           # messages per second (IOS/NXOS)
+    syslog_buffer_size: 65536
+    syslog_source_interface: Loopback0
+    expected_server_count: 2
+
+  tasks:
+    - name: Configure syslog on Cisco IOS devices
+      when: inventory_hostname in groups['ios_routers']
+      block:
+        - name: IOS — push syslog server, buffering, and rate-limit config
+          cisco.ios.ios_config:
+            lines:
+              - "logging buffered {{ syslog_buffer_size }} {{ syslog_severity }}"
+              - "logging rate-limit {{ syslog_rate_limit }}"
+              - "logging source-interface {{ syslog_source_interface }}"
+              - "logging facility {{ syslog_facility }}"
+              - "no logging console"
+              - "logging monitor {{ syslog_severity }}"
+            before:
+              - "no logging console guaranteed"
+          register: ios_config_result
+          retries: 2
+          delay: 5
+          until: ios_config_result is not failed
+
+        - name: IOS — add each syslog server in MGMT VRF
+          cisco.ios.ios_config:
+            lines:
+              - "logging host {{ item.host }} vrf {{ item.vrf }} transport udp port 514"
+          loop: "{{ syslog_servers }}"
+
+        - name: IOS — verify syslog servers are present
+          cisco.ios.ios_command:
+            commands: show logging | include Logging to
+          register: ios_verify
+          failed_when: >
+            ios_verify.stdout[0] | regex_findall('Logging to') | length < expected_server_count
+
+        - name: IOS — display syslog verification output
+          ansible.builtin.debug:
+            msg: "{{ ios_verify.stdout_lines[0] }}"
+
+      rescue:
+        - name: IOS — report configuration failure
+          ansible.builtin.debug:
+            msg: "FAILED to configure syslog on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
+
+    - name: Configure syslog on Cisco NX-OS devices
+      when: inventory_hostname in groups['nxos_switches']
+      block:
+        - name: NXOS — configure syslog servers, level, and rate-limit
+          cisco.nxos.nxos_config:
+            lines:
+              - "logging level {{ syslog_facility }} 6"
+              - "logging rate-limit {{ syslog_rate_limit }}"
+              - "logging origin-id hostname"
+              - "logging timestamp milliseconds"
+              - "logging monitor {{ syslog_severity }}"
+              - "logging logfile messages 6 size {{ syslog_buffer_size }}"
+          register: nxos_config_result
+          retries: 2
+          delay: 5
+          until: nxos_config_result is not failed
+
+        - name: NXOS — add each syslog server
+          cisco.nxos.nxos_config:
+            lines:
+              - "logging server {{ item.host }} 6 use-vrf {{ item.vrf }} facility {{ syslog_facility }}"
+          loop: "{{ syslog_servers }}"
+
+        - name: NXOS — verify logging configuration
+          cisco.nxos.nxos_command:
+            commands: show logging server
+          register: nxos_verify
+
+        - name: NXOS — display syslog server table
+          ansible.builtin.debug:
+            msg: "{{ nxos_verify.stdout_lines[0] }}"
+
+      rescue:
+        - name: NXOS — report configuration failure
+          ansible.builtin.debug:
+            msg: "FAILED to configure syslog on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
+
+    - name: Configure syslog on Juniper JunOS devices
+      when: inventory_hostname in groups['junos_devices']
+      block:
+        - name: JunOS — push syslog configuration via set commands
+          junipernetworks.junos.junos_config:
+            lines:
+              - "set system syslog host {{ item.host }} {{ syslog_facility }} {{ syslog_severity }}"
+              - "set system syslog host {{ item.host }} port 514"
+              - "set system syslog host {{ item.host }} source-address {{ syslog_source_interface }}"
+            comment: "Ansible-managed syslog — {{ lookup('pipe', 'date +%Y-%m-%d') }}"
+            update: merge
+          loop: "{{ syslog_servers }}"
+          register: junos_config_result
+
+        - name: JunOS — verify syslog hosts are committed
+          junipernetworks.junos.junos_command:
+            commands: show system syslog
+            display: text
+          register: junos_verify
+          failed_when: >
+            syslog_servers | map(attribute='host') | list
+            | difference(junos_verify.stdout[0] | regex_findall('\\d+\\.\\d+\\.\\d+\\.\\d+'))
+            | length > 0
+
+        - name: JunOS — display active syslog configuration
+          ansible.builtin.debug:
+            msg: "{{ junos_verify.stdout_lines[0] }}"
+
+      rescue:
+        - name: JunOS — report configuration failure
+          ansible.builtin.debug:
+            msg: "FAILED to configure syslog on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
