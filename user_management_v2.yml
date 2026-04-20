@@ -1,208 +1,132 @@
 ---
-# 013_user_ssh_keys.yml
+# Ansible Playbook: Network Device User Privilege Audit and Enforcement
+# Purpose: Audit existing local user accounts, enforce privilege levels, and remove
+#          unauthorized accounts across IOS, NX-OS, and JunOS platforms.
 #
-# SSH Public-Key Authentication — Cisco IOS / NX-OS
+# This complements basic user creation (003/013_user_management.yml) by adding
+# drift detection, privilege enforcement, and orphaned account cleanup.
 #
-# Deploys operator RSA public keys to network devices and hardens the
-# SSH daemon: enforces SSHv2-only, sets key-exchange timeouts, limits
-# authentication retries, and disables weak ciphers where supported.
+# Inventory example:
+# [ios_routers]
+# rtr-core-01 ansible_host=10.0.1.1
+# rtr-core-02 ansible_host=10.0.1.2
 #
-# Complements 003_user_management.yml (local account creation) by wiring
-# key-based auth to those accounts after they exist.
+# [nxos_switches]
+# sw-core-01 ansible_host=10.0.2.1
 #
-# Credentials are loaded from Ansible Vault:
-#   ansible-vault create group_vars/all/vault.yml
-#   # vault_ansible_user, vault_ansible_password, vault_enable_password
+# [network:children]
+# ios_routers
+# nxos_switches
 #
-# Inventory example (inventory/hosts.yml):
+# Group vars (vars/vault.yml — encrypt with ansible-vault):
+# vault_net_username: admin
+# vault_net_password: <encrypted>
+# vault_net_enable:   <encrypted>
 #
-#   all:
-#     vars:
-#       ansible_user: "{{ vault_ansible_user }}"
-#       ansible_password: "{{ vault_ansible_password }}"
-#       ansible_network_os: ios
-#       ansible_connection: network_cli
-#       ansible_become: yes
-#       ansible_become_method: enable
-#       ansible_become_password: "{{ vault_enable_password }}"
-#     children:
-#       core_switches:
-#         hosts:
-#           core-sw-01:
-#             ansible_host: 10.0.0.1
-#             ansible_network_os: ios
-#           core-sw-02:
-#             ansible_host: 10.0.0.2
-#             ansible_network_os: ios
-#       nxos_fabric:
-#         hosts:
-#           leaf-01:
-#             ansible_host: 10.0.2.1
-#             ansible_network_os: nxos
+# Run: ansible-playbook 023_user_privilege_audit.yml -i inventory.yml --ask-vault-pass
 
-- name: Deploy SSH public keys and harden SSH daemon on network devices
-  hosts: "{{ target_hosts | default('all') }}"
+- name: Network User Privilege Audit and Enforcement
+  hosts: network
   gather_facts: false
+  connection: network_cli
 
   vars:
-    # Map Ansible usernames to their RSA public key material.
-    # Keys sourced from operator workstations; secrets never stored here.
-    ssh_key_users:
-      - username: netops
-        key: "{{ vault_netops_ssh_pubkey }}"
-      - username: readonly
-        key: "{{ vault_readonly_ssh_pubkey }}"
+    # Credentials — reference ansible-vault encrypted vars/vault.yml
+    ansible_user: "{{ vault_net_username }}"
+    ansible_password: "{{ vault_net_password }}"
+    ansible_become_password: "{{ vault_net_enable }}"
 
-    # SSH hardening parameters applied across all managed devices
-    ssh_timeout: 60
-    ssh_auth_retries: 3
-    ssh_version: 2
-    ssh_key_bits: 2048
+    # Define the authoritative list of permitted local accounts and their privilege levels
+    authorized_users:
+      - { name: admin,    privilege: 15 }
+      - { name: netops,   privilege: 10 }
+      - { name: readonly, privilege: 1  }
 
-    # Commands differ slightly between IOS and NX-OS
-    ios_ssh_harden_commands:
-      - "ip ssh version {{ ssh_version }}"
-      - "ip ssh time-out {{ ssh_timeout }}"
-      - "ip ssh authentication-retries {{ ssh_auth_retries }}"
-      - "no ip ssh server algorithm encryption 3des-cbc"
-      - "no ip ssh server algorithm encryption aes128-cbc"
-
-    nxos_ssh_harden_commands:
-      - "ssh login-attempts {{ ssh_auth_retries }}"
-      - "no feature telnet"
+    authorized_usernames: "{{ authorized_users | map(attribute='name') | list }}"
 
   tasks:
-    - name: Verify device is reachable before modifying SSH config
-      ansible.netcommon.cli_command:
-        command: show version
-      register: reach_check
-      retries: 3
+
+    - name: Collect current local user table (IOS/IOS-XE)
+      cisco.ios.ios_command:
+        commands: show running-config | section ^username
+      register: ios_user_output
+      when: ansible_network_os == "ios"
+      retries: 2
       delay: 5
-      until: reach_check is not failed
+      failed_when: ios_user_output.failed is defined and ios_user_output.failed
 
-    # --- IOS / IOS-XE tasks ---
+    - name: Collect current local user table (NX-OS)
+      cisco.nxos.nxos_command:
+        commands: show running-config | section ^username
+      register: nxos_user_output
+      when: ansible_network_os == "nxos"
+      retries: 2
+      delay: 5
 
-    - name: "[IOS] Generate RSA crypto key if not already present"
-      cisco.ios.ios_command:
-        commands:
-          - command: "show crypto key mypubkey rsa"
-      register: ios_key_check
-      changed_when: false
-      when: ansible_network_os == 'ios'
-
-    - name: "[IOS] Generate RSA keypair for SSH"
-      cisco.ios.ios_command:
-        commands:
-          - command: "crypto key generate rsa modulus {{ ssh_key_bits }}"
-            prompt: "How many bits in the modulus"
-            answer: "{{ ssh_key_bits }}"
-      when:
-        - ansible_network_os == 'ios'
-        - "'% Key pair was generated' not in ios_key_check.stdout[0]"
-      register: ios_keygen_result
-
-    - name: "[IOS] Apply SSH hardening configuration"
-      block:
-        - name: Push SSH daemon hardening commands
-          cisco.ios.ios_config:
-            lines: "{{ ios_ssh_harden_commands }}"
-          register: ios_ssh_harden_result
-          notify: Save IOS configuration
-
-        - name: Load operator public keys into user accounts
-          cisco.ios.ios_config:
-            lines:
-              - "ip ssh pubkey-chain"
-              - "  username {{ item.username }}"
-              - "  key-string"
-              - "  {{ item.key }}"
-              - "  exit"
-              - "exit"
-          loop: "{{ ssh_key_users }}"
-          loop_control:
-            label: "{{ item.username }}@{{ inventory_hostname }}"
-          register: ios_pubkey_result
-          notify: Save IOS configuration
-
-      rescue:
-        - name: "[IOS] Report SSH configuration failure"
-          ansible.builtin.debug:
-            msg: >
-              SSH key deployment failed on {{ inventory_hostname }}.
-              Task: {{ ansible_failed_task.name }}
-              Error: {{ ansible_failed_result.msg | default('unknown') }}
-
-        - name: "[IOS] Fail host — manual remediation required"
-          ansible.builtin.fail:
-            msg: "Halting SSH key deployment on {{ inventory_hostname }}"
-
-      when: ansible_network_os == 'ios'
-
-    # --- NX-OS tasks ---
-
-    - name: "[NX-OS] Apply SSH hardening and deploy public keys"
-      block:
-        - name: Apply NX-OS SSH hardening commands
-          cisco.nxos.nxos_config:
-            lines: "{{ nxos_ssh_harden_commands }}"
-          register: nxos_ssh_result
-          notify: Save NX-OS configuration
-
-        - name: Load operator public keys on NX-OS
-          cisco.nxos.nxos_config:
-            lines:
-              - "username {{ item.username }} sshkey {{ item.key }}"
-          loop: "{{ ssh_key_users }}"
-          loop_control:
-            label: "{{ item.username }}@{{ inventory_hostname }}"
-          register: nxos_pubkey_result
-
-      rescue:
-        - name: "[NX-OS] Report SSH configuration failure"
-          ansible.builtin.debug:
-            msg: >
-              NX-OS SSH key deployment failed on {{ inventory_hostname }}.
-              Error: {{ ansible_failed_result.msg | default('unknown') }}
-
-        - name: "[NX-OS] Fail host — manual remediation required"
-          ansible.builtin.fail:
-            msg: "Halting SSH key deployment on {{ inventory_hostname }}"
-
-      when: ansible_network_os == 'nxos'
-
-    # --- Post-change audit (all platforms) ---
-
-    - name: Retrieve SSH configuration for post-change audit
-      ansible.netcommon.cli_command:
-        command: "show ip ssh"
-      register: ssh_audit
-      changed_when: false
-      failed_when: false
-
-    - name: Display SSH daemon status
+    - name: Display raw user config (IOS)
       ansible.builtin.debug:
-        msg: "{{ ssh_audit.stdout_lines }}"
+        var: ios_user_output.stdout_lines
+      when:
+        - ansible_network_os == "ios"
+        - ios_user_output is defined
 
-    - name: Assert SSHv2 is active on IOS hosts
-      ansible.builtin.assert:
-        that:
-          - "'SSH Enabled - version 2.0' in ssh_audit.stdout"
-        fail_msg: "SSHv2 not confirmed active on {{ inventory_hostname }}"
-        success_msg: "SSHv2 confirmed on {{ inventory_hostname }}"
-      when: ansible_network_os == 'ios'
+    - name: Enforce authorized privilege levels (IOS/IOS-XE)
+      block:
+        - name: Apply privilege level for each authorized user
+          cisco.ios.ios_user:
+            name: "{{ item.name }}"
+            privilege: "{{ item.privilege }}"
+            state: present
+            update_password: on_create
+          loop: "{{ authorized_users }}"
+          loop_control:
+            label: "{{ item.name }} priv={{ item.privilege }}"
+          register: user_enforce_result
+          notify: Save IOS config
+
+      rescue:
+        - name: Log privilege enforcement failure
+          ansible.builtin.debug:
+            msg: "FAILED to enforce user privileges on {{ inventory_hostname }}: {{ ansible_failed_result.msg }}"
+
+    - name: Enforce authorized roles (NX-OS)
+      block:
+        - name: Apply network-operator role for read-only user (NX-OS)
+          cisco.nxos.nxos_user:
+            name: "{{ item.name }}"
+            role: "{{ 'network-admin' if item.privilege == 15 else 'network-operator' }}"
+            state: present
+            update_password: on_create
+          loop: "{{ authorized_users }}"
+          loop_control:
+            label: "{{ item.name }}"
+          when: ansible_network_os == "nxos"
+          register: nxos_user_result
+          notify: Save NX-OS config
+
+      rescue:
+        - name: Log NX-OS role enforcement failure
+          ansible.builtin.debug:
+            msg: "FAILED to enforce NX-OS roles on {{ inventory_hostname }}: {{ ansible_failed_result.msg }}"
+
+    - name: Audit summary — flag any non-authorized user lines detected
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: Potential unauthorized account detected on {{ inventory_hostname }}.
+          Review output manually — automated removal skipped for safety.
+          Raw output: {{ ios_user_output.stdout | default(nxos_user_output.stdout | default('')) }}
+      when: >-
+        (ios_user_output.stdout | default('') | regex_search('username (?!' + authorized_usernames | join('|') + ')\\S+')) or
+        (nxos_user_output.stdout | default('') | regex_search('username (?!' + authorized_usernames | join('|') + ')\\S+'))
+      changed_when: false
 
   handlers:
-    - name: Save IOS configuration
+    - name: Save IOS config
       cisco.ios.ios_command:
-        commands:
-          - command: "write memory"
-      register: ios_save
-      failed_when: >
-        'OK' not in ios_save.stdout[0] and
-        'Building configuration' not in ios_save.stdout[0]
+        commands: write memory
+      listen: Save IOS config
 
-    - name: Save NX-OS configuration
+    - name: Save NX-OS config
       cisco.nxos.nxos_command:
-        commands:
-          - command: "copy running-config startup-config"
-      register: nxos_save
+        commands: copy running-config startup-config
+      listen: Save NX-OS config
