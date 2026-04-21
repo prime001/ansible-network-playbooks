@@ -1,146 +1,140 @@
 ---
-# 014_pre_change_snapshot.yml
-# Ansible Playbook: Pre-Change Configuration Snapshot
+# 024_config_backup.yml
+# Multi-vendor network configuration backup with rotation and integrity verification
 #
-# Purpose: Captures a comprehensive pre-maintenance snapshot of network device
-#          state before a change window — running config, routing table, interface
-#          status, and ARP/MAC tables. Stores results in a timestamped directory
-#          to support rollback comparison post-change.
+# Inventory example:
+#   [ios_devices]
+#   router1 ansible_host=10.0.1.1 ansible_network_os=ios
+#   router2 ansible_host=10.0.1.2 ansible_network_os=ios
 #
-# This playbook complements 004_config_backup.yml (periodic scheduled backups)
-# by providing a richer point-in-time capture explicitly tied to change windows.
+#   [nxos_devices]
+#   switch1 ansible_host=10.0.2.1 ansible_network_os=nxos
 #
-# Supported platforms: Cisco IOS / IOS-XE (ansible_network_os: ios)
+#   [junos_devices]
+#   fw1 ansible_host=10.0.3.1 ansible_network_os=junos
 #
-# Credentials: Stored in Ansible Vault — reference vars/vault.yml
-#   ansible-vault create vars/vault.yml
-#   vault_net_user, vault_net_pass, vault_enable_pass
+#   [network:children]
+#   ios_devices
+#   nxos_devices
+#   junos_devices
 #
-# Example inventory (inventory/network.yml):
-# ---
-# all:
-#   children:
-#     ios_devices:
-#       hosts:
-#         core-rtr-01:
-#           ansible_host: 10.0.1.1
-#         dist-sw-01:
-#           ansible_host: 10.0.1.10
-#   vars:
-#     ansible_connection: network_cli
-#     ansible_network_os: ios
-#     ansible_user: "{{ vault_net_user }}"
-#     ansible_password: "{{ vault_net_pass }}"
-#     ansible_become: true
-#     ansible_become_method: enable
-#     ansible_become_password: "{{ vault_enable_pass }}"
-#
-# Usage:
-#   ansible-playbook 014_pre_change_snapshot.yml \
-#     -i inventory/network.yml \
-#     --vault-password-file ~/.vault_pass \
-#     -e "change_id=CHG0042"
+#   [network:vars]
+#   ansible_user={{ vault_net_user }}       # store in ansible-vault
+#   ansible_password={{ vault_net_pass }}   # store in ansible-vault
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_connection=network_cli
 
-- name: Pre-Change Network State Snapshot
-  hosts: all
+- name: Multi-vendor Config Backup with Rotation and Integrity Check
+  hosts: network
   gather_facts: false
 
   vars:
-    change_id: "UNTRACKED"
-    snapshot_root: "{{ playbook_dir }}/snapshots"
-    timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
-    snapshot_dir: "{{ snapshot_root }}/{{ change_id }}/{{ inventory_hostname }}"
-    # Commands to capture — extend list as needed per environment
-    state_commands:
-      - { cmd: "show running-config",       file: "running-config.txt" }
-      - { cmd: "show ip route",             file: "ip-route.txt" }
-      - { cmd: "show ip interface brief",   file: "ip-int-brief.txt" }
-      - { cmd: "show interfaces",           file: "interfaces.txt" }
-      - { cmd: "show ip arp",               file: "arp-table.txt" }
-      - { cmd: "show version",              file: "version.txt" }
-      - { cmd: "show ip bgp summary",       file: "bgp-summary.txt" }
-      - { cmd: "show spanning-tree summary", file: "stp-summary.txt" }
-
-  pre_tasks:
-    - name: Create per-host snapshot directory
-      delegate_to: localhost
-      file:
-        path: "{{ snapshot_dir }}"
-        state: directory
-        mode: "0750"
-
-    - name: Write snapshot manifest header
-      delegate_to: localhost
-      copy:
-        content: |
-          change_id: {{ change_id }}
-          host: {{ inventory_hostname }}
-          captured_at: {{ timestamp }}
-          ansible_host: {{ ansible_host | default('unknown') }}
-        dest: "{{ snapshot_dir }}/manifest.yml"
-        mode: "0640"
+    backup_root: "/opt/net-backups"
+    backup_date: "{{ lookup('pipe', 'date +%Y-%m-%d') }}"
+    backup_keep_days: 30
+    backup_dir: "{{ backup_root }}/{{ inventory_hostname }}/{{ backup_date }}"
+    latest_link: "{{ backup_root }}/{{ inventory_hostname }}/latest.cfg"
 
   tasks:
-    - name: Capture device state commands
-      block:
-        - name: Run state command — {{ item.cmd }}
-          cisco.ios.ios_command:
-            commands:
-              - "{{ item.cmd }}"
-          register: cmd_out
-          retries: 2
-          delay: 4
-          until: cmd_out is not failed
-          loop: "{{ state_commands }}"
-          loop_control:
-            label: "{{ item.file }}"
-
-        - name: Write each command output to file
-          delegate_to: localhost
-          copy:
-            content: |
-              # Command: {{ item.item.cmd }}
-              # Host:    {{ inventory_hostname }}
-              # Time:    {{ timestamp }}
-              # Change:  {{ change_id }}
-
-              {{ item.stdout[0] }}
-            dest: "{{ snapshot_dir }}/{{ item.item.file }}"
-            mode: "0640"
-          loop: "{{ cmd_out.results }}"
-          loop_control:
-            label: "{{ item.item.file }}"
-          when: item.stdout is defined
-
-        - name: Confirm snapshot complete
-          debug:
-            msg: >
-              [OK] {{ inventory_hostname }} snapshot saved to
-              {{ snapshot_dir }}/ ({{ state_commands | length }} files)
-
-      rescue:
-        - name: Record snapshot failure
-          delegate_to: localhost
-          lineinfile:
-            path: "{{ snapshot_root }}/{{ change_id }}/snapshot_failures.log"
-            line: "{{ timestamp }} FAILED {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
-            create: true
-            mode: "0640"
-
-        - name: Alert on failure
-          debug:
-            msg: >
-              [WARN] Snapshot FAILED for {{ inventory_hostname }} during
-              change {{ change_id }}. Logged to snapshot_failures.log.
-              Review before proceeding with change window.
-          failed_when: true
-
-  post_tasks:
-    - name: Report snapshot root location
+    - name: Ensure per-device backup directory exists
+      ansible.builtin.file:
+        path: "{{ backup_dir }}"
+        state: directory
+        mode: "0750"
       delegate_to: localhost
-      run_once: true
-      debug:
-        msg: >
-          Pre-change snapshots for {{ change_id }} stored in
-          {{ snapshot_root }}/{{ change_id }}/
-          Compare post-change with: diff -rq {{ snapshot_root }}/{{ change_id }}/ <post_dir>/
+
+    - name: Capture running config — IOS/IOS-XE
+      cisco.ios.ios_command:
+        commands: show running-config
+      register: ios_config
+      retries: 3
+      delay: 5
+      until: ios_config is not failed
+      when: ansible_network_os == "ios"
+
+    - name: Capture running config — NX-OS
+      cisco.nxos.nxos_command:
+        commands: show running-config
+      register: nxos_config
+      retries: 3
+      delay: 5
+      until: nxos_config is not failed
+      when: ansible_network_os == "nxos"
+
+    - name: Capture running config — Junos
+      junipernetworks.junos.junos_command:
+        commands: show configuration
+        display: text
+      register: junos_config
+      retries: 3
+      delay: 5
+      until: junos_config is not failed
+      when: ansible_network_os == "junos"
+
+    - name: Normalize config output into single variable
+      ansible.builtin.set_fact:
+        raw_config: >-
+          {{
+            (ios_config.stdout[0]   if ansible_network_os == 'ios'   else
+             nxos_config.stdout[0]  if ansible_network_os == 'nxos'  else
+             junos_config.stdout[0] if ansible_network_os == 'junos' else '')
+          }}
+
+    - name: Write config to timestamped file
+      ansible.builtin.copy:
+        content: "{{ raw_config }}\n"
+        dest: "{{ backup_dir }}/running.cfg"
+        mode: "0640"
+      delegate_to: localhost
+      register: write_result
+
+    - name: Update 'latest' symlink to current backup
+      ansible.builtin.file:
+        src: "{{ backup_dir }}/running.cfg"
+        dest: "{{ latest_link }}"
+        state: link
+        force: true
+      delegate_to: localhost
+
+    - name: Compute SHA256 checksum of saved config
+      ansible.builtin.stat:
+        path: "{{ backup_dir }}/running.cfg"
+        checksum_algorithm: sha256
+        get_checksum: true
+      register: config_stat
+      delegate_to: localhost
+      failed_when: not config_stat.stat.exists
+
+    - name: Write checksum manifest alongside backup
+      ansible.builtin.copy:
+        content: "{{ config_stat.stat.checksum }}  running.cfg\n"
+        dest: "{{ backup_dir }}/running.cfg.sha256"
+        mode: "0640"
+      delegate_to: localhost
+
+    - name: Remove backups older than {{ backup_keep_days }} days
+      ansible.builtin.find:
+        paths: "{{ backup_root }}/{{ inventory_hostname }}"
+        file_type: directory
+        age: "{{ backup_keep_days }}d"
+      register: old_dirs
+      delegate_to: localhost
+
+    - name: Delete stale backup directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ old_dirs.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+      delegate_to: localhost
+
+    - name: Report backup summary
+      ansible.builtin.debug:
+        msg:
+          - "Host      : {{ inventory_hostname }} ({{ ansible_network_os }})"
+          - "Saved to  : {{ backup_dir }}/running.cfg"
+          - "SHA256    : {{ config_stat.stat.checksum }}"
+          - "Config KB : {{ (raw_config | length / 1024) | round(1) }}"
+          - "Purged    : {{ old_dirs.files | length }} old backup(s)"
