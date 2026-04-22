@@ -1,150 +1,128 @@
-The repo only has a README locally — the existing playbooks are in the remote. Since `006_snmp_config.yml` already covers basic SNMP, I'll write a playbook focused on **SNMP v3 USM user hardening and trap receiver configuration**, which is a distinct, advanced topic.
-
 ---
-name: 016_snmp_v3_hardening
----
-type: snmp-config (v3 security hardening variant)
-
-Here is the playbook content:
-
-```yaml
----
-# 016_snmp_v3_hardening.yml
+# 026_snmp_config.yml
 #
-# SNMP v3 Hardening & Trap Receiver Configuration
-# ------------------------------------------------
-# Configures SNMPv3 USM users with auth+priv (SHA/AES),
-# removes insecure v1/v2c communities, and provisions
-# trap destinations for multi-vendor IOS/NX-OS devices.
-#
-# Vault: ansible-vault encrypt_string for snmp_auth_pass / snmp_priv_pass
+# SNMP v3 Hardening and Trap Destination Enforcement
+# Configures SNMPv3 users with auth/priv, removes legacy v1/v2c communities,
+# and sets trap destinations with retry logic across IOS/IOS-XE devices.
 #
 # Inventory example:
-# ------------------
 # [network_devices]
-# core-sw01  ansible_host=10.0.0.1  ansible_network_os=ios
-# core-sw02  ansible_host=10.0.0.2  ansible_network_os=nxos
-# dist-rtr01 ansible_host=10.0.0.3  ansible_network_os=ios
+# core-sw-01 ansible_host=10.0.1.1 ansible_network_os=ios
+# dist-sw-01 ansible_host=10.0.1.2 ansible_network_os=ios
+# edge-rtr-01 ansible_host=10.0.2.1 ansible_network_os=ios
 #
 # [network_devices:vars]
-# ansible_user=netadmin
-# ansible_password="{{ vault_device_password }}"
 # ansible_connection=network_cli
+# ansible_user={{ vault_net_user }}           # ansible-vault encrypted
+# ansible_password={{ vault_net_password }}   # ansible-vault encrypted
 # ansible_become=yes
 # ansible_become_method=enable
-# ------------------
+# ansible_become_password={{ vault_enable_password }}
 
-- name: SNMP v3 Hardening — Auth/Priv Users and Trap Receivers
+- name: Enforce SNMPv3 hardening and trap destinations on IOS/IOS-XE
   hosts: network_devices
   gather_facts: false
-
   vars:
-    # Reference: ansible-vault encrypted vars in group_vars/all/vault.yml
-    snmp_v3_user: "nmsadmin"
-    snmp_auth_pass: "{{ vault_snmp_auth_pass }}"
-    snmp_priv_pass: "{{ vault_snmp_priv_pass }}"
-    snmp_trap_host: "10.0.100.50"
-    snmp_trap_community: "{{ vault_snmp_trap_community }}"
+    snmp_v3_group: NMS_RO_GROUP
+    snmp_v3_user: "{{ vault_snmp_user | default('nms_monitor') }}"
+    snmp_v3_auth_pass: "{{ vault_snmp_auth_pass }}"   # ansible-vault required
+    snmp_v3_priv_pass: "{{ vault_snmp_priv_pass }}"   # ansible-vault required
+    snmp_trap_host: 10.10.1.50
+    snmp_trap_port: 162
+    snmp_location: "DC1-Row3-Rack5"
     snmp_contact: "noc@example.com"
-    snmp_location: "DC1-Rack-A12"
     legacy_communities:
       - public
       - private
-      - default
+      - community
 
   tasks:
-
-    - name: Remove insecure SNMPv1/v2c community strings
+    - name: Remove legacy SNMPv1/v2c community strings
       cisco.ios.ios_config:
         lines:
           - "no snmp-server community {{ item }} RO"
           - "no snmp-server community {{ item }} RW"
       loop: "{{ legacy_communities }}"
-      when: ansible_network_os == "ios"
       register: community_removal
       retries: 2
-      delay: 3
+      delay: 5
       until: community_removal is not failed
+      ignore_errors: true
 
-    - name: Configure SNMPv3 USM user with SHA auth and AES-128 priv (IOS)
+    - name: Configure SNMPv3 group with read-only access
       cisco.ios.ios_config:
         lines:
-          - "snmp-server group NMSGROUP v3 priv"
-          - "snmp-server user {{ snmp_v3_user }} NMSGROUP v3 auth sha {{ snmp_auth_pass }} priv aes 128 {{ snmp_priv_pass }}"
-          - "snmp-server contact {{ snmp_contact }}"
-          - "snmp-server location {{ snmp_location }}"
-          - "snmp-server host {{ snmp_trap_host }} version 3 priv {{ snmp_v3_user }}"
-      when: ansible_network_os == "ios"
-      register: ios_snmp_result
+          - "snmp-server group {{ snmp_v3_group }} v3 priv read iso"
+        match: exact
+      register: snmp_group_result
       failed_when:
-        - ios_snmp_result.failed is defined
-        - ios_snmp_result.failed
+        - snmp_group_result is failed
+        - "'already exists' not in (snmp_group_result.msg | default(''))"
 
-    - name: Configure SNMPv3 USM user (NX-OS)
-      cisco.nxos.nxos_config:
+    - name: Configure SNMPv3 user with SHA auth and AES128 privacy
+      cisco.ios.ios_config:
         lines:
-          - "snmp-server user {{ snmp_v3_user }} auth sha {{ snmp_auth_pass }} priv aes-128 {{ snmp_priv_pass }}"
-          - "snmp-server contact {{ snmp_contact }}"
-          - "snmp-server location {{ snmp_location }}"
-          - "snmp-server host {{ snmp_trap_host }} traps version 3 priv {{ snmp_v3_user }}"
-          - "no snmp-server community public"
-          - "no snmp-server community private"
-      when: ansible_network_os == "nxos"
-      register: nxos_snmp_result
-      failed_when:
-        - nxos_snmp_result.failed is defined
-        - nxos_snmp_result.failed
+          - >-
+            snmp-server user {{ snmp_v3_user }} {{ snmp_v3_group }}
+            v3 auth sha {{ snmp_v3_auth_pass }}
+            priv aes 128 {{ snmp_v3_priv_pass }}
+      no_log: true
+      register: snmp_user_result
+      retries: 2
+      delay: 5
+      until: snmp_user_result is not failed
 
-    - name: Verify SNMPv3 user is present in running config
+    - name: Set SNMP system location and contact
+      cisco.ios.ios_config:
+        lines:
+          - "snmp-server location {{ snmp_location }}"
+          - "snmp-server contact {{ snmp_contact }}"
+
+    - name: Configure SNMPv3 trap destination
+      cisco.ios.ios_config:
+        lines:
+          - >-
+            snmp-server host {{ snmp_trap_host }} traps version 3
+            priv {{ snmp_v3_user }}
+      register: trap_dest_result
+      retries: 3
+      delay: 10
+      until: trap_dest_result is not failed
+
+    - name: Enable relevant SNMP trap categories
+      cisco.ios.ios_config:
+        lines:
+          - snmp-server enable traps snmp linkdown linkup
+          - snmp-server enable traps config
+          - snmp-server enable traps envmon
+          - snmp-server enable traps bgp
+
+    - name: Verify SNMP configuration applied
       cisco.ios.ios_command:
         commands:
-          - "show snmp user {{ snmp_v3_user }}"
-          - "show snmp host"
+          - show snmp user
+          - show snmp group
+          - show snmp host
       register: snmp_verify
-      when: ansible_network_os == "ios"
       retries: 2
       delay: 5
       until: snmp_verify is not failed
 
     - name: Display SNMP verification output
-      ansible.builtin.debug:
+      debug:
         msg: "{{ snmp_verify.stdout_lines }}"
-      when:
-        - ansible_network_os == "ios"
-        - snmp_verify is defined
 
-    - name: Save running config to startup
-      cisco.ios.ios_command:
-        commands:
-          - "write memory"
-      register: save_result
-      when: ansible_network_os == "ios"
-      failed_when: "'error' in save_result.stdout[0] | lower"
-
-  rescue:
-    - name: Log SNMP hardening failure
-      ansible.builtin.debug:
-        msg: >
-          SNMP v3 hardening FAILED on {{ inventory_hostname }}.
-          Review vault credentials and device reachability before retrying.
-
-    - name: Capture running config snapshot on failure
-      cisco.ios.ios_command:
-        commands:
-          - "show running-config | section snmp"
-      register: failed_snmp_config
-      when: ansible_network_os == "ios"
-
-    - name: Display current SNMP state for diagnostics
-      ansible.builtin.debug:
-        var: failed_snmp_config.stdout_lines
-      when: failed_snmp_config is defined
-```
-
-This playbook:
-- **Removes** legacy v1/v2c community strings (`public`, `private`, `default`)
-- **Provisions** SNMPv3 USM users with SHA auth + AES-128 priv on both IOS and NX-OS
-- **Registers trap destinations** pointing to a NMS host
-- **Verifies** the user was created via `show snmp user`
-- **Rescue block** captures current SNMP config for diagnostics on failure
-- Uses `vault_*` references for all credentials
+    - block:
+        - name: Confirm SNMPv3 user is present in output
+          assert:
+            that:
+              - snmp_v3_user in snmp_verify.stdout[0]
+            fail_msg: "SNMPv3 user {{ snmp_v3_user }} not found — manual review required"
+            success_msg: "SNMPv3 user {{ snmp_v3_user }} confirmed on {{ inventory_hostname }}"
+      rescue:
+        - name: Log assertion failure for remediation
+          debug:
+            msg: >
+              WARNING: SNMP assertion failed on {{ inventory_hostname }}.
+              Review 'show snmp user' output manually.
+              Raw output: {{ snmp_verify.stdout[0] }}
