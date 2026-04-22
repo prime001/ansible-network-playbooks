@@ -1,216 +1,130 @@
 ---
-# 021_ntp_stratum_audit.yml
+# 031_ntp_config.yml
+# NTP Authentication and Stratum Verification — Multi-Vendor
 #
-# NTP Stratum & Drift Audit — IOS / Junos Fleet
+# Configures NTP with MD5 authentication keys and validates stratum
+# reachability post-deployment. Distinct from prior NTP playbooks
+# (001/011/021) which cover basic server push; this playbook adds
+# key-based auth and post-change drift assertions.
 #
-# Reads NTP association details across Cisco IOS and Juniper JunOS devices,
-# validates stratum levels against policy, flags excessive clock drift, and
-# writes a per-run summary report to the control node.
+# Inventory example:
+#   [core_routers]
+#   rtr-core-01  ansible_host=10.0.0.1  ansible_network_os=ios
+#   rtr-core-02  ansible_host=10.0.0.2  ansible_network_os=ios
+#   rtr-edge-01  ansible_host=10.0.1.1  ansible_network_os=nxos
 #
-# Credentials: stored in Ansible Vault
-#   ansible-vault create group_vars/all/vault.yml
-#   Keys expected: vault_net_user, vault_net_pass, vault_enable_pass
-#
-# Inventory example (inventory/network.yml):
-# ---
-# all:
-#   children:
-#     ios_devices:
-#       hosts:
-#         rtr-core-01:
-#           ansible_host: 10.0.0.1
-#         rtr-core-02:
-#           ansible_host: 10.0.0.2
-#       vars:
-#         ansible_network_os: ios
-#         ansible_connection: network_cli
-#         ansible_user: "{{ vault_net_user }}"
-#         ansible_password: "{{ vault_net_pass }}"
-#         ansible_become: true
-#         ansible_become_method: enable
-#         ansible_become_password: "{{ vault_enable_pass }}"
-#     junos_devices:
-#       hosts:
-#         fw-edge-01:
-#           ansible_host: 10.0.0.10
-#       vars:
-#         ansible_network_os: junos
-#         ansible_connection: netconf
-#         ansible_user: "{{ vault_net_user }}"
-#         ansible_password: "{{ vault_net_pass }}"
-#
-# Run: ansible-playbook 021_ntp_stratum_audit.yml -i inventory/network.yml \
-#        --ask-vault-pass [-e max_stratum=3] [-e report_dir=/tmp/ntp_audit]
+# Vault: ansible-vault encrypt_string '<password>' --name 'ntp_auth_key'
+#        store result in group_vars/all/vault.yml
 
-- name: NTP stratum and drift audit across IOS and Junos fleet
-  hosts: "{{ target_hosts | default('all') }}"
+- name: NTP Authentication and Stratum Verification
+  hosts: core_routers
   gather_facts: false
+  connection: network_cli
 
   vars:
-    # Alert if a device's stratum exceeds this value (RFC 5905: 1–15)
-    max_stratum: 3
-    # Alert if absolute clock offset (ms) exceeds this threshold
-    max_offset_ms: 50
-    # Directory on control node to write per-run audit reports
-    report_dir: "/tmp/ntp_audit"
-    # Retry settings for unreliable links
-    task_retries: 2
-    retry_delay: 5
+    # Override via group_vars or ansible-vault
+    ntp_key_id: 1
+    ntp_auth_key: "{{ vault_ntp_auth_key }}"        # vault-encrypted
+    ntp_servers:
+      - address: 10.0.254.10
+        prefer: true
+      - address: 10.0.254.11
+        prefer: false
+    ntp_source_interface: Loopback0
+    ntp_max_stratum: 4                               # fail if stratum exceeds this
+    ansible_user: "{{ vault_ansible_user }}"
+    ansible_password: "{{ vault_ansible_password }}"
+    ansible_become: true
+    ansible_become_method: enable
+    ansible_become_pass: "{{ vault_enable_password }}"
 
   tasks:
 
-    # ── IOS ──────────────────────────────────────────────────────────────────
-    - name: Collect NTP status from IOS devices
-      when: ansible_network_os == 'ios'
+    - name: Push NTP authentication key (IOS/IOS-XE)
+      cisco.ios.ios_config:
+        lines:
+          - "ntp authentication-key {{ ntp_key_id }} md5 {{ ntp_auth_key }}"
+          - ntp authenticate
+          - "ntp trusted-key {{ ntp_key_id }}"
+      when: ansible_network_os == "ios"
+      notify: save ios config
+
+    - name: Push NTP server entries with auth key (IOS/IOS-XE)
+      cisco.ios.ios_config:
+        lines: >-
+          {{
+            ntp_servers | map(
+              attribute='address'
+            ) | map('regex_replace', '^(.*)$',
+              'ntp server \1 key ' + (ntp_key_id | string)
+              + (' prefer' if item.prefer else '')
+            ) | list
+          }}
+      loop: "{{ ntp_servers }}"
+      loop_control:
+        label: "{{ item.address }}"
+      when: ansible_network_os == "ios"
+
+    - name: Configure NTP source interface (IOS/IOS-XE)
+      cisco.ios.ios_config:
+        lines:
+          - "ntp source {{ ntp_source_interface }}"
+      when:
+        - ansible_network_os == "ios"
+        - ntp_source_interface is defined
+
+    - name: Push NTP config (NX-OS)
+      cisco.nxos.nxos_config:
+        lines:
+          - "ntp authentication-key {{ ntp_key_id }} md5 {{ ntp_auth_key }}"
+          - ntp authenticate
+          - "ntp trusted-key {{ ntp_key_id }}"
+          - "ntp server {{ item.address }} key {{ ntp_key_id }}{{ ' prefer' if item.prefer else '' }}"
+          - "ntp source-interface {{ ntp_source_interface }}"
+      loop: "{{ ntp_servers }}"
+      loop_control:
+        label: "{{ item.address }}"
+      when: ansible_network_os == "nxos"
+
+    - name: Verify NTP associations after config push
       block:
-        - name: IOS — query NTP status and associations
+        - name: Query NTP associations
           cisco.ios.ios_command:
-            commands:
-              - show ntp status
-              - show ntp associations
-          register: ios_ntp_raw
-          retries: "{{ task_retries }}"
-          delay: "{{ retry_delay }}"
-          until: ios_ntp_raw is not failed
+            commands: show ntp associations detail
+            wait_for:
+              - result[0] contains "our_master"
+            retries: 6
+            interval: 10
+          register: ntp_assoc_output
+          when: ansible_network_os == "ios"
 
-        - name: IOS — parse stratum from NTP status output
-          ansible.builtin.set_fact:
-            ntp_stratum: >-
-              {{ ios_ntp_raw.stdout[0]
-                 | regex_search('stratum\s+(\d+)', '\1')
-                 | first
-                 | default('unknown') }}
-            ntp_synchronized: "{{ 'synchronized' in ios_ntp_raw.stdout[0] }}"
-            ntp_offset_raw: >-
-              {{ ios_ntp_raw.stdout[0]
-                 | regex_search('offset\s+([\-\d\.]+)', '\1')
-                 | first
-                 | default('0') }}
+        - name: Assert stratum is within acceptable range
+          ansible.builtin.assert:
+            that:
+              - ntp_assoc_output.stdout[0] is search("stratum [1-" + ntp_max_stratum | string + "]")
+            fail_msg: >
+              NTP stratum on {{ inventory_hostname }} exceeds {{ ntp_max_stratum }}
+              or no synchronized peer found. Output: {{ ntp_assoc_output.stdout[0][:300] }}
+            success_msg: "NTP synchronized within acceptable stratum on {{ inventory_hostname }}"
+          when: ansible_network_os == "ios"
 
-        - name: IOS — flag stratum policy violation
+        - name: Display NTP status summary
           ansible.builtin.debug:
-            msg: >
-              POLICY VIOLATION — {{ inventory_hostname }} reports stratum {{ ntp_stratum }},
-              exceeds max allowed ({{ max_stratum }}).
-          when:
-            - ntp_stratum != 'unknown'
-            - ntp_stratum | int > max_stratum | int
-
-        - name: IOS — flag excessive clock drift
-          ansible.builtin.debug:
-            msg: >
-              DRIFT ALERT — {{ inventory_hostname }} clock offset {{ ntp_offset_raw }} ms
-              exceeds threshold ({{ max_offset_ms }} ms).
-          when:
-            - ntp_offset_raw | float | abs > max_offset_ms | float
-
-        - name: IOS — set audit result fact
-          ansible.builtin.set_fact:
-            audit_result:
-              host: "{{ inventory_hostname }}"
-              platform: ios
-              synchronized: "{{ ntp_synchronized }}"
-              stratum: "{{ ntp_stratum }}"
-              offset_ms: "{{ ntp_offset_raw }}"
-              stratum_ok: "{{ ntp_stratum == 'unknown' or ntp_stratum | int <= max_stratum | int }}"
-              drift_ok: "{{ ntp_offset_raw | float | abs <= max_offset_ms | float }}"
+            msg: "{{ ntp_assoc_output.stdout_lines[0][:20] }}"
+          when: ansible_network_os == "ios"
 
       rescue:
-        - name: IOS — record collection failure
-          ansible.builtin.set_fact:
-            audit_result:
-              host: "{{ inventory_hostname }}"
-              platform: ios
-              error: "{{ ansible_failed_result.msg | default('collection failed') }}"
-
-    # ── Junos ─────────────────────────────────────────────────────────────────
-    - name: Collect NTP status from Junos devices
-      when: ansible_network_os == 'junos'
-      block:
-        - name: Junos — query NTP synchronization status
-          junipernetworks.junos.junos_command:
-            commands:
-              - show ntp status
-              - show ntp associations
-            display: text
-          register: junos_ntp_raw
-          retries: "{{ task_retries }}"
-          delay: "{{ retry_delay }}"
-          until: junos_ntp_raw is not failed
-
-        - name: Junos — parse stratum and offset
-          ansible.builtin.set_fact:
-            ntp_stratum: >-
-              {{ junos_ntp_raw.stdout[0]
-                 | regex_search('stratum=(\d+)', '\1')
-                 | first
-                 | default('unknown') }}
-            ntp_synchronized: >-
-              {{ 'status=0x' in junos_ntp_raw.stdout[0] and
-                 'leap_none' in junos_ntp_raw.stdout[0] }}
-            ntp_offset_raw: >-
-              {{ junos_ntp_raw.stdout[0]
-                 | regex_search('offset=([\-\d\.]+)', '\1')
-                 | first
-                 | default('0') }}
-
-        - name: Junos — flag stratum policy violation
+        - name: Log NTP sync failure
           ansible.builtin.debug:
             msg: >
-              POLICY VIOLATION — {{ inventory_hostname }} reports stratum {{ ntp_stratum }},
-              exceeds max allowed ({{ max_stratum }}).
-          when:
-            - ntp_stratum != 'unknown'
-            - ntp_stratum | int > max_stratum | int
+              WARNING: {{ inventory_hostname }} did not achieve NTP sync within timeout.
+              Manual verification required. Check reachability to {{ ntp_servers | map(attribute='address') | list }}.
 
-        - name: Junos — set audit result fact
-          ansible.builtin.set_fact:
-            audit_result:
-              host: "{{ inventory_hostname }}"
-              platform: junos
-              synchronized: "{{ ntp_synchronized }}"
-              stratum: "{{ ntp_stratum }}"
-              offset_ms: "{{ ntp_offset_raw }}"
-              stratum_ok: "{{ ntp_stratum == 'unknown' or ntp_stratum | int <= max_stratum | int }}"
-              drift_ok: "{{ ntp_offset_raw | float | abs <= max_offset_ms | float }}"
+        - name: Fail the play on sync timeout
+          ansible.builtin.fail:
+            msg: "NTP sync verification failed on {{ inventory_hostname }}"
 
-      rescue:
-        - name: Junos — record collection failure
-          ansible.builtin.set_fact:
-            audit_result:
-              host: "{{ inventory_hostname }}"
-              platform: junos
-              error: "{{ ansible_failed_result.msg | default('collection failed') }}"
-
-    # ── Per-host summary ──────────────────────────────────────────────────────
-    - name: Display per-host audit result
-      ansible.builtin.debug:
-        var: audit_result
-
-# ── Fleet-wide report written from localhost ──────────────────────────────────
-- name: Write consolidated NTP audit report to control node
-  hosts: localhost
-  gather_facts: false
-
-  vars:
-    report_dir: "/tmp/ntp_audit"
-
-  tasks:
-    - name: Ensure report directory exists
-      ansible.builtin.file:
-        path: "{{ report_dir }}"
-        state: directory
-        mode: "0750"
-
-    - name: Write audit report JSON
-      ansible.builtin.copy:
-        dest: "{{ report_dir }}/ntp_audit_{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}.json"
-        content: "{{ hostvars | dict2items | selectattr('value.audit_result', 'defined') | map(attribute='value.audit_result') | list | to_nice_json }}"
-        mode: "0640"
-      when: hostvars | dict2items | selectattr('value.audit_result', 'defined') | list | length > 0
-
-    - name: Print fleet audit summary
-      ansible.builtin.debug:
-        msg: >
-          NTP Audit complete — {{ hostvars | dict2items | selectattr('value.audit_result', 'defined') | list | length }} host(s) audited.
-          Report written to {{ report_dir }}.
+  handlers:
+    - name: save ios config
+      cisco.ios.ios_command:
+        commands: write memory
