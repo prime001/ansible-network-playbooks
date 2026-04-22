@@ -1,138 +1,125 @@
 ---
-# 017_network_inventory_report.yml
-#
-# Network Inventory Report Generator
-# Collects device facts across multi-vendor environment and produces
-# a structured CSV inventory report saved to the Ansible control node.
-#
-# Complements 007_facts_gathering.yml (raw fact dump) by normalizing
-# facts across IOS, IOS-XR, NX-OS, and JunOS into a single report.
+# 027_routing_facts_gather.yml
+# Gather detailed routing table and protocol adjacency facts from multi-vendor devices.
+# Covers BGP summary, OSPF neighbors, and active route counts — distinct from
+# basic device facts collected in 007/017_facts_gathering.yml.
 #
 # Inventory example:
-# [core_switches]
-# sw-core-01 ansible_host=10.1.1.1 ansible_network_os=ios
-# sw-core-02 ansible_host=10.1.1.2 ansible_network_os=nxos
+# [routers]
+# rtr-core-01 ansible_host=10.0.0.1 ansible_network_os=ios
+# rtr-core-02 ansible_host=10.0.0.2 ansible_network_os=iosxr
+# rtr-edge-01 ansible_host=10.0.0.3 ansible_network_os=nxos
 #
-# [wan_routers]
-# rtr-wan-01 ansible_host=10.1.2.1 ansible_network_os=iosxr
-# rtr-wan-02 ansible_host=10.1.2.2 ansible_network_os=junos
-#
-# [network:children]
-# core_switches
-# wan_routers
-#
-# Credentials: store in Ansible Vault
-#   ansible_user: "{{ vault_net_user }}"
-#   ansible_password: "{{ vault_net_password }}"
-#   ansible_become_password: "{{ vault_net_enable }}"  # IOS/NX-OS only
+# [routers:vars]
+# ansible_user={{ vault_net_username }}       # ansible-vault encrypted
+# ansible_password={{ vault_net_password }}   # ansible-vault encrypted
+# ansible_become=yes
+# ansible_become_method=enable
+# ansible_connection=network_cli
 
-- name: Generate normalized network inventory report across multi-vendor devices
-  hosts: network
+- name: Gather Routing Protocol and Table Facts
+  hosts: routers
   gather_facts: false
-  connection: network_cli
-
   vars:
-    report_dir: "/tmp/net_inventory"
-    report_file: "{{ report_dir }}/network_inventory_{{ ansible_date_time.date }}.csv"
-    query_retries: 2
-    query_retry_delay: 5
+    output_dir: /tmp/routing_facts
+    timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
 
   tasks:
-    - name: Ensure report output directory exists on control node
+
+    - name: Ensure local output directory exists
       delegate_to: localhost
       run_once: true
       file:
-        path: "{{ report_dir }}"
+        path: "{{ output_dir }}"
         state: directory
-        mode: "0750"
+        mode: '0750'
 
-    - name: Write CSV header row
-      delegate_to: localhost
-      run_once: true
-      lineinfile:
-        path: "{{ report_file }}"
-        line: "hostname,ip,os,model,serial,version,uptime_secs,image"
-        create: true
-        insertbefore: BOF
-
-    - name: Gather platform facts from network devices
+    - name: Gather routing facts block
       block:
-        - name: Collect ios/nxos facts
-          cisco.ios.ios_facts:
-            gather_subset:
-              - hardware
-              - default
-          register: ios_facts_out
-          retries: "{{ query_retries }}"
-          delay: "{{ query_retry_delay }}"
-          until: ios_facts_out is succeeded
-          when: ansible_network_os in ['ios', 'nxos']
 
-        - name: Collect iosxr facts
-          cisco.iosxr.iosxr_facts:
-            gather_subset:
-              - hardware
-              - default
-          register: xr_facts_out
-          retries: "{{ query_retries }}"
-          delay: "{{ query_retry_delay }}"
-          until: xr_facts_out is succeeded
-          when: ansible_network_os == 'iosxr'
+        - name: Query BGP summary
+          cli_command:
+            command: >-
+              {% if ansible_network_os == 'iosxr' %}
+              show bgp ipv4 unicast summary
+              {% elif ansible_network_os == 'nxos' %}
+              show bgp ipv4 unicast summary vrf all
+              {% else %}
+              show ip bgp summary
+              {% endif %}
+          register: bgp_summary
+          retries: 2
+          delay: 5
+          until: bgp_summary is not failed
 
-        - name: Collect junos facts
-          junipernetworks.junos.junos_facts:
-            gather_subset:
-              - hardware
-              - default
-          register: junos_facts_out
-          retries: "{{ query_retries }}"
-          delay: "{{ query_retry_delay }}"
-          until: junos_facts_out is succeeded
-          when: ansible_network_os == 'junos'
+        - name: Query OSPF neighbor state
+          cli_command:
+            command: >-
+              {% if ansible_network_os == 'iosxr' %}
+              show ospf neighbor
+              {% elif ansible_network_os == 'nxos' %}
+              show ip ospf neighbors detail
+              {% else %}
+              show ip ospf neighbor
+              {% endif %}
+          register: ospf_neighbors
+          retries: 2
+          delay: 5
+          until: ospf_neighbors is not failed
+
+        - name: Count active routes in RIB
+          cli_command:
+            command: >-
+              {% if ansible_network_os == 'iosxr' %}
+              show route summary
+              {% elif ansible_network_os == 'nxos' %}
+              show ip route summary
+              {% else %}
+              show ip route summary
+              {% endif %}
+          register: route_summary
+          retries: 2
+          delay: 5
+          until: route_summary is not failed
+
+        - name: Write per-device routing report
+          delegate_to: localhost
+          copy:
+            dest: "{{ output_dir }}/{{ inventory_hostname }}_{{ timestamp }}.txt"
+            content: |
+              ====================================================
+              Routing Facts Report — {{ inventory_hostname }}
+              Collected: {{ timestamp }}
+              Platform:  {{ ansible_network_os }}
+              ====================================================
+
+              --- BGP Summary ---
+              {{ bgp_summary.stdout }}
+
+              --- OSPF Neighbors ---
+              {{ ospf_neighbors.stdout }}
+
+              --- Route Table Summary ---
+              {{ route_summary.stdout }}
+
+        - name: Display route summary to console
+          debug:
+            msg: |
+              [{{ inventory_hostname }}] Route Summary:
+              {{ route_summary.stdout_lines | join('\n') }}
 
       rescue:
-        - name: Log fact collection failure and continue
+
+        - name: Log collection failure
           debug:
             msg: >
-              WARNING: Failed to collect facts from {{ inventory_hostname }}
-              ({{ ansible_host }}). Skipping device in report.
-          failed_when: false
+              WARNING: Failed to collect routing facts from {{ inventory_hostname }}.
+              Error: {{ ansible_failed_result.msg | default('unknown error') }}
 
-    - name: Normalize facts into common variables
-      set_fact:
-        norm_hostname: "{{ ansible_net_hostname | default(inventory_hostname) }}"
-        norm_model: "{{ ansible_net_model | default('unknown') }}"
-        norm_serial: "{{ ansible_net_serialnum | default('unknown') }}"
-        norm_version: "{{ ansible_net_version | default('unknown') }}"
-        norm_uptime: "{{ ansible_net_uptime_timedate | default(ansible_net_uptime | default('unknown')) }}"
-        norm_image: "{{ ansible_net_image | default('unknown') }}"
-      when: >
-        (ios_facts_out is defined and ios_facts_out is succeeded) or
-        (xr_facts_out is defined and xr_facts_out is succeeded) or
-        (junos_facts_out is defined and junos_facts_out is succeeded)
-
-    - name: Append device row to CSV report
-      delegate_to: localhost
-      lineinfile:
-        path: "{{ report_file }}"
-        line: >-
-          {{ norm_hostname }},{{ ansible_host }},{{ ansible_network_os }},
-          {{- norm_model }},{{ norm_serial }},{{ norm_version }},
-          {{- norm_uptime }},{{ norm_image }}
-      when: norm_hostname is defined
-
-    - name: Display per-device inventory summary
-      debug:
-        msg:
-          - "Host    : {{ norm_hostname | default('N/A') }}"
-          - "OS      : {{ ansible_network_os }}"
-          - "Model   : {{ norm_model | default('N/A') }}"
-          - "Serial  : {{ norm_serial | default('N/A') }}"
-          - "Version : {{ norm_version | default('N/A') }}"
-      when: norm_hostname is defined
-
-    - name: Print report location when all devices processed
-      delegate_to: localhost
-      run_once: true
-      debug:
-        msg: "Inventory report written to {{ report_file }}"
+        - name: Write failure placeholder
+          delegate_to: localhost
+          copy:
+            dest: "{{ output_dir }}/{{ inventory_hostname }}_{{ timestamp }}_FAILED.txt"
+            content: |
+              Collection failed for {{ inventory_hostname }} at {{ timestamp }}.
+              Check connectivity and credentials.
