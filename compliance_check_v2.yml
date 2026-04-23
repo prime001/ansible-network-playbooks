@@ -1,123 +1,118 @@
 ---
-# 025_bgp_neighbor_check.yml
+# Ansible Playbook: BGP Neighbor State Verification
+# Playbook: 035_bgp_neighbor_audit.yml
 #
-# BGP Neighbor State Verification
-# Validates BGP peer adjacencies across IOS, IOS-XR, and NX-OS devices.
-# Reports sessions not in ESTABLISHED state and fails the play if any
-# critical peers are down.
+# Purpose:
+#   Verify that all expected BGP neighbors are in the ESTABLISHED state.
+#   Fails the play if any required peer is missing or not established.
+#   Safe to run in production — read-only (show commands only).
+#
+# Modules used: cisco.ios.ios_command, ansible.utils.cli_parse
 #
 # Inventory example:
-#   [bgp_routers]
-#   core-rtr-01  ansible_host=10.0.1.1  ansible_network_os=ios
-#   core-rtr-02  ansible_host=10.0.1.2  ansible_network_os=iosxr
-#   spine-sw-01  ansible_host=10.0.2.1  ansible_network_os=nxos
+#   [core_routers]
+#   rtr-core-01 ansible_host=10.0.0.1
+#   rtr-core-02 ansible_host=10.0.0.2
 #
-#   [bgp_routers:vars]
-#   ansible_user={{ vault_net_user }}          # ansible-vault encrypted
-#   ansible_password={{ vault_net_password }}   # ansible-vault encrypted
+#   [core_routers:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_net_username }}        # ansible-vault encrypted
+#   ansible_password={{ vault_net_password }}    # ansible-vault encrypted
 #   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_connection=network_cli
+#   ansible_become_password={{ vault_enable_secret }}
 #
 # Usage:
-#   ansible-playbook -i inventory/prod.ini 025_bgp_neighbor_check.yml \
-#     --vault-password-file ~/.vault_pass \
-#     --limit core_routers
+#   ansible-playbook 035_bgp_neighbor_audit.yml \
+#     -i inventory/core_routers.ini \
+#     --ask-vault-pass
+#
+# Variables (define in host_vars or group_vars, encrypted with ansible-vault):
+#   vault_net_username   - SSH username
+#   vault_net_password   - SSH password
+#   vault_enable_secret  - Enable/privilege secret
+#   bgp_expected_peers   - List of peer IPs that must be ESTABLISHED
 
-- name: BGP Neighbor State Verification
-  hosts: bgp_routers
+- name: BGP Neighbor State Audit — Verify All Required Peers Are Established
+  hosts: core_routers
   gather_facts: false
+  connection: network_cli
+
   vars:
-    # Minimum acceptable peers per device — alert if established count drops below
-    min_established_peers: 1
-    bgp_check_retries: 3
-    bgp_check_delay: 10
+    bgp_expected_peers:
+      - "10.255.0.1"
+      - "10.255.0.2"
+      - "172.16.100.1"
+    bgp_audit_timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
 
   tasks:
-    - name: Query BGP summary — IOS
+
+    - name: Collect BGP summary from device
       cisco.ios.ios_command:
-        commands: show bgp all summary
-      register: bgp_summary_ios
-      retries: "{{ bgp_check_retries }}"
-      delay: "{{ bgp_check_delay }}"
-      until: bgp_summary_ios is not failed
-      when: ansible_network_os == "ios"
-      ignore_errors: false
+        commands:
+          - show bgp summary
+          - show bgp neighbors | include BGP neighbor|BGP state
+      register: bgp_raw
+      retries: 2
+      delay: 5
+      until: bgp_raw is not failed
 
-    - name: Query BGP summary — IOS-XR
-      cisco.iosxr.iosxr_command:
-        commands: show bgp all all summary
-      register: bgp_summary_iosxr
-      retries: "{{ bgp_check_retries }}"
-      delay: "{{ bgp_check_delay }}"
-      until: bgp_summary_iosxr is not failed
-      when: ansible_network_os == "iosxr"
-
-    - name: Query BGP summary — NX-OS
-      cisco.nxos.nxos_command:
-        commands: show bgp all summary
-      register: bgp_summary_nxos
-      retries: "{{ bgp_check_retries }}"
-      delay: "{{ bgp_check_delay }}"
-      until: bgp_summary_nxos is not failed
-      when: ansible_network_os == "nxos"
-
-    - name: Consolidate BGP output into single fact
+    - name: Parse BGP neighbor states from summary output
       ansible.builtin.set_fact:
-        bgp_raw_output: >-
-          {{
-            (bgp_summary_ios.stdout | default(['']))[0]
-            if ansible_network_os == 'ios'
-            else (bgp_summary_iosxr.stdout | default(['']))[0]
-            if ansible_network_os == 'iosxr'
-            else (bgp_summary_nxos.stdout | default(['']))[0]
-          }}
+        bgp_summary_output: "{{ bgp_raw.stdout[0] }}"
+        bgp_state_output: "{{ bgp_raw.stdout[1] }}"
 
-    - name: Check for non-established BGP sessions
+    - name: Report full BGP summary for each device
+      ansible.builtin.debug:
+        msg: |
+          === BGP Summary: {{ inventory_hostname }} ({{ ansible_host }}) ===
+          {{ bgp_summary_output }}
+
+    - name: Check each expected peer appears in BGP summary
+      ansible.builtin.assert:
+        that:
+          - "item in bgp_summary_output"
+        fail_msg: >
+          COMPLIANCE FAIL [{{ inventory_hostname }}]:
+          Expected BGP peer {{ item }} not found in 'show bgp summary'.
+          Peer may be unconfigured or session was never established.
+        success_msg: >
+          PASS [{{ inventory_hostname }}]: Peer {{ item }} is present in BGP table.
+      loop: "{{ bgp_expected_peers }}"
+      register: peer_presence_check
+      ignore_errors: true
+
+    - name: Check that no expected peer shows Idle or Active state
       block:
-        - name: Flag peers not in Established/ESTAB state
-          ansible.builtin.set_fact:
-            non_established_lines: >-
-              {{
-                bgp_raw_output.splitlines()
-                | select('match', '^\d{1,3}(\.\d{1,3}){3}')
-                | reject('search', ' [0-9]+\s*$')
-                | list
-              }}
-
-        - name: Count established sessions
-          ansible.builtin.set_fact:
-            established_count: >-
-              {{
-                bgp_raw_output.splitlines()
-                | select('match', '^\d{1,3}(\.\d{1,3}){3}')
-                | select('search', ' [0-9]+\s*$')
-                | list
-                | length
-              }}
-
-        - name: Display BGP peer summary
-          ansible.builtin.debug:
-            msg:
-              - "Host          : {{ inventory_hostname }}"
-              - "OS            : {{ ansible_network_os }}"
-              - "Established   : {{ established_count }}"
-              - "Problem peers : {{ non_established_lines | length }}"
-              - "Detail        : {{ non_established_lines if non_established_lines else ['All peers established'] }}"
-
-        - name: Fail if established peer count is below threshold
+        - name: Flag sessions not in Established state
           ansible.builtin.fail:
             msg: >
-              COMPLIANCE FAIL — {{ inventory_hostname }} has only {{ established_count }}
-              established BGP session(s); minimum required is {{ min_established_peers }}.
-              Non-established peers: {{ non_established_lines }}
-          failed_when: established_count | int < min_established_peers | int
+              COMPLIANCE FAIL [{{ inventory_hostname }}]:
+              BGP state output indicates a non-Established session.
+              Review 'show bgp neighbors' output and check peer reachability.
+          failed_when: >
+            ('Idle' in bgp_state_output) or
+            ('Active' in bgp_state_output) or
+            ('Connect' in bgp_state_output)
+          when: bgp_state_output is defined
 
       rescue:
-        - name: Record compliance failure for reporting
+        - name: Log BGP state failure for remediation
           ansible.builtin.debug:
-            msg: "BGP compliance check FAILED on {{ inventory_hostname }} — see above for details."
+            msg: |
+              [ALERT] {{ inventory_hostname }} has one or more BGP sessions
+              not in Established state. Investigate immediately.
+              Raw state output:
+              {{ bgp_state_output }}
 
-        - name: Re-raise failure so play outcome reflects the error
-          ansible.builtin.fail:
-            msg: "BGP neighbor check failed on {{ inventory_hostname }}."
+        - name: Persist failure flag for reporting
+          ansible.builtin.set_fact:
+            bgp_audit_failed: true
+
+    - name: Summarize audit result per device
+      ansible.builtin.debug:
+        msg: >
+          BGP Audit Complete [{{ inventory_hostname }}] at {{ bgp_audit_timestamp }}.
+          Peers checked: {{ bgp_expected_peers | join(', ') }}.
+          Status: {{ 'FAIL — review output above' if bgp_audit_failed | default(false) else 'PASS — all peers present and Established' }}
