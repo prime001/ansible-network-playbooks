@@ -1,140 +1,164 @@
 ---
-# 024_config_backup.yml
-# Multi-vendor network configuration backup with rotation and integrity verification
+# Ansible Playbook: Network Device Configuration Backup
+# Playbook: 034_config_backup.yml
+#
+# Purpose: Backup running and startup configurations from Cisco IOS/IOS-XE
+#          devices to a timestamped local archive. Supports differential
+#          detection — only flags devices whose config changed since last backup.
+#
+# Credentials: Stored in Ansible Vault
+#   ansible-vault create group_vars/network/vault.yml
+#   vault_ansible_user: <device_username>
+#   vault_ansible_password: <device_password>
+#   vault_ansible_become_password: <enable_password>
 #
 # Inventory example:
 #   [ios_devices]
-#   router1 ansible_host=10.0.1.1 ansible_network_os=ios
-#   router2 ansible_host=10.0.1.2 ansible_network_os=ios
+#   core-sw-01  ansible_host=10.0.1.1
+#   core-sw-02  ansible_host=10.0.1.2
+#   dist-rtr-01 ansible_host=10.0.2.1
 #
-#   [nxos_devices]
-#   switch1 ansible_host=10.0.2.1 ansible_network_os=nxos
-#
-#   [junos_devices]
-#   fw1 ansible_host=10.0.3.1 ansible_network_os=junos
-#
-#   [network:children]
-#   ios_devices
-#   nxos_devices
-#   junos_devices
-#
-#   [network:vars]
-#   ansible_user={{ vault_net_user }}       # store in ansible-vault
-#   ansible_password={{ vault_net_pass }}   # store in ansible-vault
+#   [ios_devices:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_ansible_user }}
+#   ansible_password={{ vault_ansible_password }}
 #   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_connection=network_cli
+#   ansible_become_password={{ vault_ansible_become_password }}
+#
+# Usage:
+#   ansible-playbook 034_config_backup.yml -i inventory/network.yml --ask-vault-pass
+#   ansible-playbook 034_config_backup.yml -i inventory/network.yml --vault-password-file ~/.vault_pass
 
-- name: Multi-vendor Config Backup with Rotation and Integrity Check
-  hosts: network
+- name: Cisco IOS/IOS-XE — Running & Startup Configuration Backup with Change Detection
+  hosts: ios_devices
   gather_facts: false
+  serial: 10
 
   vars:
-    backup_root: "/opt/net-backups"
-    backup_date: "{{ lookup('pipe', 'date +%Y-%m-%d') }}"
-    backup_keep_days: 30
-    backup_dir: "{{ backup_root }}/{{ inventory_hostname }}/{{ backup_date }}"
-    latest_link: "{{ backup_root }}/{{ inventory_hostname }}/latest.cfg"
+    backup_root: "{{ playbook_dir }}/backups"
+    timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+    backup_dir: "{{ backup_root }}/{{ inventory_hostname }}"
+    backup_file: "{{ backup_dir }}/running_{{ timestamp }}.cfg"
+    latest_link: "{{ backup_dir }}/running_latest.cfg"
+    max_retries: 3
+    retry_delay: 5
 
   tasks:
-    - name: Ensure per-device backup directory exists
-      ansible.builtin.file:
+    - name: Ensure local backup directory exists for host
+      delegate_to: localhost
+      file:
         path: "{{ backup_dir }}"
         state: directory
         mode: "0750"
+      run_once: false
+
+    - name: Retrieve running configuration
+      block:
+        - name: Pull running-config via ios_command
+          ios_command:
+            commands:
+              - show running-config
+              - show startup-config
+              - show version
+          register: device_configs
+          retries: "{{ max_retries }}"
+          delay: "{{ retry_delay }}"
+          until: device_configs is not failed
+
+        - name: Save running-config to timestamped backup file
+          delegate_to: localhost
+          copy:
+            content: |
+              ! ============================================================
+              ! Device   : {{ inventory_hostname }}
+              ! Host     : {{ ansible_host }}
+              ! Captured : {{ timestamp }}
+              ! ============================================================
+              {{ device_configs.stdout[0] }}
+            dest: "{{ backup_file }}"
+            mode: "0640"
+
+        - name: Update symlink to latest backup
+          delegate_to: localhost
+          file:
+            src: "{{ backup_file }}"
+            dest: "{{ latest_link }}"
+            state: link
+            force: true
+
+        - name: Check if a previous backup exists for diff comparison
+          delegate_to: localhost
+          stat:
+            path: "{{ backup_dir }}/running_previous.cfg"
+          register: previous_backup
+
+        - name: Compare current config against previous backup
+          delegate_to: localhost
+          command: >
+            diff -u
+            {{ backup_dir }}/running_previous.cfg
+            {{ backup_file }}
+          register: config_diff
+          failed_when: config_diff.rc > 1
+          changed_when: config_diff.rc == 1
+          when: previous_backup.stat.exists
+
+        - name: Flag host as changed when diff detected
+          debug:
+            msg: >
+              [CHANGE DETECTED] {{ inventory_hostname }} running-config differs
+              from previous backup. Review: {{ backup_file }}
+          when:
+            - previous_backup.stat.exists
+            - config_diff.rc == 1
+
+        - name: Rotate previous backup pointer
+          delegate_to: localhost
+          copy:
+            src: "{{ backup_file }}"
+            dest: "{{ backup_dir }}/running_previous.cfg"
+            mode: "0640"
+            remote_src: true
+
+        - name: Save startup-config separately
+          delegate_to: localhost
+          copy:
+            content: |
+              ! ============================================================
+              ! Device   : {{ inventory_hostname }}
+              ! Config   : startup-config
+              ! Captured : {{ timestamp }}
+              ! ============================================================
+              {{ device_configs.stdout[1] }}
+            dest: "{{ backup_dir }}/startup_{{ timestamp }}.cfg"
+            mode: "0640"
+
+        - name: Extract and display software version
+          debug:
+            msg: >
+              {{ inventory_hostname }} ({{ ansible_host }}) — backup complete.
+              Version line: {{ device_configs.stdout[2] | regex_search('Cisco IOS.*Version [^,]+') | default('version not parsed') }}
+
+      rescue:
+        - name: Log backup failure for host
+          debug:
+            msg: >
+              [BACKUP FAILED] Could not retrieve config from {{ inventory_hostname }}
+              ({{ ansible_host }}) after {{ max_retries }} retries.
+              Error: {{ ansible_failed_result.msg | default('unknown error') }}
+
+        - name: Write failure marker so ops can detect incomplete runs
+          delegate_to: localhost
+          copy:
+            content: "BACKUP_FAILED {{ timestamp }}\n"
+            dest: "{{ backup_dir }}/BACKUP_FAILED_{{ timestamp }}.txt"
+            mode: "0640"
+
+  post_tasks:
+    - name: Summarise backup locations
       delegate_to: localhost
-
-    - name: Capture running config — IOS/IOS-XE
-      cisco.ios.ios_command:
-        commands: show running-config
-      register: ios_config
-      retries: 3
-      delay: 5
-      until: ios_config is not failed
-      when: ansible_network_os == "ios"
-
-    - name: Capture running config — NX-OS
-      cisco.nxos.nxos_command:
-        commands: show running-config
-      register: nxos_config
-      retries: 3
-      delay: 5
-      until: nxos_config is not failed
-      when: ansible_network_os == "nxos"
-
-    - name: Capture running config — Junos
-      junipernetworks.junos.junos_command:
-        commands: show configuration
-        display: text
-      register: junos_config
-      retries: 3
-      delay: 5
-      until: junos_config is not failed
-      when: ansible_network_os == "junos"
-
-    - name: Normalize config output into single variable
-      ansible.builtin.set_fact:
-        raw_config: >-
-          {{
-            (ios_config.stdout[0]   if ansible_network_os == 'ios'   else
-             nxos_config.stdout[0]  if ansible_network_os == 'nxos'  else
-             junos_config.stdout[0] if ansible_network_os == 'junos' else '')
-          }}
-
-    - name: Write config to timestamped file
-      ansible.builtin.copy:
-        content: "{{ raw_config }}\n"
-        dest: "{{ backup_dir }}/running.cfg"
-        mode: "0640"
-      delegate_to: localhost
-      register: write_result
-
-    - name: Update 'latest' symlink to current backup
-      ansible.builtin.file:
-        src: "{{ backup_dir }}/running.cfg"
-        dest: "{{ latest_link }}"
-        state: link
-        force: true
-      delegate_to: localhost
-
-    - name: Compute SHA256 checksum of saved config
-      ansible.builtin.stat:
-        path: "{{ backup_dir }}/running.cfg"
-        checksum_algorithm: sha256
-        get_checksum: true
-      register: config_stat
-      delegate_to: localhost
-      failed_when: not config_stat.stat.exists
-
-    - name: Write checksum manifest alongside backup
-      ansible.builtin.copy:
-        content: "{{ config_stat.stat.checksum }}  running.cfg\n"
-        dest: "{{ backup_dir }}/running.cfg.sha256"
-        mode: "0640"
-      delegate_to: localhost
-
-    - name: Remove backups older than {{ backup_keep_days }} days
-      ansible.builtin.find:
-        paths: "{{ backup_root }}/{{ inventory_hostname }}"
-        file_type: directory
-        age: "{{ backup_keep_days }}d"
-      register: old_dirs
-      delegate_to: localhost
-
-    - name: Delete stale backup directories
-      ansible.builtin.file:
-        path: "{{ item.path }}"
-        state: absent
-      loop: "{{ old_dirs.files }}"
-      loop_control:
-        label: "{{ item.path }}"
-      delegate_to: localhost
-
-    - name: Report backup summary
-      ansible.builtin.debug:
-        msg:
-          - "Host      : {{ inventory_hostname }} ({{ ansible_network_os }})"
-          - "Saved to  : {{ backup_dir }}/running.cfg"
-          - "SHA256    : {{ config_stat.stat.checksum }}"
-          - "Config KB : {{ (raw_config | length / 1024) | round(1) }}"
-          - "Purged    : {{ old_dirs.files | length }} old backup(s)"
+      debug:
+        msg: "Backups stored under: {{ backup_root }}"
+      run_once: true
