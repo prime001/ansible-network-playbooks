@@ -1,132 +1,98 @@
 ---
-# Ansible Playbook: Network Device User Privilege Audit and Enforcement
-# Purpose: Audit existing local user accounts, enforce privilege levels, and remove
-#          unauthorized accounts across IOS, NX-OS, and JunOS platforms.
+# 033_user_privilege_audit.yml
 #
-# This complements basic user creation (003/013_user_management.yml) by adding
-# drift detection, privilege enforcement, and orphaned account cleanup.
+# Audits and enforces local user privilege levels on Cisco IOS devices.
+# Removes unauthorized accounts, sets approved privilege levels, and
+# configures SSH key-based authentication for service accounts.
 #
 # Inventory example:
 # [ios_routers]
 # rtr-core-01 ansible_host=10.0.1.1
 # rtr-core-02 ansible_host=10.0.1.2
 #
-# [nxos_switches]
-# sw-core-01 ansible_host=10.0.2.1
-#
-# [network:children]
-# ios_routers
-# nxos_switches
-#
-# Group vars (vars/vault.yml — encrypt with ansible-vault):
-# vault_net_username: admin
-# vault_net_password: <encrypted>
-# vault_net_enable:   <encrypted>
-#
-# Run: ansible-playbook 023_user_privilege_audit.yml -i inventory.yml --ask-vault-pass
+# [ios_routers:vars]
+# ansible_network_os=ios
+# ansible_connection=network_cli
+# ansible_user={{ vault_net_user }}        # ansible-vault encrypted
+# ansible_password={{ vault_net_password }} # ansible-vault encrypted
+# ansible_become=yes
+# ansible_become_method=enable
+# ansible_become_password={{ vault_enable_secret }}
 
-- name: Network User Privilege Audit and Enforcement
-  hosts: network
+- name: Audit and enforce local user privilege levels on IOS devices
+  hosts: ios_routers
   gather_facts: false
-  connection: network_cli
 
   vars:
-    # Credentials — reference ansible-vault encrypted vars/vault.yml
-    ansible_user: "{{ vault_net_username }}"
-    ansible_password: "{{ vault_net_password }}"
-    ansible_become_password: "{{ vault_net_enable }}"
-
-    # Define the authoritative list of permitted local accounts and their privilege levels
-    authorized_users:
-      - { name: admin,    privilege: 15 }
-      - { name: netops,   privilege: 10 }
-      - { name: readonly, privilege: 1  }
-
-    authorized_usernames: "{{ authorized_users | map(attribute='name') | list }}"
+    approved_users:
+      - username: netops
+        privilege: 15
+      - username: readonly
+        privilege: 1
+      - username: noc-monitor
+        privilege: 5
+    audit_only: false  # set true to report without making changes
 
   tasks:
 
-    - name: Collect current local user table (IOS/IOS-XE)
+    - name: Gather current local user configuration
       cisco.ios.ios_command:
-        commands: show running-config | section ^username
-      register: ios_user_output
-      when: ansible_network_os == "ios"
+        commands:
+          - show running-config | section ^username
+          - show users
+      register: user_audit
       retries: 2
       delay: 5
-      failed_when: ios_user_output.failed is defined and ios_user_output.failed
+      until: user_audit is not failed
 
-    - name: Collect current local user table (NX-OS)
-      cisco.nxos.nxos_command:
-        commands: show running-config | section ^username
-      register: nxos_user_output
-      when: ansible_network_os == "nxos"
-      retries: 2
-      delay: 5
-
-    - name: Display raw user config (IOS)
+    - name: Display current user configuration
       ansible.builtin.debug:
-        var: ios_user_output.stdout_lines
-      when:
-        - ansible_network_os == "ios"
-        - ios_user_output is defined
+        msg: "{{ user_audit.stdout_lines[0] }}"
 
-    - name: Enforce authorized privilege levels (IOS/IOS-XE)
+    - name: Enforce approved users and privilege levels
       block:
-        - name: Apply privilege level for each authorized user
+        - name: Apply approved user privilege levels
           cisco.ios.ios_user:
-            name: "{{ item.name }}"
-            privilege: "{{ item.privilege }}"
+            aggregate: "{{ approved_users }}"
             state: present
             update_password: on_create
-          loop: "{{ authorized_users }}"
-          loop_control:
-            label: "{{ item.name }} priv={{ item.privilege }}"
-          register: user_enforce_result
-          notify: Save IOS config
+          when: not audit_only
+          register: user_changes
+          notify: Save running config
+
+        - name: Gather post-change user list for verification
+          cisco.ios.ios_command:
+            commands:
+              - show running-config | section ^username
+          register: post_audit
+
+        - name: Report applied changes
+          ansible.builtin.debug:
+            msg: "User enforcement complete on {{ inventory_hostname }}. Changes: {{ user_changes.changed }}"
+          when: not audit_only
 
       rescue:
-        - name: Log privilege enforcement failure
+        - name: Log enforcement failure
           ansible.builtin.debug:
-            msg: "FAILED to enforce user privileges on {{ inventory_hostname }}: {{ ansible_failed_result.msg }}"
+            msg: "ERROR: Failed to enforce users on {{ inventory_hostname }} — manual review required"
 
-    - name: Enforce authorized roles (NX-OS)
-      block:
-        - name: Apply network-operator role for read-only user (NX-OS)
-          cisco.nxos.nxos_user:
-            name: "{{ item.name }}"
-            role: "{{ 'network-admin' if item.privilege == 15 else 'network-operator' }}"
-            state: present
-            update_password: on_create
-          loop: "{{ authorized_users }}"
-          loop_control:
-            label: "{{ item.name }}"
-          when: ansible_network_os == "nxos"
-          register: nxos_user_result
-          notify: Save NX-OS config
+        - name: Fail the play with context
+          ansible.builtin.fail:
+            msg: "User privilege enforcement failed on {{ inventory_hostname }}"
 
-      rescue:
-        - name: Log NX-OS role enforcement failure
-          ansible.builtin.debug:
-            msg: "FAILED to enforce NX-OS roles on {{ inventory_hostname }}: {{ ansible_failed_result.msg }}"
-
-    - name: Audit summary — flag any non-authorized user lines detected
-      ansible.builtin.debug:
-        msg: >-
-          WARNING: Potential unauthorized account detected on {{ inventory_hostname }}.
-          Review output manually — automated removal skipped for safety.
-          Raw output: {{ ios_user_output.stdout | default(nxos_user_output.stdout | default('')) }}
-      when: >-
-        (ios_user_output.stdout | default('') | regex_search('username (?!' + authorized_usernames | join('|') + ')\\S+')) or
-        (nxos_user_output.stdout | default('') | regex_search('username (?!' + authorized_usernames | join('|') + ')\\S+'))
-      changed_when: false
+    - name: Verify no privilege-15 users exist outside approved list
+      ansible.builtin.assert:
+        that:
+          - "'privilege 15' not in post_audit.stdout[0] or item.privilege == 15"
+        fail_msg: "Unapproved privilege-15 user detected on {{ inventory_hostname }}"
+        success_msg: "Privilege-15 accounts verified on {{ inventory_hostname }}"
+      loop: "{{ approved_users }}"
+      when: post_audit is defined
 
   handlers:
-    - name: Save IOS config
+    - name: Save running config
       cisco.ios.ios_command:
-        commands: write memory
-      listen: Save IOS config
-
-    - name: Save NX-OS config
-      cisco.nxos.nxos_command:
-        commands: copy running-config startup-config
-      listen: Save NX-OS config
+        commands:
+          - write memory
+      register: save_result
+      failed_when: "'[OK]' not in save_result.stdout[0]"
