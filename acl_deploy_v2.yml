@@ -1,168 +1,156 @@
 ---
-# =============================================================================
-# Playbook: BGP Prefix-List and Route-Map Deployment
-# Purpose:  Deploy inbound/outbound prefix-lists and route-maps on IOS/IOS-XE
-#           routers to control BGP route advertisement and acceptance.
-#           Complements acl_deploy (002/012) — prefix-lists target routing
-#           policy; ACLs target packet filtering.
+# 032_acl_deploy.yml
 #
-# Credentials: Stored in Ansible Vault — ansible-vault edit group_vars/all/vault.yml
-#   vault_ansible_user, vault_ansible_password, vault_ansible_become_password
+# Purpose: Deploy and verify extended ACLs on Cisco IOS-XR devices
+#          using structured ACL data from host_vars/group_vars.
+#
+# Targets: iosxr_routers group (IOS-XR platform)
+#
+# Prerequisites:
+#   - ansible-galaxy collection install cisco.iosxr
+#   - Vault-encrypted credentials in group_vars/all/vault.yml
 #
 # Inventory example:
-#   [bgp_routers]
-#   rtr-core-01  ansible_host=10.0.0.1
-#   rtr-core-02  ansible_host=10.0.0.2
-#   rtr-edge-01  ansible_host=10.0.0.3
+#   [iosxr_routers]
+#   xr-core-01  ansible_host=10.0.0.1
+#   xr-core-02  ansible_host=10.0.0.2
 #
-#   [bgp_routers:vars]
-#   ansible_network_os=ios
+#   [iosxr_routers:vars]
+#   ansible_network_os=cisco.iosxr.iosxr
 #   ansible_connection=network_cli
-#   ansible_user={{ vault_ansible_user }}
-#   ansible_password={{ vault_ansible_password }}
+#   ansible_user={{ vault_net_user }}        # ansible-vault encrypted
+#   ansible_password={{ vault_net_pass }}    # ansible-vault encrypted
 #   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_become_password={{ vault_ansible_become_password }}
-# =============================================================================
+#
+# Usage:
+#   ansible-playbook 032_acl_deploy.yml --vault-id @prompt -l xr-core-01
+#   ansible-playbook 032_acl_deploy.yml --vault-id @prompt --check   # dry-run
+#
+# Variables (define in host_vars/<host>.yml or group_vars/iosxr_routers.yml):
+#   acl_entries: list of ACL definitions (see variable block below)
+#   acl_apply_interfaces: list of interfaces with direction for binding
+##############################################################################
 
-- name: Deploy BGP Prefix-Lists and Route-Maps
-  hosts: bgp_routers
+- name: Deploy and verify extended IPv4 ACLs on Cisco IOS-XR routers
+  hosts: iosxr_routers
   gather_facts: false
 
   vars:
-    # Override per host or group in inventory / group_vars
-    bgp_prefix_lists:
-      - name: PL_ALLOW_INTERNAL
-        action: permit
-        entries:
-          - { seq: 10, prefix: "10.0.0.0/8",    le: 24 }
-          - { seq: 20, prefix: "172.16.0.0/12",  le: 28 }
-      - name: PL_DENY_DEFAULT
-        action: deny
-        entries:
-          - { seq: 5,  prefix: "0.0.0.0/0" }
+    # Override in host_vars or group_vars as needed
+    acl_entries:
+      - name: MGMT_ACCESS_IN
+        afi: ipv4
+        acls:
+          - name: MGMT_ACCESS_IN
+            aces:
+              - sequence: 10
+                grant: permit
+                protocol: tcp
+                source:
+                  network: 10.10.0.0
+                  wildcard_bits: 0.0.0.255
+                destination:
+                  any: true
+                port:
+                  destination:
+                    eq: 22
+              - sequence: 20
+                grant: permit
+                protocol: icmp
+                source:
+                  network: 10.0.0.0
+                  wildcard_bits: 0.255.255.255
+                destination:
+                  any: true
+              - sequence: 9999
+                grant: deny
+                protocol: ip
+                source:
+                  any: true
+                destination:
+                  any: true
+                log: true
 
-    bgp_route_maps:
-      - name: RM_IN_PEER
-        seq: 10
-        action: permit
-        match: "ip address prefix-list PL_ALLOW_INTERNAL"
-        set:   "local-preference 150"
-      - name: RM_OUT_PEER
-        seq: 10
-        action: permit
-        match: "ip address prefix-list PL_DENY_DEFAULT"
-
-    config_save_timeout: 30
-    retry_count: 3
-    retry_delay: 5
+    acl_apply_interfaces:
+      - name: GigabitEthernet0/0/0/0
+        direction: in
+        acl_name: MGMT_ACCESS_IN
 
   tasks:
+    - name: Checkpoint — capture running ACL config before changes
+      cisco.iosxr.iosxr_command:
+        commands:
+          - show access-lists ipv4
+      register: acl_before
+      retries: 2
+      delay: 5
 
-    - name: Verify device reachability
-      cisco.ios.ios_command:
-        commands: show version
-      register: ver_output
-      retries: "{{ retry_count }}"
-      delay: "{{ retry_delay }}"
-      until: ver_output is not failed
-
-    - name: Display platform info
+    - name: Display pre-change ACL state
       ansible.builtin.debug:
-        msg: "Connected to {{ inventory_hostname }} — {{ ver_output.stdout[0] | regex_search('Cisco IOS.+') }}"
+        msg: "{{ acl_before.stdout_lines }}"
 
-    - name: Build and apply prefix-lists
+    - name: Deploy IPv4 ACL definitions
       block:
+        - name: Push ACL config via iosxr_acls module
+          cisco.iosxr.iosxr_acls:
+            config: "{{ acl_entries }}"
+            state: merged
+          register: acl_deploy_result
+          notify: Save running config
 
-        - name: Deploy prefix-lists via ios_config
-          cisco.ios.ios_config:
-            lines:
-              - "ip prefix-list {{ item.0.name }} seq {{ item.1.seq }} {{ item.0.action }} {{ item.1.prefix }}\
-                 {% if item.1.le is defined %} le {{ item.1.le }}{% endif %}"
-            save_when: never
-          loop: "{{ bgp_prefix_lists | subelements('entries') }}"
-          loop_control:
-            label: "{{ item.0.name }} seq {{ item.1.seq }}"
-          register: pfx_result
-          failed_when:
-            - pfx_result.failed is defined
-            - pfx_result.failed
+        - name: Bind ACLs to interfaces
+          cisco.iosxr.iosxr_acl_interfaces:
+            config:
+              - name: "{{ item.name }}"
+                access_groups:
+                  - afi: ipv4
+                    acls:
+                      - name: "{{ item.acl_name }}"
+                        direction: "{{ item.direction }}"
+            state: merged
+          loop: "{{ acl_apply_interfaces }}"
+          register: acl_bind_result
 
       rescue:
-
-        - name: Log prefix-list deployment failure
+        - name: Log deploy failure
           ansible.builtin.debug:
-            msg: "FAILED deploying prefix-lists on {{ inventory_hostname }}: {{ pfx_result | default('unknown error') }}"
+            msg: "ACL deploy failed on {{ inventory_hostname }}. Rolling back."
 
-        - name: Abort play for this host on prefix-list failure
+        - name: Rollback — remove ACLs pushed in this run
+          cisco.iosxr.iosxr_acls:
+            config: "{{ acl_entries }}"
+            state: deleted
+          ignore_errors: true
+
+        - name: Fail with clear message after rollback
           ansible.builtin.fail:
-            msg: "Halting {{ inventory_hostname }} — prefix-list config failed. Review and retry."
+            msg: "ACL deployment failed on {{ inventory_hostname }}. Config rolled back."
 
-    - name: Build and apply route-maps
-      block:
-
-        - name: Deploy route-map entries with set clause
-          cisco.ios.ios_config:
-            lines:
-              - "match {{ item.match }}"
-              - "set {{ item.set }}"
-            parents:
-              - "route-map {{ item.name }} {{ item.action }} {{ item.seq }}"
-            save_when: never
-          loop: "{{ bgp_route_maps | selectattr('set', 'defined') | list }}"
-          loop_control:
-            label: "{{ item.name }} {{ item.seq }}"
-          register: rm_result
-
-        - name: Deploy permit-only route-map entries (no set clause)
-          cisco.ios.ios_config:
-            lines:
-              - "match {{ item.match }}"
-            parents:
-              - "route-map {{ item.name }} {{ item.action }} {{ item.seq }}"
-            save_when: never
-          loop: "{{ bgp_route_maps | rejectattr('set', 'defined') | list }}"
-          loop_control:
-            label: "{{ item.name }} {{ item.seq }}"
-
-      rescue:
-
-        - name: Log route-map deployment failure
-          ansible.builtin.debug:
-            msg: "FAILED deploying route-maps on {{ inventory_hostname }}: {{ rm_result | default('unknown error') }}"
-
-        - name: Abort play for this host on route-map failure
-          ansible.builtin.fail:
-            msg: "Halting {{ inventory_hostname }} — route-map config failed. Review and retry."
-
-    - name: Verify deployed prefix-lists
-      cisco.ios.ios_command:
+    - name: Verify — capture ACL config after changes
+      cisco.iosxr.iosxr_command:
         commands:
-          - show ip prefix-list
-      register: pfx_verify
+          - show access-lists ipv4
+          - show running-config interface
+      register: acl_after
+      failed_when: acl_after.stdout | length == 0
 
-    - name: Verify deployed route-maps
-      cisco.ios.ios_command:
+    - name: Assert target ACL exists in running config
+      ansible.builtin.assert:
+        that:
+          - "'MGMT_ACCESS_IN' in acl_after.stdout[0]"
+        fail_msg: "ACL MGMT_ACCESS_IN not found in running config after deploy"
+        success_msg: "ACL MGMT_ACCESS_IN confirmed present on {{ inventory_hostname }}"
+
+    - name: Display deploy change summary
+      ansible.builtin.debug:
+        msg:
+          - "Host       : {{ inventory_hostname }}"
+          - "Changed    : {{ acl_deploy_result.changed }}"
+          - "Commands   : {{ acl_deploy_result.commands | default([]) }}"
+
+  handlers:
+    - name: Save running config
+      cisco.iosxr.iosxr_command:
         commands:
-          - show route-map
-      register: rm_verify
-
-    - name: Display prefix-list verification output
-      ansible.builtin.debug:
-        var: pfx_verify.stdout_lines
-
-    - name: Display route-map verification output
-      ansible.builtin.debug:
-        var: rm_verify.stdout_lines
-
-    - name: Save running configuration
-      cisco.ios.ios_config:
-        save_when: always
-      async: "{{ config_save_timeout }}"
-      poll: 5
-      register: save_result
-
-    - name: Confirm configuration saved
-      ansible.builtin.debug:
-        msg: "Configuration saved on {{ inventory_hostname }}"
-      when: save_result is succeeded
+          - commit label "ansible-acl-deploy-{{ ansible_date_time.date }}"
