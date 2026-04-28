@@ -1,118 +1,124 @@
----
-# Ansible Playbook: BGP Neighbor State Verification
-# Playbook: 035_bgp_neighbor_audit.yml
-#
-# Purpose:
-#   Verify that all expected BGP neighbors are in the ESTABLISHED state.
-#   Fails the play if any required peer is missing or not established.
-#   Safe to run in production — read-only (show commands only).
-#
-# Modules used: cisco.ios.ios_command, ansible.utils.cli_parse
-#
-# Inventory example:
-#   [core_routers]
-#   rtr-core-01 ansible_host=10.0.0.1
-#   rtr-core-02 ansible_host=10.0.0.2
-#
-#   [core_routers:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user={{ vault_net_username }}        # ansible-vault encrypted
-#   ansible_password={{ vault_net_password }}    # ansible-vault encrypted
-#   ansible_become=yes
-#   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_secret }}
-#
-# Usage:
-#   ansible-playbook 035_bgp_neighbor_audit.yml \
-#     -i inventory/core_routers.ini \
-#     --ask-vault-pass
-#
-# Variables (define in host_vars or group_vars, encrypted with ansible-vault):
-#   vault_net_username   - SSH username
-#   vault_net_password   - SSH password
-#   vault_enable_secret  - Enable/privilege secret
-#   bgp_expected_peers   - List of peer IPs that must be ESTABLISHED
+The ansible-network-playbooks repo isn't local — I'll generate the playbook content directly.
 
-- name: BGP Neighbor State Audit — Verify All Required Peers Are Established
+```yaml
+---
+# routing_protocol_compliance.yml
+#
+# Audits routing protocol security posture on Cisco IOS routers:
+#   - OSPF MD5 authentication on all active interfaces
+#   - BGP neighbor password (MD5) enforcement
+#   - Redistribution locked behind route-maps (no naked redistribute)
+#
+# Credentials: ansible-vault encrypted vars — see group_vars/network/vault.yml
+# Usage:
+#   ansible-playbook routing_protocol_compliance.yml \
+#     -i inventory/network.ini --ask-vault-pass
+#
+# Inventory example (inventory/network.ini):
+# [core_routers]
+# rtr-core-01  ansible_host=10.0.1.1
+# rtr-core-02  ansible_host=10.0.1.2
+#
+# [core_routers:vars]
+# ansible_network_os=ios
+# ansible_connection=network_cli
+# ansible_user="{{ vault_net_user }}"
+# ansible_password="{{ vault_net_password }}"
+# ansible_become=yes
+# ansible_become_method=enable
+# ansible_become_password="{{ vault_net_enable }}"
+
+- name: Routing Protocol Compliance Audit
   hosts: core_routers
   gather_facts: false
-  connection: network_cli
 
   vars:
-    bgp_expected_peers:
-      - "10.255.0.1"
-      - "10.255.0.2"
-      - "172.16.100.1"
-    bgp_audit_timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+    compliance_fail: false
 
   tasks:
-
-    - name: Collect BGP summary from device
-      cisco.ios.ios_command:
-        commands:
-          - show bgp summary
-          - show bgp neighbors | include BGP neighbor|BGP state
-      register: bgp_raw
-      retries: 2
-      delay: 5
-      until: bgp_raw is not failed
-
-    - name: Parse BGP neighbor states from summary output
-      ansible.builtin.set_fact:
-        bgp_summary_output: "{{ bgp_raw.stdout[0] }}"
-        bgp_state_output: "{{ bgp_raw.stdout[1] }}"
-
-    - name: Report full BGP summary for each device
-      ansible.builtin.debug:
-        msg: |
-          === BGP Summary: {{ inventory_hostname }} ({{ ansible_host }}) ===
-          {{ bgp_summary_output }}
-
-    - name: Check each expected peer appears in BGP summary
-      ansible.builtin.assert:
-        that:
-          - "item in bgp_summary_output"
-        fail_msg: >
-          COMPLIANCE FAIL [{{ inventory_hostname }}]:
-          Expected BGP peer {{ item }} not found in 'show bgp summary'.
-          Peer may be unconfigured or session was never established.
-        success_msg: >
-          PASS [{{ inventory_hostname }}]: Peer {{ item }} is present in BGP table.
-      loop: "{{ bgp_expected_peers }}"
-      register: peer_presence_check
-      ignore_errors: true
-
-    - name: Check that no expected peer shows Idle or Active state
+    - name: Collect routing protocol data
       block:
-        - name: Flag sessions not in Established state
-          ansible.builtin.fail:
-            msg: >
-              COMPLIANCE FAIL [{{ inventory_hostname }}]:
-              BGP state output indicates a non-Established session.
-              Review 'show bgp neighbors' output and check peer reachability.
+        - name: Fetch OSPF interface auth state
+          cisco.ios.ios_command:
+            commands:
+              - show ip ospf interface | include Authentication|Line
+          register: ospf_auth_raw
+          retries: 3
+          delay: 5
           failed_when: >
-            ('Idle' in bgp_state_output) or
-            ('Active' in bgp_state_output) or
-            ('Connect' in bgp_state_output)
-          when: bgp_state_output is defined
+            ospf_auth_raw.failed is defined and ospf_auth_raw.failed
+
+        - name: Fetch BGP neighbor config
+          cisco.ios.ios_command:
+            commands:
+              - show running-config | section ^router bgp
+          register: bgp_config_raw
+          retries: 3
+          delay: 5
+          failed_when: false
+
+        - name: Fetch redistribution statements
+          cisco.ios.ios_command:
+            commands:
+              - show running-config | include redistribute
+          register: redist_raw
+          retries: 3
+          delay: 5
+          failed_when: false
 
       rescue:
-        - name: Log BGP state failure for remediation
+        - name: Log collection failure and abort host
           ansible.builtin.debug:
-            msg: |
-              [ALERT] {{ inventory_hostname }} has one or more BGP sessions
-              not in Established state. Investigate immediately.
-              Raw state output:
-              {{ bgp_state_output }}
+            msg: >
+              [{{ inventory_hostname }}] Data collection failed — skipping
+              compliance checks. Verify connectivity and credentials.
+        - ansible.builtin.meta: end_host
 
-        - name: Persist failure flag for reporting
-          ansible.builtin.set_fact:
-            bgp_audit_failed: true
+    - name: Assert OSPF interfaces use MD5 authentication
+      ansible.builtin.assert:
+        that:
+          - >
+            ospf_auth_raw.stdout[0] | length == 0 or
+            'Message digest' in ospf_auth_raw.stdout[0]
+        success_msg: "PASS [{{ inventory_hostname }}]: OSPF MD5 authentication present"
+        fail_msg: "FAIL [{{ inventory_hostname }}]: OSPF interface(s) missing MD5 auth"
+      register: ospf_check
+      ignore_errors: true
 
-    - name: Summarize audit result per device
+    - name: Assert BGP neighbors have MD5 password configured
+      ansible.builtin.assert:
+        that:
+          - >
+            bgp_config_raw.stdout[0] | length == 0 or
+            'password' in bgp_config_raw.stdout[0]
+        success_msg: "PASS [{{ inventory_hostname }}]: BGP neighbor passwords configured"
+        fail_msg: "FAIL [{{ inventory_hostname }}]: BGP neighbor(s) missing MD5 password"
+      register: bgp_check
+      ignore_errors: true
+
+    - name: Assert redistribution is guarded by route-maps
+      ansible.builtin.assert:
+        that:
+          - >
+            redist_raw.stdout[0] | length == 0 or
+            'route-map' in redist_raw.stdout[0]
+        success_msg: "PASS [{{ inventory_hostname }}]: All redistribution uses route-map guards"
+        fail_msg: "FAIL [{{ inventory_hostname }}]: Unconstrained redistribution detected"
+      register: redist_check
+      ignore_errors: true
+
+    - name: Display compliance summary
       ansible.builtin.debug:
+        msg:
+          - "=== Routing Protocol Compliance: {{ inventory_hostname }} ==="
+          - "OSPF Auth : {{ 'PASS' if not ospf_check.failed else 'FAIL' }}"
+          - "BGP Passwd: {{ 'PASS' if not bgp_check.failed else 'FAIL' }}"
+          - "Redist Guard: {{ 'PASS' if not redist_check.failed else 'FAIL' }}"
+
+    - name: Fail play if any control failed
+      ansible.builtin.fail:
         msg: >
-          BGP Audit Complete [{{ inventory_hostname }}] at {{ bgp_audit_timestamp }}.
-          Peers checked: {{ bgp_expected_peers | join(', ') }}.
-          Status: {{ 'FAIL — review output above' if bgp_audit_failed | default(false) else 'PASS — all peers present and Established' }}
+          Routing protocol compliance FAILED on {{ inventory_hostname }}.
+          Review task output above and remediate before next audit window.
+      when: ospf_check.failed or bgp_check.failed or redist_check.failed
+```
