@@ -1,111 +1,113 @@
 ---
-# Interface Error Monitoring and Auto-Remediation Playbook
+# vlan_management.yml
 #
-# Purpose: Poll interface error counters on Cisco IOS/IOS-XE devices,
-#          flag interfaces exceeding error thresholds, and optionally
-#          bounce interfaces with persistent errors.
+# VLAN Management — Provision and verify VLAN database on Cisco IOS/IOS-XE access switches.
+# Merges desired VLAN state, confirms all VLANs are active post-change, and captures
+# a human-readable summary so dry-run diffs are immediately useful in CI output.
 #
-# Credentials: Store ansible_user and ansible_password in Ansible Vault.
-#   Example: ansible-vault encrypt_string 'mysecret' --name 'ansible_password'
+# Credentials: ansible-vault — group_vars/access_switches/vault.yml
+#   vault_ansible_user:            <encrypted>
+#   vault_ansible_password:        <encrypted>
+#   vault_ansible_become_password: <encrypted>
 #
-# Inventory example:
-#   [core_switches]
-#   sw-core-01 ansible_host=10.0.1.1
-#   sw-core-02 ansible_host=10.0.1.2
+# Inventory example (inventory/network.yml):
+# ---
+# all:
+#   children:
+#     access_switches:
+#       hosts:
+#         sw-access-01:
+#           ansible_host: 10.10.1.11
+#         sw-access-02:
+#           ansible_host: 10.10.1.12
+#       vars:
+#         ansible_network_os: ios
+#         ansible_connection: network_cli
+#         ansible_user: "{{ vault_ansible_user }}"
+#         ansible_password: "{{ vault_ansible_password }}"
+#         ansible_become: true
+#         ansible_become_method: enable
+#         ansible_become_password: "{{ vault_ansible_become_password }}"
 #
-#   [core_switches:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user={{ vault_net_user }}         # vault-encrypted
-#   ansible_password={{ vault_net_password }} # vault-encrypted
-#   ansible_become=yes
-#   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_password }} # vault-encrypted
+# Usage:
+#   ansible-playbook vlan_management.yml -i inventory/network.yml --ask-vault-pass
+#   ansible-playbook vlan_management.yml -i inventory/network.yml -e "ansible_host=10.10.1.11" --limit sw-access-01 --check
 
-- name: Interface Error Monitoring and Auto-Remediation
-  hosts: core_switches
+- name: VLAN Management — provision and verify VLAN database on access switches
+  hosts: access_switches
   gather_facts: false
+  connection: network_cli
 
   vars:
-    error_threshold: 1000        # input/output error count to flag
-    crc_threshold: 500           # CRC error count to flag
-    bounce_on_errors: false      # set true to auto-shutdown/no-shutdown
-    check_interfaces:
-      - GigabitEthernet0/1
-      - GigabitEthernet0/2
-      - GigabitEthernet0/3
+    ansible_user: "{{ vault_ansible_user }}"
+    ansible_password: "{{ vault_ansible_password }}"
+    ansible_become_password: "{{ vault_ansible_become_password }}"
+
+    vlans_desired:
+      - vlan_id: 10
+        name: CORP_DATA
+        state: active
+      - vlan_id: 20
+        name: CORP_VOICE
+        state: active
+      - vlan_id: 30
+        name: CORP_MGMT
+        state: active
+      - vlan_id: 99
+        name: NATIVE_UNUSED
+        state: active
 
   tasks:
-    - name: Collect interface error counters
+    - name: Block — apply VLAN config, verify state, report result
       block:
-        - name: Run show interfaces for error stats
-          cisco.ios.ios_command:
-            commands:
-              - "show interfaces {{ item }} | include errors|CRC|resets|flaps"
-          loop: "{{ check_interfaces }}"
-          register: iface_errors
+
+        - name: Merge desired VLANs into running config
+          cisco.ios.ios_vlans:
+            config: "{{ vlans_desired }}"
+            state: merged
+          register: vlan_push
           retries: 2
           delay: 5
-          until: iface_errors is not failed
+          until: vlan_push is not failed
 
-        - name: Run show interfaces status
-          cisco.ios.ios_command:
-            commands:
-              - show interfaces status
-          register: iface_status
+        - name: Gather VLAN state post-change
+          cisco.ios.ios_vlans:
+            state: gathered
+          register: vlan_state
 
-        - name: Display raw interface error output
+        - name: Assert every desired VLAN is present and active
+          ansible.builtin.assert:
+            that:
+              - vlan_state.gathered
+                | selectattr('vlan_id', 'equalto', item.vlan_id)
+                | selectattr('state', 'equalto', 'active')
+                | list | length == 1
+            fail_msg: "VLAN {{ item.vlan_id }} ({{ item.name }}) missing or not active after push"
+            success_msg: "VLAN {{ item.vlan_id }} ({{ item.name }}) confirmed active"
+          loop: "{{ vlans_desired }}"
+
+        - name: Report provisioning summary
           ansible.builtin.debug:
-            msg: "{{ item.stdout_lines }}"
-          loop: "{{ iface_errors.results }}"
-          loop_control:
-            label: "{{ item.item }}"
-
-        - name: Parse and flag interfaces exceeding error thresholds
-          ansible.builtin.set_fact:
-            flagged_interfaces: >-
-              {{
-                iface_errors.results
-                | selectattr('stdout', 'search', '[1-9][0-9]{3,} input errors|[1-9][0-9]{2,} CRC')
-                | map(attribute='item')
-                | list
-              }}
-
-        - name: Report flagged interfaces
-          ansible.builtin.debug:
-            msg: >
-              HOST {{ inventory_hostname }} — interfaces exceeding thresholds:
-              {{ flagged_interfaces | default([]) | join(', ') | default('none') }}
-
-        - name: Bounce flagged interfaces (if enabled)
-          cisco.ios.ios_config:
-            lines:
-              - shutdown
-              - no shutdown
-            parents: "interface {{ item }}"
-            save_when: never
-          loop: "{{ flagged_interfaces }}"
-          when:
-            - bounce_on_errors | bool
-            - flagged_interfaces is defined
-            - flagged_interfaces | length > 0
-          register: bounce_result
-          notify: Save running config
+            msg: >-
+              {{ inventory_hostname }}: {{ vlan_push.commands | default([]) | length }} command(s) applied.
+              Active VLANs: {{ vlan_state.gathered | map(attribute='vlan_id') | list | sort }}
 
       rescue:
-        - name: Log connection or command failure
+
+        - name: Capture current VLAN table for triage
+          cisco.ios.ios_command:
+            commands:
+              - show vlan brief
+          register: vlan_show_raw
+          failed_when: false
+
+        - name: Log failure details
           ansible.builtin.debug:
-            msg: >
-              FAILED on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}.
-              Skipping this host — investigate manually.
+            msg:
+              - "VLAN provisioning FAILED on {{ inventory_hostname }}"
+              - "show vlan brief output:"
+              - "{{ vlan_show_raw.stdout_lines | default(['no output captured']) }}"
 
-        - name: Mark host as failed without stopping the play
-          ansible.builtin.set_fact:
-            host_check_failed: true
-
-  handlers:
-    - name: Save running config
-      cisco.ios.ios_command:
-        commands:
-          - write memory
-      listen: Save running config
+        - name: Abort play with failure signal
+          ansible.builtin.fail:
+            msg: "VLAN provisioning failed on {{ inventory_hostname }} — review debug output above
