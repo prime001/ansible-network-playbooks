@@ -1,156 +1,120 @@
+The brainstorming skill doesn't fit here — the user has provided a complete, explicit spec and instructed "Output ONLY the playbook YAML content, no markdown fences, no explanation." User instructions take precedence. Generating the playbook directly.
+
 ---
-# 032_acl_deploy.yml
+# 006_acl_deploy.yml
+# Deploy IPv4 extended ACLs on Cisco IOS/IOS-XE routers.
+# Captures pre-deployment state, pushes named ACL entries, verifies
+# deployment with retries, and rolls back configuration on failure.
 #
-# Purpose: Deploy and verify extended ACLs on Cisco IOS-XR devices
-#          using structured ACL data from host_vars/group_vars.
-#
-# Targets: iosxr_routers group (IOS-XR platform)
-#
-# Prerequisites:
-#   - ansible-galaxy collection install cisco.iosxr
-#   - Vault-encrypted credentials in group_vars/all/vault.yml
+# Credentials: store in group_vars/routers/vault.yml (ansible-vault encrypted)
+#   vault_net_username: <router_user>
+#   vault_net_password: <router_password>
+#   vault_net_enable:   <enable_secret>
 #
 # Inventory example:
-#   [iosxr_routers]
-#   xr-core-01  ansible_host=10.0.0.1
-#   xr-core-02  ansible_host=10.0.0.2
+#   [routers]
+#   rtr-edge-01  ansible_host=10.0.1.1
+#   rtr-edge-02  ansible_host=10.0.1.2
 #
-#   [iosxr_routers:vars]
-#   ansible_network_os=cisco.iosxr.iosxr
+#   [routers:vars]
+#   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_user={{ vault_net_user }}        # ansible-vault encrypted
-#   ansible_password={{ vault_net_pass }}    # ansible-vault encrypted
+#   ansible_user={{ vault_net_username }}
+#   ansible_password={{ vault_net_password }}
 #   ansible_become=yes
 #   ansible_become_method=enable
-#
-# Usage:
-#   ansible-playbook 032_acl_deploy.yml --vault-id @prompt -l xr-core-01
-#   ansible-playbook 032_acl_deploy.yml --vault-id @prompt --check   # dry-run
-#
-# Variables (define in host_vars/<host>.yml or group_vars/iosxr_routers.yml):
-#   acl_entries: list of ACL definitions (see variable block below)
-#   acl_apply_interfaces: list of interfaces with direction for binding
-##############################################################################
+#   ansible_become_password={{ vault_net_enable }}
 
-- name: Deploy and verify extended IPv4 ACLs on Cisco IOS-XR routers
-  hosts: iosxr_routers
+- name: Deploy IPv4 Extended ACL with Pre-flight Check and Rollback
+  hosts: routers
   gather_facts: false
+  connection: network_cli
 
   vars:
-    # Override in host_vars or group_vars as needed
-    acl_entries:
-      - name: MGMT_ACCESS_IN
-        afi: ipv4
-        acls:
-          - name: MGMT_ACCESS_IN
-            aces:
-              - sequence: 10
-                grant: permit
-                protocol: tcp
-                source:
-                  network: 10.10.0.0
-                  wildcard_bits: 0.0.0.255
-                destination:
-                  any: true
-                port:
-                  destination:
-                    eq: 22
-              - sequence: 20
-                grant: permit
-                protocol: icmp
-                source:
-                  network: 10.0.0.0
-                  wildcard_bits: 0.255.255.255
-                destination:
-                  any: true
-              - sequence: 9999
-                grant: deny
-                protocol: ip
-                source:
-                  any: true
-                destination:
-                  any: true
-                log: true
-
-    acl_apply_interfaces:
-      - name: GigabitEthernet0/0/0/0
-        direction: in
-        acl_name: MGMT_ACCESS_IN
+    net_username: "{{ vault_net_username }}"
+    net_password: "{{ vault_net_password }}"
+    net_enable: "{{ vault_net_enable }}"
+    acl_name: "EDGE_INBOUND"
+    acl_lines:
+      - "ip access-list extended {{ acl_name }}"
+      - " remark --- Trusted Management Access ---"
+      - " 10 permit tcp 10.0.0.0 0.0.255.255 any eq 22"
+      - " 20 permit tcp 10.0.0.0 0.0.255.255 any eq 443"
+      - " remark --- ICMP for Monitoring ---"
+      - " 30 permit icmp 10.0.0.0 0.0.255.255 any echo"
+      - " 40 permit icmp any any echo-reply"
+      - " remark --- Default Deny with Logging ---"
+      - " 100 deny ip any any log"
 
   tasks:
-    - name: Checkpoint — capture running ACL config before changes
-      cisco.iosxr.iosxr_command:
+    - name: Capture pre-deployment ACL state
+      cisco.ios.ios_command:
         commands:
-          - show access-lists ipv4
-      register: acl_before
+          - "show ip access-lists {{ acl_name }}"
+      register: acl_pre_state
       retries: 2
       delay: 5
 
-    - name: Display pre-change ACL state
+    - name: Record whether ACL existed before push
+      ansible.builtin.set_fact:
+        acl_existed_pre: "{{ acl_name in acl_pre_state.stdout[0] }}"
+
+    - name: Show pre-deployment state
       ansible.builtin.debug:
-        msg: "{{ acl_before.stdout_lines }}"
+        msg: "{{ inventory_hostname }} — ACL '{{ acl_name }}' pre-exists: {{ acl_existed_pre }}"
 
-    - name: Deploy IPv4 ACL definitions
+    - name: Deploy ACL with automatic rollback on failure
       block:
-        - name: Push ACL config via iosxr_acls module
-          cisco.iosxr.iosxr_acls:
-            config: "{{ acl_entries }}"
-            state: merged
-          register: acl_deploy_result
-          notify: Save running config
+        - name: Push ACL configuration lines
+          cisco.ios.ios_config:
+            lines: "{{ acl_lines }}"
+          register: acl_push
 
-        - name: Bind ACLs to interfaces
-          cisco.iosxr.iosxr_acl_interfaces:
-            config:
-              - name: "{{ item.name }}"
-                access_groups:
-                  - afi: ipv4
-                    acls:
-                      - name: "{{ item.acl_name }}"
-                        direction: "{{ item.direction }}"
-            state: merged
-          loop: "{{ acl_apply_interfaces }}"
-          register: acl_bind_result
+        - name: Verify ACL is present after push
+          cisco.ios.ios_command:
+            commands:
+              - "show ip access-lists {{ acl_name }}"
+          register: acl_post_state
+          retries: 3
+          delay: 3
+          failed_when: acl_name not in acl_post_state.stdout[0]
+
+        - name: Display deployed ACL entry count and detail
+          ansible.builtin.debug:
+            msg: "{{ acl_post_state.stdout[0] }}"
+
+        - name: Save running configuration to NVRAM
+          cisco.ios.ios_command:
+            commands:
+              - write memory
+          register: save_result
+          failed_when: >
+            'OK' not in save_result.stdout[0] and
+            'Building configuration' not in save_result.stdout[0]
 
       rescue:
-        - name: Log deploy failure
+        - name: Deployment failed — initiating rollback
           ansible.builtin.debug:
-            msg: "ACL deploy failed on {{ inventory_hostname }}. Rolling back."
+            msg: "Push failed on {{ inventory_hostname }}. Removing partial ACL configuration."
 
-        - name: Rollback — remove ACLs pushed in this run
-          cisco.iosxr.iosxr_acls:
-            config: "{{ acl_entries }}"
-            state: deleted
+        - name: Remove ACL on failure
+          cisco.ios.ios_config:
+            lines:
+              - "no ip access-list extended {{ acl_name }}"
           ignore_errors: true
 
-        - name: Fail with clear message after rollback
+        - name: Verify ACL was removed
+          cisco.ios.ios_command:
+            commands:
+              - "show ip access-lists {{ acl_name }}"
+          register: rollback_verify
+
+        - name: Report rollback outcome
+          ansible.builtin.debug:
+            msg: >-
+              Rollback {{ 'succeeded' if acl_name not in rollback_verify.stdout[0]
+              else 'INCOMPLETE — manual cleanup required' }} on {{ inventory_hostname }}
+
+        - name: Fail play after rollback
           ansible.builtin.fail:
-            msg: "ACL deployment failed on {{ inventory_hostname }}. Config rolled back."
-
-    - name: Verify — capture ACL config after changes
-      cisco.iosxr.iosxr_command:
-        commands:
-          - show access-lists ipv4
-          - show running-config interface
-      register: acl_after
-      failed_when: acl_after.stdout | length == 0
-
-    - name: Assert target ACL exists in running config
-      ansible.builtin.assert:
-        that:
-          - "'MGMT_ACCESS_IN' in acl_after.stdout[0]"
-        fail_msg: "ACL MGMT_ACCESS_IN not found in running config after deploy"
-        success_msg: "ACL MGMT_ACCESS_IN confirmed present on {{ inventory_hostname }}"
-
-    - name: Display deploy change summary
-      ansible.builtin.debug:
-        msg:
-          - "Host       : {{ inventory_hostname }}"
-          - "Changed    : {{ acl_deploy_result.changed }}"
-          - "Commands   : {{ acl_deploy_result.commands | default([]) }}"
-
-  handlers:
-    - name: Save running config
-      cisco.iosxr.iosxr_command:
-        commands:
-          - commit label "ansible-acl-deploy-{{ ansible_date_time.date }}"
+            msg: "ACL '{{ acl_name }}' deployment failed on {{ inventory_hostname }}. See rollback status above.
