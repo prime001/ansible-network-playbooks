@@ -1,125 +1,137 @@
 ---
-# 027_routing_facts_gather.yml
-# Gather detailed routing table and protocol adjacency facts from multi-vendor devices.
-# Covers BGP summary, OSPF neighbors, and active route counts — distinct from
-# basic device facts collected in 007/017_facts_gathering.yml.
+# routing_neighbor_facts.yml
+#
+# Purpose : Collect BGP and OSPF neighbor state across multi-vendor devices
+#           and persist per-host reports to a local timestamped directory.
+#           Complements facts_gathering*.yml (which captures platform/interface
+#           facts) with L3 routing-protocol visibility.
+#
+# Credentials : vault_net_user / vault_net_password stored in Ansible Vault
+#   Vault file : group_vars/all/vault.yml
+#   Encrypt    : ansible-vault encrypt group_vars/all/vault.yml
 #
 # Inventory example:
-# [routers]
-# rtr-core-01 ansible_host=10.0.0.1 ansible_network_os=ios
-# rtr-core-02 ansible_host=10.0.0.2 ansible_network_os=iosxr
-# rtr-edge-01 ansible_host=10.0.0.3 ansible_network_os=nxos
+#   [core_routers]
+#   rtr-core-01  ansible_host=10.0.0.1  ansible_network_os=ios
+#   rtr-core-02  ansible_host=10.0.0.2  ansible_network_os=iosxr
+#   [aggregation]
+#   sw-agg-01    ansible_host=10.0.1.1  ansible_network_os=nxos
 #
-# [routers:vars]
-# ansible_user={{ vault_net_username }}       # ansible-vault encrypted
-# ansible_password={{ vault_net_password }}   # ansible-vault encrypted
-# ansible_become=yes
-# ansible_become_method=enable
-# ansible_connection=network_cli
+# Usage:
+#   ansible-playbook routing_neighbor_facts.yml -i inventory.yml --ask-vault-pass
 
-- name: Gather Routing Protocol and Table Facts
-  hosts: routers
+- name: Gather BGP and OSPF neighbor state (multi-vendor)
+  hosts: all
   gather_facts: false
+  connection: network_cli
+
   vars:
-    output_dir: /tmp/routing_facts
-    timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+    ansible_user: "{{ vault_net_user }}"
+    ansible_password: "{{ vault_net_password }}"
+    ansible_become: false
+    facts_output_dir: "./routing_neighbor_facts"
+    collection_timestamp: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
 
   tasks:
-
-    - name: Ensure local output directory exists
+    - name: Create local output directory
       delegate_to: localhost
       run_once: true
-      file:
-        path: "{{ output_dir }}"
+      ansible.builtin.file:
+        path: "{{ facts_output_dir }}"
         state: directory
-        mode: '0750'
+        mode: "0755"
 
-    - name: Gather routing facts block
+    - name: Collect neighbors — Cisco IOS
+      when: ansible_network_os == "ios"
       block:
-
-        - name: Query BGP summary
-          cli_command:
-            command: >-
-              {% if ansible_network_os == 'iosxr' %}
-              show bgp ipv4 unicast summary
-              {% elif ansible_network_os == 'nxos' %}
-              show bgp ipv4 unicast summary vrf all
-              {% else %}
-              show ip bgp summary
-              {% endif %}
-          register: bgp_summary
+        - name: IOS | show ip bgp summary + ospf neighbor detail
+          cisco.ios.ios_command:
+            commands:
+              - show ip bgp summary
+              - show ip ospf neighbor detail
+          register: ios_neighbor_data
           retries: 2
           delay: 5
-          until: bgp_summary is not failed
+          until: ios_neighbor_data is not failed
 
-        - name: Query OSPF neighbor state
-          cli_command:
-            command: >-
-              {% if ansible_network_os == 'iosxr' %}
-              show ospf neighbor
-              {% elif ansible_network_os == 'nxos' %}
-              show ip ospf neighbors detail
-              {% else %}
-              show ip ospf neighbor
-              {% endif %}
-          register: ospf_neighbors
-          retries: 2
-          delay: 5
-          until: ospf_neighbors is not failed
-
-        - name: Count active routes in RIB
-          cli_command:
-            command: >-
-              {% if ansible_network_os == 'iosxr' %}
-              show route summary
-              {% elif ansible_network_os == 'nxos' %}
-              show ip route summary
-              {% else %}
-              show ip route summary
-              {% endif %}
-          register: route_summary
-          retries: 2
-          delay: 5
-          until: route_summary is not failed
-
-        - name: Write per-device routing report
-          delegate_to: localhost
-          copy:
-            dest: "{{ output_dir }}/{{ inventory_hostname }}_{{ timestamp }}.txt"
-            content: |
-              ====================================================
-              Routing Facts Report — {{ inventory_hostname }}
-              Collected: {{ timestamp }}
-              Platform:  {{ ansible_network_os }}
-              ====================================================
-
-              --- BGP Summary ---
-              {{ bgp_summary.stdout }}
-
-              --- OSPF Neighbors ---
-              {{ ospf_neighbors.stdout }}
-
-              --- Route Table Summary ---
-              {{ route_summary.stdout }}
-
-        - name: Display route summary to console
-          debug:
-            msg: |
-              [{{ inventory_hostname }}] Route Summary:
-              {{ route_summary.stdout_lines | join('\n') }}
+        - name: IOS | display neighbor output
+          ansible.builtin.debug:
+            var: ios_neighbor_data.stdout_lines
 
       rescue:
-
-        - name: Log collection failure
-          debug:
+        - name: IOS | log collection failure
+          ansible.builtin.debug:
             msg: >
-              WARNING: Failed to collect routing facts from {{ inventory_hostname }}.
-              Error: {{ ansible_failed_result.msg | default('unknown error') }}
+              Neighbor collection failed on {{ inventory_hostname }}:
+              {{ ansible_failed_result.msg | default('unknown error') }}
+          failed_when: false
 
-        - name: Write failure placeholder
-          delegate_to: localhost
-          copy:
-            dest: "{{ output_dir }}/{{ inventory_hostname }}_{{ timestamp }}_FAILED.txt"
-            content: |
-              Collection failed for {{ inventory_hostname }} at {{ timestamp }}.
-              Check connectivity and credentials.
+    - name: Collect neighbors — Cisco IOS-XR
+      when: ansible_network_os == "iosxr"
+      block:
+        - name: IOS-XR | show bgp summary + ospf neighbor detail
+          cisco.iosxr.iosxr_command:
+            commands:
+              - show bgp summary
+              - show ospf neighbor detail
+          register: iosxr_neighbor_data
+          retries: 2
+          delay: 5
+          until: iosxr_neighbor_data is not failed
+
+        - name: IOS-XR | display neighbor output
+          ansible.builtin.debug:
+            var: iosxr_neighbor_data.stdout_lines
+
+      rescue:
+        - name: IOS-XR | log collection failure
+          ansible.builtin.debug:
+            msg: >
+              Neighbor collection failed on {{ inventory_hostname }}:
+              {{ ansible_failed_result.msg | default('unknown error') }}
+          failed_when: false
+
+    - name: Collect neighbors — Cisco NX-OS
+      when: ansible_network_os == "nxos"
+      block:
+        - name: NX-OS | show bgp summary + ospf neighbors detail
+          cisco.nxos.nxos_command:
+            commands:
+              - show bgp summary
+              - show ip ospf neighbors detail
+          register: nxos_neighbor_data
+          retries: 2
+          delay: 5
+          until: nxos_neighbor_data is not failed
+
+        - name: NX-OS | display neighbor output
+          ansible.builtin.debug:
+            var: nxos_neighbor_data.stdout_lines
+
+      rescue:
+        - name: NX-OS | log collection failure
+          ansible.builtin.debug:
+            msg: >
+              Neighbor collection failed on {{ inventory_hostname }}:
+              {{ ansible_failed_result.msg | default('unknown error') }}
+          failed_when: false
+
+    - name: Persist neighbor facts to local report file
+      delegate_to: localhost
+      ansible.builtin.copy:
+        content: |
+          # {{ inventory_hostname }} — Routing Neighbor Facts
+          # Collected : {{ collection_timestamp }}
+          # Platform  : {{ ansible_network_os }}
+          ---
+          {{ (ios_neighbor_data
+              | default(iosxr_neighbor_data
+              | default(nxos_neighbor_data
+              | default({})))).stdout
+              | default(['No data collected'])
+              | join('\n') }}
+        dest: "{{ facts_output_dir }}/{{ inventory_hostname }}_neighbors.txt"
+      when: >
+        ios_neighbor_data    is defined or
+        iosxr_neighbor_data  is defined or
+        nxos_neighbor_data   is defined
