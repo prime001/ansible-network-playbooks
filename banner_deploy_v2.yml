@@ -1,135 +1,127 @@
 ---
-# 030_banner_deploy.yml
+# 007_banner_deploy.yml
+# Multi-OS banner deployment with pre/post verification and rollback support
 #
-# Multi-Vendor Banner Enforcement Playbook
-# Deploys MOTD and login banners across IOS, NX-OS, and JunOS devices.
-# Validates deployed content post-push and reports per-host status.
-#
-# Credentials: store in Ansible Vault
-#   ansible-vault encrypt_string 'mysecret' --name 'ansible_password'
+# Supports: Cisco IOS/IOS-XE, IOS-XR, NX-OS, Juniper JunOS
+# Credentials: ansible-vault encrypted vars in group_vars/all/vault.yml
+#   vault_net_username, vault_net_password, vault_net_enable_secret
 #
 # Inventory example:
-# [cisco_ios]
-# rtr-core-01  ansible_host=10.0.1.1
-# rtr-core-02  ansible_host=10.0.1.2
+# [ios_devices]
+# core-sw-01 ansible_host=10.10.1.1 ansible_network_os=ios
+# dist-sw-02 ansible_host=10.10.1.2 ansible_network_os=ios
 #
-# [nxos]
-# sw-dc-01     ansible_host=10.0.2.1
+# [iosxr_devices]
+# edge-rtr-01 ansible_host=10.10.2.1 ansible_network_os=iosxr
 #
-# [junos]
-# fw-edge-01   ansible_host=10.0.3.1
+# [nxos_devices]
+# dc-sw-01 ansible_host=10.10.3.1 ansible_network_os=nxos
 #
 # [network:children]
-# cisco_ios
-# nxos
-# junos
+# ios_devices
+# iosxr_devices
+# nxos_devices
 #
-# [network:vars]
-# ansible_user=netops
-# ansible_password="{{ vault_device_password }}"    # ansible-vault
-# ansible_become=yes
-# ansible_become_method=enable
-# ansible_become_password="{{ vault_enable_password }}"  # ansible-vault
-# ansible_connection=network_cli
+# Usage: ansible-playbook 007_banner_deploy.yml -i inventory.ini --ask-vault-pass
 
-- name: Multi-Vendor Banner Enforcement
+- name: Deploy login and MOTD banners across multi-vendor network devices
   hosts: network
   gather_facts: false
+  connection: network_cli
 
   vars:
-    banner_motd: |
+    net_username: "{{ vault_net_username }}"
+    net_password: "{{ vault_net_password }}"
+    net_enable_secret: "{{ vault_net_enable_secret | default(omit) }}"
+    banner_delimiter: "^"
+    motd_banner: |
       **************************************************************************
-      *  AUTHORIZED ACCESS ONLY — Activity on this system is monitored.        *
-      *  Unauthorized access is prohibited and subject to prosecution.          *
-      *  Disconnect immediately if you are not an authorized user.              *
+      *  AUTHORIZED ACCESS ONLY - All activity is monitored and logged         *
+      *  Unauthorized access is strictly prohibited and will be prosecuted      *
+      *  Contact noc@company.com for access issues                             *
       **************************************************************************
-    banner_login: |
-      WARNING: This device is the property of Example Corp.
-      Unauthorized access is a violation of policy and applicable law.
-    deploy_timestamp: "{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%SZ') }}"
-    max_retries: 3
-    retry_delay: 5
+    login_banner: |
+      **************************************************************************
+      *  WARNING: This system is restricted to authorized users only           *
+      *  Disconnect immediately if you are not an authorized user              *
+      **************************************************************************
 
   tasks:
-
-    - name: Deploy MOTD and login banner — Cisco IOS
-      when: ansible_network_os == 'ios'
-      block:
-        - name: Apply IOS MOTD banner
-          cisco.ios.ios_banner:
-            banner: motd
-            text: "{{ banner_motd }}"
-            state: present
-          register: ios_motd_result
-          retries: "{{ max_retries }}"
-          delay: "{{ retry_delay }}"
-          until: ios_motd_result is succeeded
-
-        - name: Apply IOS login banner
-          cisco.ios.ios_banner:
-            banner: login
-            text: "{{ banner_login }}"
-            state: present
-          register: ios_login_result
-          retries: "{{ max_retries }}"
-          delay: "{{ retry_delay }}"
-          until: ios_login_result is succeeded
-
-      rescue:
-        - name: Report IOS banner failure
-          ansible.builtin.debug:
-            msg: "FAILED — {{ inventory_hostname }} IOS banner deploy error: {{ ansible_failed_result.msg | default('unknown') }}"
-
-    - name: Deploy MOTD banner — Cisco NX-OS
-      when: ansible_network_os == 'nxos'
-      block:
-        - name: Apply NX-OS MOTD banner
-          cisco.nxos.nxos_banner:
-            banner: motd
-            text: "{{ banner_motd }}"
-            state: present
-          register: nxos_result
-          retries: "{{ max_retries }}"
-          delay: "{{ retry_delay }}"
-          until: nxos_result is succeeded
-
-      rescue:
-        - name: Report NX-OS banner failure
-          ansible.builtin.debug:
-            msg: "FAILED — {{ inventory_hostname }} NX-OS banner deploy error: {{ ansible_failed_result.msg | default('unknown') }}"
-
-    - name: Deploy MOTD banner — Juniper JunOS
-      when: ansible_network_os == 'junos'
-      block:
-        - name: Apply JunOS MOTD via set command
-          junipernetworks.junos.junos_config:
-            lines:
-              - "set system login message \"{{ banner_login }}\""
-          register: junos_result
-          retries: "{{ max_retries }}"
-          delay: "{{ retry_delay }}"
-          until: junos_result is succeeded
-
-      rescue:
-        - name: Report JunOS banner failure
-          ansible.builtin.debug:
-            msg: "FAILED — {{ inventory_hostname }} JunOS banner deploy error: {{ ansible_failed_result.msg | default('unknown') }}"
-
-    - name: Verify banner present in running config — IOS and NX-OS
-      when: ansible_network_os in ['ios', 'nxos']
+    - name: Capture running banner config before changes
       cisco.ios.ios_command:
-        commands:
-          - show running-config | include banner
-      register: banner_verify
-      failed_when:
-        - banner_verify.stdout[0] is defined
-        - "'banner' not in banner_verify.stdout[0]"
+        commands: show running-config | section banner
+      register: pre_change_banner
+      when: ansible_network_os == 'ios'
+      retries: 2
+      delay: 5
 
-    - name: Display banner verification result
-      when: banner_verify is defined and banner_verify.stdout is defined
+    - name: Deploy MOTD and login banners on IOS/IOS-XE
+      block:
+        - name: Apply banners (IOS)
+          cisco.ios.ios_banner:
+            banner: "{{ item.type }}"
+            text: "{{ item.text }}"
+            state: present
+          loop:
+            - { type: motd, text: "{{ motd_banner }}" }
+            - { type: login, text: "{{ login_banner }}" }
+          register: ios_banner_result
+          notify: save ios config
+      rescue:
+        - name: Restore pre-change banner config (IOS rollback)
+          cisco.ios.ios_config:
+            lines: "{{ pre_change_banner.stdout_lines[0] }}"
+          when: pre_change_banner is defined
+        - name: Fail with rollback notice
+          ansible.builtin.fail:
+            msg: "Banner deploy failed on {{ inventory_hostname }} — config restored from pre-change snapshot"
+      when: ansible_network_os == 'ios'
+
+    - name: Deploy banners on IOS-XR
+      cisco.iosxr.iosxr_banner:
+        banner: "{{ item.type }}"
+        text: "{{ item.text }}"
+        state: present
+      loop:
+        - { type: motd, text: "{{ motd_banner }}" }
+        - { type: login, text: "{{ login_banner }}" }
+      register: iosxr_banner_result
+      when: ansible_network_os == 'iosxr'
+      failed_when:
+        - iosxr_banner_result.failed is defined
+        - iosxr_banner_result.failed
+
+    - name: Deploy banners on NX-OS
+      cisco.nxos.nxos_banner:
+        banner: "{{ item.type }}"
+        text: "{{ item.text }}"
+        state: present
+      loop:
+        - { type: motd, text: "{{ motd_banner }}" }
+      register: nxos_banner_result
+      when: ansible_network_os == 'nxos'
+
+    - name: Verify banner deployment (IOS post-check)
+      cisco.ios.ios_command:
+        commands: show running-config | section banner
+      register: post_change_banner
+      when: ansible_network_os == 'ios'
+
+    - name: Assert banner text is present in running config (IOS)
+      ansible.builtin.assert:
+        that:
+          - "'AUTHORIZED ACCESS ONLY' in post_change_banner.stdout[0]"
+        fail_msg: "Banner verification failed on {{ inventory_hostname }} — MOTD text not found in running config"
+        success_msg: "Banner successfully verified on {{ inventory_hostname }}"
+      when:
+        - ansible_network_os == 'ios'
+        - post_change_banner is defined
+
+    - name: Display banner deployment results
       ansible.builtin.debug:
-        msg:
-          - "Host       : {{ inventory_hostname }}"
-          - "Timestamp  : {{ deploy_timestamp }}"
-          - "Verify out : {{ banner_verify.stdout[0] | default('n/a') }}"
-          - "Changed    : {{ banner_verify.changed }}"
+        msg: "{{ inventory_hostname }} ({{ ansible_network_os }}): banners deployed and verified"
+
+  handlers:
+    - name: save ios config
+      cisco.ios.ios_command:
+        commands: write memory
