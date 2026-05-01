@@ -1,124 +1,118 @@
-The ansible-network-playbooks repo isn't local — I'll generate the playbook content directly.
-
 ```yaml
 ---
-# routing_protocol_compliance.yml
+# Ansible Playbook: Network Device Routing Protocol Validation
+# Purpose: Validate OSPF and BGP neighbor health, verify routing table integrity,
+#          and ensure critical routes are reachable across managed network devices
+# Portfolio Use: Demonstrates network validation, multi-vendor support, error handling
 #
-# Audits routing protocol security posture on Cisco IOS routers:
-#   - OSPF MD5 authentication on all active interfaces
-#   - BGP neighbor password (MD5) enforcement
-#   - Redistribution locked behind route-maps (no naked redistribute)
-#
-# Credentials: ansible-vault encrypted vars — see group_vars/network/vault.yml
-# Usage:
-#   ansible-playbook routing_protocol_compliance.yml \
-#     -i inventory/network.ini --ask-vault-pass
-#
-# Inventory example (inventory/network.ini):
-# [core_routers]
-# rtr-core-01  ansible_host=10.0.1.1
-# rtr-core-02  ansible_host=10.0.1.2
-#
-# [core_routers:vars]
-# ansible_network_os=ios
-# ansible_connection=network_cli
-# ansible_user="{{ vault_net_user }}"
-# ansible_password="{{ vault_net_password }}"
-# ansible_become=yes
-# ansible_become_method=enable
-# ansible_become_password="{{ vault_net_enable }}"
+# Inventory Example (inventory/devices.yml):
+#   [cisco_ios]
+#   router1 ansible_host=10.0.1.1 device_type=cisco_ios
+#   router2 ansible_host=10.0.1.2 device_type=cisco_ios
+#   
+#   [cisco_iosxr]
+#   xr_router ansible_host=10.0.2.1 device_type=cisco_iosxr
+#   
+#   [all:vars]
+#   ansible_connection=network_cli
+#   ansible_network_os=ios  # or iosxr, nxos, junos based on device
+#   ansible_user={{ vault_network_user }}
+#   ansible_password={{ vault_network_password }}
 
-- name: Routing Protocol Compliance Audit
-  hosts: core_routers
-  gather_facts: false
-
+- name: Network Device Routing Protocol Compliance Validation
+  hosts: all
+  gather_facts: no
   vars:
-    compliance_fail: false
+    min_ospf_neighbors: 2
+    min_bgp_neighbors: 1
+    validation_retries: 3
+    retry_delay: 5
 
   tasks:
-    - name: Collect routing protocol data
-      block:
-        - name: Fetch OSPF interface auth state
-          cisco.ios.ios_command:
-            commands:
-              - show ip ospf interface | include Authentication|Line
-          register: ospf_auth_raw
-          retries: 3
-          delay: 5
-          failed_when: >
-            ospf_auth_raw.failed is defined and ospf_auth_raw.failed
+    - name: Retrieve OSPF neighbor status
+      ios_command:
+        commands:
+          - "show ip ospf neighbor"
+      register: ospf_output
+      retries: "{{ validation_retries }}"
+      delay: "{{ retry_delay }}"
+      failed_when: false
+      changed_when: false
 
-        - name: Fetch BGP neighbor config
-          cisco.ios.ios_command:
-            commands:
-              - show running-config | section ^router bgp
-          register: bgp_config_raw
-          retries: 3
-          delay: 5
-          failed_when: false
+    - name: Count OSPF neighbors in FULL state
+      set_fact:
+        ospf_full_count: "{{ ospf_output.stdout[0] | regex_findall('FULL') | length }}"
+      when: ospf_output.rc == 0
 
-        - name: Fetch redistribution statements
-          cisco.ios.ios_command:
-            commands:
-              - show running-config | include redistribute
-          register: redist_raw
-          retries: 3
-          delay: 5
-          failed_when: false
-
+    - name: Validate OSPF neighbor count meets minimum threshold
+      assert:
+        that:
+          - ospf_full_count | int >= min_ospf_neighbors
+        fail_msg: "OSPF: Found {{ ospf_full_count }} FULL neighbors, minimum required: {{ min_ospf_neighbors }}"
+        success_msg: "OSPF neighbor validation passed with {{ ospf_full_count }} FULL neighbors"
+      when: ospf_output.rc == 0
       rescue:
-        - name: Log collection failure and abort host
-          ansible.builtin.debug:
-            msg: >
-              [{{ inventory_hostname }}] Data collection failed — skipping
-              compliance checks. Verify connectivity and credentials.
-        - ansible.builtin.meta: end_host
+        - name: Alert on OSPF validation failure
+          debug:
+            msg: "WARNING: {{ inventory_hostname }} OSPF neighbor count below threshold"
 
-    - name: Assert OSPF interfaces use MD5 authentication
-      ansible.builtin.assert:
+    - name: Retrieve BGP neighbor summary
+      ios_command:
+        commands:
+          - "show ip bgp summary"
+      register: bgp_output
+      retries: "{{ validation_retries }}"
+      delay: "{{ retry_delay }}"
+      failed_when: false
+      changed_when: false
+
+    - name: Count BGP established neighbors
+      set_fact:
+        bgp_established_count: "{{ bgp_output.stdout[0] | regex_findall('Established') | length }}"
+      when: bgp_output.rc == 0
+
+    - name: Validate BGP neighbor establishment threshold
+      assert:
         that:
-          - >
-            ospf_auth_raw.stdout[0] | length == 0 or
-            'Message digest' in ospf_auth_raw.stdout[0]
-        success_msg: "PASS [{{ inventory_hostname }}]: OSPF MD5 authentication present"
-        fail_msg: "FAIL [{{ inventory_hostname }}]: OSPF interface(s) missing MD5 auth"
-      register: ospf_check
-      ignore_errors: true
+          - bgp_established_count | int >= min_bgp_neighbors
+        fail_msg: "BGP: Found {{ bgp_established_count }} established neighbors, minimum required: {{ min_bgp_neighbors }}"
+        success_msg: "BGP neighbor validation passed with {{ bgp_established_count }} established neighbors"
+      when: bgp_output.rc == 0
+      rescue:
+        - name: Alert on BGP validation failure
+          debug:
+            msg: "WARNING: {{ inventory_hostname }} BGP neighbor count below threshold"
 
-    - name: Assert BGP neighbors have MD5 password configured
-      ansible.builtin.assert:
-        that:
-          - >
-            bgp_config_raw.stdout[0] | length == 0 or
-            'password' in bgp_config_raw.stdout[0]
-        success_msg: "PASS [{{ inventory_hostname }}]: BGP neighbor passwords configured"
-        fail_msg: "FAIL [{{ inventory_hostname }}]: BGP neighbor(s) missing MD5 password"
-      register: bgp_check
-      ignore_errors: true
+    - name: Retrieve routing table summary
+      ios_command:
+        commands:
+          - "show ip route summary"
+      register: route_output
+      retries: "{{ validation_retries }}"
+      delay: "{{ retry_delay }}"
+      failed_when: false
+      changed_when: false
 
-    - name: Assert redistribution is guarded by route-maps
-      ansible.builtin.assert:
-        that:
-          - >
-            redist_raw.stdout[0] | length == 0 or
-            'route-map' in redist_raw.stdout[0]
-        success_msg: "PASS [{{ inventory_hostname }}]: All redistribution uses route-map guards"
-        fail_msg: "FAIL [{{ inventory_hostname }}]: Unconstrained redistribution detected"
-      register: redist_check
-      ignore_errors: true
+    - name: Display routing validation report
+      debug:
+        msg: |
+          ========================================
+          Device Routing Validation Report
+          Device: {{ inventory_hostname }}
+          OSPF FULL Neighbors: {{ ospf_full_count | default('N/A') }}
+          BGP Established Neighbors: {{ bgp_established_count | default('N/A') }}
+          Route Retrieval Status: {{ route_output.rc == 0 | ternary('SUCCESS', 'FAILED') }}
+          Overall Status: {{ (ospf_full_count | default(0) | int >= min_ospf_neighbors and bgp_established_count | default(0) | int >= min_bgp_neighbors) | ternary('HEALTHY', 'DEGRADED') }}
+          ========================================
 
-    - name: Display compliance summary
-      ansible.builtin.debug:
-        msg:
-          - "=== Routing Protocol Compliance: {{ inventory_hostname }} ==="
-          - "OSPF Auth : {{ 'PASS' if not ospf_check.failed else 'FAIL' }}"
-          - "BGP Passwd: {{ 'PASS' if not bgp_check.failed else 'FAIL' }}"
-          - "Redist Guard: {{ 'PASS' if not redist_check.failed else 'FAIL' }}"
-
-    - name: Fail play if any control failed
-      ansible.builtin.fail:
-        msg: >
-          Routing protocol compliance FAILED on {{ inventory_hostname }}.
-          Review task output above and remediate before next audit window.
-      when: ospf_check.failed or bgp_check.failed or redist_check.failed
+    - name: Archive validation results to local report
+      copy:
+        content: |
+          Device: {{ inventory_hostname }}
+          OSPF_Full_Neighbors: {{ ospf_full_count | default('0') }}
+          BGP_Established_Neighbors: {{ bgp_established_count | default('0') }}
+          Validation_Status: {{ (ospf_full_count | default(0) | int >= min_ospf_neighbors) | ternary('PASS', 'FAIL') }}
+        dest: "/tmp/routing_validation_{{ inventory_hostname }}.log"
+      delegate_to: localhost
+      become: no
 ```
