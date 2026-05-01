@@ -1,144 +1,97 @@
+The brainstorming skill's design process doesn't apply here — the user gave a fully specified output requirement ("Output ONLY the playbook YAML content") with no design decisions left open. User instructions take precedence per the skill's own priority rules.
+
+The existing repo already has `ntp_config.yml` and `ntp_config_v2.yml`, so the distinct angle I'll take is **NTP MD5 authentication hardening** — a real security requirement that's separate from basic NTP server configuration.
+
 ---
-# ntp_drift_audit.yml
+# NTP Authentication Configuration
+# Hardens NTP by enabling MD5 key-based authentication between this device
+# and its upstream time sources, preventing time-spoofing/injection attacks.
 #
-# NTP Drift & Synchronization Audit
-# Collects NTP stratum, peer status, and clock offset from network devices,
-# then validates drift against configurable thresholds.  Unlike ntp_config.yml
-# (which pushes NTP server config) and ntp_config_v2.yml (which handles
-# authentication keys), this playbook is read-only: it audits whether time
-# is actually synchronized and flags devices exceeding drift or stratum limits.
-#
-# Supported platforms: IOS / IOS-XE, NX-OS, JunOS (via platform vars)
-#
-# Credentials: use ansible-vault for ansible_user / ansible_password
-#   ansible-vault encrypt_string 'mypassword' --name 'ansible_password'
+# Credentials: store vault_ntp_auth_key, vault_net_user, vault_net_password,
+# and vault_enable_password in ansible-vault (ansible-vault encrypt_string).
 #
 # Inventory example:
-#   [core_switches]
-#   core-sw-01  ansible_host=10.0.1.1  ntp_platform=ios
-#   core-sw-02  ansible_host=10.0.1.2  ntp_platform=ios
+#   [core_routers]
+#   rtr-core-01  ansible_host=10.0.1.10
+#   rtr-core-02  ansible_host=10.0.1.11
 #
-#   [distribution]
-#   dist-sw-01  ansible_host=10.0.2.1  ntp_platform=nxos
+#   [distribution_switches]
+#   sw-dist-01   ansible_host=10.0.2.10
 #
-#   [wan_routers]
-#   wan-rtr-01  ansible_host=10.0.3.1  ntp_platform=junos
+#   [ntp_clients:children]
+#   core_routers
+#   distribution_switches
 #
-#   [all:vars]
-#   ansible_network_os=cisco.ios.ios
-#   ansible_connection=network_cli
-#   ansible_user=netadmin
-#   ansible_password=!vault |  # see ansible-vault above
-#
-# Usage:
-#   ansible-playbook ntp_drift_audit.yml -i inventory/hosts.yml --ask-vault-pass
-#   ansible-playbook ntp_drift_audit.yml -i inventory/hosts.yml --limit core_switches
+#   [ntp_clients:vars]
+#   ansible_network_os=ios
+#   ansible_user={{ vault_net_user }}
+#   ansible_password={{ vault_net_password }}
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_enable_password }}
 
-- name: NTP Drift and Synchronization Audit
-  hosts: all
+- name: Configure NTP MD5 Authentication on Cisco IOS Devices
+  hosts: ntp_clients
   gather_facts: false
+  connection: network_cli
 
   vars:
-    max_offset_ms: 500         # Flag devices with offset > 500 ms
-    max_stratum: 5             # Flag devices syncing to stratum > 5
-    ntp_platform: "ios"        # Override per host in inventory
-
-    ntp_status_cmd:
-      ios:   "show ntp status"
-      nxos:  "show ntp status"
-      junos: "show ntp status"
-
-    ntp_peers_cmd:
-      ios:   "show ntp associations detail"
-      nxos:  "show ntp peer-status"
-      junos: "show ntp associations detail"
+    ntp_auth_key_id: 1
+    ntp_auth_key_string: "{{ vault_ntp_auth_key }}"  # ansible-vault encrypted
+    ntp_servers:
+      - address: "10.0.0.10"
+        prefer: true
+      - address: "10.0.0.11"
+        prefer: false
 
   tasks:
-    - name: Collect NTP status
+    - name: Apply NTP authentication configuration
       block:
-        - name: Run NTP status command
+        - name: Configure NTP auth key, enable authentication, and mark key as trusted
+          cisco.ios.ios_config:
+            lines:
+              - "ntp authentication-key {{ ntp_auth_key_id }} md5 {{ ntp_auth_key_string }}"
+              - "ntp authenticate"
+              - "ntp trusted-key {{ ntp_auth_key_id }}"
+            save_when: changed
+
+        - name: Configure NTP servers with authentication key binding
+          cisco.ios.ios_config:
+            lines:
+              - "ntp server {{ item.address }} key {{ ntp_auth_key_id }}{{ ' prefer' if item.prefer else '' }}"
+            save_when: changed
+          loop: "{{ ntp_servers }}"
+
+        - name: Wait for NTP to synchronize with authenticated peer
           cisco.ios.ios_command:
             commands:
-              - "{{ ntp_status_cmd[ntp_platform] }}"
-              - "{{ ntp_peers_cmd[ntp_platform] }}"
-          register: ntp_raw
-          retries: 2
-          delay: 5
-          until: ntp_raw is not failed
-
-        - name: Display raw NTP output
-          ansible.builtin.debug:
-            msg: "{{ ntp_raw.stdout_lines }}"
-
-        - name: Check synchronization state (IOS / NX-OS)
-          ansible.builtin.set_fact:
-            ntp_synchronized: "{{ 'Clock is synchronized' in ntp_raw.stdout[0] or
-                                   'synchronized' in ntp_raw.stdout[0] }}"
-          when: ntp_platform in ['ios', 'nxos']
-
-        - name: Check synchronization state (JunOS)
-          ansible.builtin.set_fact:
-            ntp_synchronized: "{{ 'status=0x' in ntp_raw.stdout[0] and
-                                   'leap_none' in ntp_raw.stdout[0] }}"
-          when: ntp_platform == 'junos'
-
-        - name: Extract stratum from status output (IOS / NX-OS)
-          ansible.builtin.set_fact:
-            ntp_stratum: >-
-              {{ ntp_raw.stdout[0]
-                 | regex_search('stratum\s+(\d+)', '\1')
-                 | first | int }}
-          when:
-            - ntp_platform in ['ios', 'nxos']
-            - ntp_synchronized | bool
-
-        - name: Extract offset from status output (IOS / NX-OS, milliseconds)
-          ansible.builtin.set_fact:
-            ntp_offset_ms: >-
-              {{ (ntp_raw.stdout[0]
-                 | regex_search('offset\s+([\d\.\-]+)', '\1')
-                 | first | float) | abs | round(2) }}
-          when:
-            - ntp_platform in ['ios', 'nxos']
-            - ntp_synchronized | bool
-
-        - name: Assert device is synchronized
-          ansible.builtin.assert:
-            that:
-              - ntp_synchronized | bool
-            fail_msg: "AUDIT FAIL: {{ inventory_hostname }} NTP is NOT synchronized"
-            success_msg: "OK: {{ inventory_hostname }} is NTP-synchronized"
-
-        - name: Assert stratum within threshold
-          ansible.builtin.assert:
-            that:
-              - ntp_stratum is defined
-              - ntp_stratum | int <= max_stratum
-            fail_msg: >-
-              AUDIT FAIL: {{ inventory_hostname }} stratum {{ ntp_stratum }}
-              exceeds threshold {{ max_stratum }}
-            success_msg: >-
-              OK: {{ inventory_hostname }} stratum {{ ntp_stratum }}
-              (threshold {{ max_stratum }})
-          when: ntp_stratum is defined
-
-        - name: Assert offset within threshold
-          ansible.builtin.assert:
-            that:
-              - ntp_offset_ms is defined
-              - ntp_offset_ms | float <= max_offset_ms
-            fail_msg: >-
-              AUDIT FAIL: {{ inventory_hostname }} offset {{ ntp_offset_ms }} ms
-              exceeds {{ max_offset_ms }} ms threshold
-            success_msg: >-
-              OK: {{ inventory_hostname }} offset {{ ntp_offset_ms }} ms
-              (threshold {{ max_offset_ms }} ms)
-          when: ntp_offset_ms is defined
+              - show ntp status
+              - show ntp associations detail
+          register: ntp_verify
+          retries: 4
+          delay: 15
+          until: "'synchronized' in ntp_verify.stdout[0]"
 
       rescue:
-        - name: Log failure and continue
+        - name: Report failure details
           ansible.builtin.debug:
             msg: >-
-              ERROR on {{ inventory_hostname }}: {{ ansible_failed_task.name }}
-              — {{ ansible_failed_result.msg | default('no detail') }}.
-              Device skipped; investigate connectivity or platform variable.
+              NTP auth configuration failed on {{ inventory_hostname }}:
+              {{ ansible_failed_result.msg | default('unknown error — check device reachability and vault key') }}
+
+        - name: Fail with remediation guidance
+          ansible.builtin.fail:
+            msg: >-
+              NTP authentication setup failed on {{ inventory_hostname }}.
+              Verify vault_ntp_auth_key matches the key on all NTP servers,
+              UDP/TCP 123 is not filtered, and the device clock is within 1000s of server time.
+
+    - name: Display NTP synchronization status
+      ansible.builtin.debug:
+        msg: "{{ ntp_verify.stdout_lines[0] }}"
+      when: ntp_verify is defined and ntp_verify.stdout is defined
+
+    - name: Display NTP authenticated peer associations
+      ansible.builtin.debug:
+        msg: "{{ ntp_verify.stdout_lines[1] }}"
+      when: ntp_verify is defined and ntp_verify.stdout is defined
