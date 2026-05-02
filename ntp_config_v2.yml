@@ -1,97 +1,108 @@
-The brainstorming skill's design process doesn't apply here — the user gave a fully specified output requirement ("Output ONLY the playbook YAML content") with no design decisions left open. User instructions take precedence per the skill's own priority rules.
+Looking at the existing files, NTP config is already covered by ntp_config.yml, ntp_config_v2.yml, and numbered variants. I'll write an NTP authentication hardening + drift verification playbook — a distinct angle not covered by basic NTP server configuration.
 
-The existing repo already has `ntp_config.yml` and `ntp_config_v2.yml`, so the distinct angle I'll take is **NTP MD5 authentication hardening** — a real security requirement that's separate from basic NTP server configuration.
-
+```yaml
 ---
-# NTP Authentication Configuration
-# Hardens NTP by enabling MD5 key-based authentication between this device
-# and its upstream time sources, preventing time-spoofing/injection attacks.
+# ntp_auth_verify.yml
+# Configures NTP authentication (MD5 keys + trusted-key) and verifies
+# clock sync/stratum post-deployment. Distinct from ntp_config.yml
+# (server list push) — this hardens existing NTP associations and
+# validates the result.
 #
-# Credentials: store vault_ntp_auth_key, vault_net_user, vault_net_password,
-# and vault_enable_password in ansible-vault (ansible-vault encrypt_string).
+# Credentials: ansible-vault encrypted group_vars/all/vault.yml
+#   vault_net_username, vault_net_password, vault_ntp_key_string
 #
 # Inventory example:
-#   [core_routers]
-#   rtr-core-01  ansible_host=10.0.1.10
-#   rtr-core-02  ansible_host=10.0.1.11
+# [core_routers]
+# rtr-core-01 ansible_host=10.0.1.1
+# rtr-core-02 ansible_host=10.0.1.2
 #
-#   [distribution_switches]
-#   sw-dist-01   ansible_host=10.0.2.10
-#
-#   [ntp_clients:children]
-#   core_routers
-#   distribution_switches
-#
-#   [ntp_clients:vars]
-#   ansible_network_os=ios
-#   ansible_user={{ vault_net_user }}
-#   ansible_password={{ vault_net_password }}
-#   ansible_become=yes
-#   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_password }}
+# [core_routers:vars]
+# ansible_network_os=ios
+# ansible_connection=network_cli
+# ansible_user={{ vault_net_username }}
+# ansible_password={{ vault_net_password }}
 
-- name: Configure NTP MD5 Authentication on Cisco IOS Devices
-  hosts: ntp_clients
+- name: Harden NTP authentication and verify clock synchronisation
+  hosts: core_routers
   gather_facts: false
-  connection: network_cli
 
   vars:
-    ntp_auth_key_id: 1
-    ntp_auth_key_string: "{{ vault_ntp_auth_key }}"  # ansible-vault encrypted
-    ntp_servers:
-      - address: "10.0.0.10"
-        prefer: true
-      - address: "10.0.0.11"
-        prefer: false
+    ntp_key_id: 1
+    ntp_key_type: md5
+    ntp_key_string: "{{ vault_ntp_key_string }}"
+    max_stratum: 4
+    max_drift_seconds: 2
+    ntp_source_interface: Loopback0
 
   tasks:
-    - name: Apply NTP authentication configuration
+    - name: Apply NTP authentication key and trusted-key config
       block:
-        - name: Configure NTP auth key, enable authentication, and mark key as trusted
+        - name: Push NTP authentication lines
           cisco.ios.ios_config:
             lines:
-              - "ntp authentication-key {{ ntp_auth_key_id }} md5 {{ ntp_auth_key_string }}"
+              - "ntp authentication-key {{ ntp_key_id }} {{ ntp_key_type }} {{ ntp_key_string }}"
               - "ntp authenticate"
-              - "ntp trusted-key {{ ntp_auth_key_id }}"
+              - "ntp trusted-key {{ ntp_key_id }}"
+              - "ntp source {{ ntp_source_interface }}"
             save_when: changed
+          register: ntp_auth_result
+          retries: 2
+          delay: 5
+          until: ntp_auth_result is not failed
 
-        - name: Configure NTP servers with authentication key binding
-          cisco.ios.ios_config:
-            lines:
-              - "ntp server {{ item.address }} key {{ ntp_auth_key_id }}{{ ' prefer' if item.prefer else '' }}"
-            save_when: changed
-          loop: "{{ ntp_servers }}"
-
-        - name: Wait for NTP to synchronize with authenticated peer
+        - name: Confirm running-config reflects authentication
           cisco.ios.ios_command:
-            commands:
-              - show ntp status
-              - show ntp associations detail
-          register: ntp_verify
-          retries: 4
-          delay: 15
-          until: "'synchronized' in ntp_verify.stdout[0]"
+            commands: "show running-config | include ntp"
+          register: ntp_running_cfg
+          failed_when: "'ntp authenticate' not in ntp_running_cfg.stdout[0]"
 
       rescue:
-        - name: Report failure details
+        - name: Log authentication push failure
+          ansible.builtin.debug:
+            msg: "NTP auth config failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg }}"
+
+        - name: Abort remaining tasks for this host
+          ansible.builtin.meta: end_host
+
+    - name: Verify NTP synchronisation status
+      block:
+        - name: Collect NTP associations detail
+          cisco.ios.ios_command:
+            commands:
+              - show ntp associations detail
+              - show ntp status
+          register: ntp_status
+          retries: 3
+          delay: 10
+          until: "'Clock is synchronized' in ntp_status.stdout[1]"
+
+        - name: Parse stratum from NTP status output
+          ansible.builtin.set_fact:
+            current_stratum: >-
+              {{ ntp_status.stdout[1]
+                 | regex_search('stratum\s+(\d+)', '\1')
+                 | first | int }}
+
+        - name: Enforce stratum ceiling
+          ansible.builtin.assert:
+            that: current_stratum <= max_stratum
+            fail_msg: >-
+              {{ inventory_hostname }} stratum {{ current_stratum }}
+              exceeds allowed maximum of {{ max_stratum }}
+            success_msg: "Stratum {{ current_stratum }} — within policy"
+
+      rescue:
+        - name: Report sync failure after retries
           ansible.builtin.debug:
             msg: >-
-              NTP auth configuration failed on {{ inventory_hostname }}:
-              {{ ansible_failed_result.msg | default('unknown error — check device reachability and vault key') }}
+              {{ inventory_hostname }} failed to synchronise NTP within
+              retry window. Manual investigation required.
 
-        - name: Fail with remediation guidance
-          ansible.builtin.fail:
-            msg: >-
-              NTP authentication setup failed on {{ inventory_hostname }}.
-              Verify vault_ntp_auth_key matches the key on all NTP servers,
-              UDP/TCP 123 is not filtered, and the device clock is within 1000s of server time.
-
-    - name: Display NTP synchronization status
+    - name: Display NTP verification summary
       ansible.builtin.debug:
-        msg: "{{ ntp_verify.stdout_lines[0] }}"
-      when: ntp_verify is defined and ntp_verify.stdout is defined
-
-    - name: Display NTP authenticated peer associations
-      ansible.builtin.debug:
-        msg: "{{ ntp_verify.stdout_lines[1] }}"
-      when: ntp_verify is defined and ntp_verify.stdout is defined
+        msg:
+          host: "{{ inventory_hostname }}"
+          auth_config_changed: "{{ ntp_auth_result.changed }}"
+          stratum: "{{ current_stratum | default('unknown') }}"
+          status_output: "{{ ntp_status.stdout[1].split('\n') | first }}"
+```
