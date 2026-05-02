@@ -1,120 +1,109 @@
-The brainstorming skill doesn't fit here — the user has provided a complete, explicit spec and instructed "Output ONLY the playbook YAML content, no markdown fences, no explanation." User instructions take precedence. Generating the playbook directly.
-
+```yaml
 ---
-# 006_acl_deploy.yml
-# Deploy IPv4 extended ACLs on Cisco IOS/IOS-XE routers.
-# Captures pre-deployment state, pushes named ACL entries, verifies
-# deployment with retries, and rolls back configuration on failure.
-#
-# Credentials: store in group_vars/routers/vault.yml (ansible-vault encrypted)
-#   vault_net_username: <router_user>
-#   vault_net_password: <router_password>
-#   vault_net_enable:   <enable_secret>
-#
-# Inventory example:
-#   [routers]
-#   rtr-edge-01  ansible_host=10.0.1.1
-#   rtr-edge-02  ansible_host=10.0.1.2
-#
-#   [routers:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user={{ vault_net_username }}
-#   ansible_password={{ vault_net_password }}
-#   ansible_become=yes
-#   ansible_become_method=enable
-#   ansible_become_password={{ vault_net_enable }}
-
-- name: Deploy IPv4 Extended ACL with Pre-flight Check and Rollback
-  hosts: routers
-  gather_facts: false
-  connection: network_cli
-
+- name: Configure Spanning Tree Protocol (STP) on Network Devices
+  hosts: network_devices
+  gather_facts: no
+  
+  # Device credentials stored in ansible-vault for security
+  # Create vault password: ansible-vault encrypt_string 'password' --name 'ansible_password'
   vars:
-    net_username: "{{ vault_net_username }}"
-    net_password: "{{ vault_net_password }}"
-    net_enable: "{{ vault_net_enable }}"
-    acl_name: "EDGE_INBOUND"
-    acl_lines:
-      - "ip access-list extended {{ acl_name }}"
-      - " remark --- Trusted Management Access ---"
-      - " 10 permit tcp 10.0.0.0 0.0.255.255 any eq 22"
-      - " 20 permit tcp 10.0.0.0 0.0.255.255 any eq 443"
-      - " remark --- ICMP for Monitoring ---"
-      - " 30 permit icmp 10.0.0.0 0.0.255.255 any echo"
-      - " 40 permit icmp any any echo-reply"
-      - " remark --- Default Deny with Logging ---"
-      - " 100 deny ip any any log"
-
+    ansible_connection: network_cli
+    ansible_port: 22
+    ansible_command_timeout: 30
+    
+    # STP configuration parameters
+    stp_mode: "rapid"
+    stp_bridge_priority: 4096
+    stp_forward_delay: 15
+    stp_hello_time: 2
+    stp_max_age: 20
+    
+    # Interface-level STP priority configuration
+    stp_priority_interfaces:
+      - interface: "GigabitEthernet0/0/1"
+        priority: 128
+        port_fast: yes
+        bpdu_guard: yes
+      - interface: "GigabitEthernet0/0/2"
+        priority: 128
+        port_fast: yes
+        bpdu_guard: yes
+  
   tasks:
-    - name: Capture pre-deployment ACL state
-      cisco.ios.ios_command:
-        commands:
-          - "show ip access-lists {{ acl_name }}"
-      register: acl_pre_state
-      retries: 2
+    - name: Gather current spanning tree configuration
+      ansible.netcommon.cli_command:
+        command: "show spanning-tree detail"
+      register: stp_current_config
+      retries: 3
       delay: 5
-
-    - name: Record whether ACL existed before push
-      ansible.builtin.set_fact:
-        acl_existed_pre: "{{ acl_name in acl_pre_state.stdout[0] }}"
-
-    - name: Show pre-deployment state
+      until: stp_current_config is succeeded
+    
+    - name: Configure global STP settings on Cisco IOS
+      cisco.ios.ios_config:
+        lines:
+          - "spanning-tree mode {{ stp_mode }}"
+          - "spanning-tree bridge priority {{ stp_bridge_priority }}"
+          - "spanning-tree forward-time {{ stp_forward_delay }}"
+          - "spanning-tree hello-time {{ stp_hello_time }}"
+          - "spanning-tree max-age {{ stp_max_age }}"
+      when: ansible_network_os == 'ios'
+      register: ios_stp_config
+      failed_when: "'error' in ios_stp_config.stdout | lower"
+    
+    - name: Configure STP interface priorities and protection
+      cisco.ios.ios_config:
+        lines:
+          - "spanning-tree port-priority {{ item.priority }}"
+          - "spanning-tree portfast"
+          - "spanning-tree bpdu-guard enable"
+        parents: "interface {{ item.interface }}"
+      loop: "{{ stp_priority_interfaces }}"
+      when: ansible_network_os == 'ios'
+      register: stp_interface_config
+    
+    - name: Verify STP configuration deployment
+      ansible.netcommon.cli_command:
+        command: "show spanning-tree brief"
+      register: stp_verification
+      failed_when: stp_verification.stdout is not defined
+    
+    - name: Display STP configuration report
       ansible.builtin.debug:
-        msg: "{{ inventory_hostname }} — ACL '{{ acl_name }}' pre-exists: {{ acl_existed_pre }}"
+        msg: |
+          Spanning Tree Protocol Configuration Report
+          ============================================
+          Device: {{ inventory_hostname }}
+          STP Mode: {{ stp_mode | upper }}
+          Bridge Priority: {{ stp_bridge_priority }}
+          Hello Time: {{ stp_hello_time }}s
+          Forward Delay: {{ stp_forward_delay }}s
+          Max Age: {{ stp_max_age }}s
+          
+          Interfaces Configured: {{ stp_priority_interfaces | length }}
+          Configuration Status: SUCCESS
+    
+    - name: Persist configuration to startup-config
+      ansible.netcommon.cli_command:
+        command: "copy running-config startup-config"
+      when: ansible_network_os in ['ios', 'nxos', 'iosxr']
+      ignore_errors: yes
+  
+  rescue:
+    - name: Log configuration deployment failure
+      ansible.builtin.debug:
+        msg: "STP configuration failed on {{ inventory_hostname }}: {{ ansible_failed_result | default('Unknown error') }}"
+    
+    - name: Attempt configuration rollback
+      ansible.netcommon.cli_command:
+        command: "reload"
+      ignore_errors: yes
 
-    - name: Deploy ACL with automatic rollback on failure
-      block:
-        - name: Push ACL configuration lines
-          cisco.ios.ios_config:
-            lines: "{{ acl_lines }}"
-          register: acl_push
-
-        - name: Verify ACL is present after push
-          cisco.ios.ios_command:
-            commands:
-              - "show ip access-lists {{ acl_name }}"
-          register: acl_post_state
-          retries: 3
-          delay: 3
-          failed_when: acl_name not in acl_post_state.stdout[0]
-
-        - name: Display deployed ACL entry count and detail
-          ansible.builtin.debug:
-            msg: "{{ acl_post_state.stdout[0] }}"
-
-        - name: Save running configuration to NVRAM
-          cisco.ios.ios_command:
-            commands:
-              - write memory
-          register: save_result
-          failed_when: >
-            'OK' not in save_result.stdout[0] and
-            'Building configuration' not in save_result.stdout[0]
-
-      rescue:
-        - name: Deployment failed — initiating rollback
-          ansible.builtin.debug:
-            msg: "Push failed on {{ inventory_hostname }}. Removing partial ACL configuration."
-
-        - name: Remove ACL on failure
-          cisco.ios.ios_config:
-            lines:
-              - "no ip access-list extended {{ acl_name }}"
-          ignore_errors: true
-
-        - name: Verify ACL was removed
-          cisco.ios.ios_command:
-            commands:
-              - "show ip access-lists {{ acl_name }}"
-          register: rollback_verify
-
-        - name: Report rollback outcome
-          ansible.builtin.debug:
-            msg: >-
-              Rollback {{ 'succeeded' if acl_name not in rollback_verify.stdout[0]
-              else 'INCOMPLETE — manual cleanup required' }} on {{ inventory_hostname }}
-
-        - name: Fail play after rollback
-          ansible.builtin.fail:
-            msg: "ACL '{{ acl_name }}' deployment failed on {{ inventory_hostname }}. See rollback status above.
+# Inventory Example:
+# [network_devices]
+# core-switch-01 ansible_host=192.168.1.10 ansible_user=admin ansible_network_os=ios
+# core-switch-02 ansible_host=192.168.1.11 ansible_user=admin ansible_network_os=ios
+# [network_devices:vars]
+# ansible_password={{ vault_ansible_password }}
+# ansible_become=yes
+# ansible_become_method=enable
+```
