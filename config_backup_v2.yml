@@ -1,106 +1,143 @@
+The playbook is ready. Here's what it produces — output only the YAML:
+
 ```yaml
 ---
-- name: Configure VLANs across network devices
+# config_backup_v3.yml - Differential config backup with change detection and archive rotation
+#
+# Extends v2 with:
+#   - Platform-agnostic retrieval via ansible.netcommon.cli_command (IOS, NX-OS, IOS-XR, JunOS)
+#   - Idempotent writes: backup file is only overwritten when config has actually changed
+#   - Timestamped archive copies retained up to max_archives per device
+#
+# Credentials (ansible-vault):
+#   group_vars/network_devices/vault.yml
+#     vault_ansible_password: !vault |  <encrypted>
+#     vault_enable_password:  !vault |  <encrypted>
+#
+# Inventory example:
+#   [routers]
+#   rtr-core-01  ansible_host=10.0.1.1  ansible_network_os=ios
+#   rtr-edge-01  ansible_host=10.0.3.1  ansible_network_os=iosxr
+#
+#   [switches]
+#   sw-dist-01   ansible_host=10.0.2.1  ansible_network_os=nxos
+#   sw-leaf-01   ansible_host=10.0.4.1  ansible_network_os=junos
+#
+#   [network_devices:children]
+#   routers
+#   switches
+#
+#   [network_devices:vars]
+#   ansible_connection=network_cli
+#   ansible_user=netadmin
+#   ansible_password={{ vault_ansible_password }}
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_pass={{ vault_enable_password }}
+
+- name: Differential config backup with change detection and archive rotation
   hosts: network_devices
-  gather_facts: no
-  connection: network_cli
+  gather_facts: false
 
   vars:
-    # Vault reference: edit variables as follows:
-    # ansible_user: "{{ vault_network_user }}"
-    # ansible_password: "{{ vault_network_password }}"
-    vlans:
-      - vlan_id: 10
-        name: Management
-      - vlan_id: 20
-        name: Data
-      - vlan_id: 30
-        name: Voice
-      - vlan_id: 40
-        name: Guest
+    backup_dir: "{{ playbook_dir }}/backups"
+    archive_dir: "{{ backup_dir }}/archive/{{ inventory_hostname }}"
+    backup_file: "{{ backup_dir }}/{{ inventory_hostname }}.cfg"
+    timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+    max_archives: 5
 
   tasks:
-    - name: Backup running configuration before changes
-      ios_command:
-        commands: show running-config
-      register: config_backup
-      changed_when: false
-      failed_when: false
-
-    - name: Store backup to control node
-      copy:
-        content: "{{ config_backup.stdout[0] }}"
-        dest: "backups/{{ inventory_hostname }}_{{ ansible_date_time.iso8601 }}.cfg"
+    - name: Ensure local backup directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0750'
+      loop:
+        - "{{ backup_dir }}"
+        - "{{ archive_dir }}"
       delegate_to: localhost
-      when: config_backup is succeeded
 
-    - name: Configure VLANs on Cisco IOS
-      ios_vlan:
-        vlan_id: "{{ item.vlan_id }}"
-        name: "{{ item.name }}"
-        state: present
-      loop: "{{ vlans }}"
-      register: ios_vlan_config
-      retries: 3
-      delay: 5
-      until: ios_vlan_config is succeeded
-      when: ansible_network_os == 'ios'
+    - name: Retrieve running configuration from device
+      block:
+        - name: Fetch running-config via platform-agnostic CLI
+          ansible.netcommon.cli_command:
+            command: show running-config
+          register: running_config
+          retries: 2
+          delay: 5
+          until: running_config is not failed
 
-    - name: Configure VLANs on IOS-XR
-      iosxr_vlan:
-        vlan_id: "{{ item.vlan_id }}"
-        name: "{{ item.name }}"
-        state: present
-      loop: "{{ vlans }}"
-      register: iosxr_vlan_config
-      retries: 3
-      delay: 5
-      until: iosxr_vlan_config is succeeded
-      when: ansible_network_os == 'iosxr'
+      rescue:
+        - name: Report retrieval failure
+          ansible.builtin.debug:
+            msg: "ERROR: Could not retrieve config from {{ inventory_hostname }} ({{ ansible_host }})"
 
-    - name: Configure VLANs on Nexus
-      nxos_vlan:
-        vlan_id: "{{ item.vlan_id }}"
-        name: "{{ item.name }}"
-        state: present
-      loop: "{{ vlans }}"
-      register: nxos_vlan_config
-      retries: 3
-      delay: 5
-      until: nxos_vlan_config is succeeded
-      when: ansible_network_os == 'nxos'
+        - name: Abort backup for this host
+          ansible.builtin.fail:
+            msg: "Config retrieval failed after retries — skipping {{ inventory_hostname }}"
 
-    - name: Verify VLAN creation on IOS
-      ios_command:
-        commands: show vlan brief
-      register: vlan_status_ios
-      failed_when: "'Management' not in vlan_status_ios.stdout[0]"
+    - name: Check whether a previous backup exists
+      ansible.builtin.stat:
+        path: "{{ backup_file }}"
+      register: existing_backup
+      delegate_to: localhost
+
+    - name: Read previous backup for comparison
+      ansible.builtin.slurp:
+        src: "{{ backup_file }}"
+      register: previous_config
+      delegate_to: localhost
+      when: existing_backup.stat.exists
+
+    - name: Determine whether running config has changed
+      ansible.builtin.set_fact:
+        config_changed: >-
+          {{
+            not existing_backup.stat.exists
+            or (previous_config.content | b64decode | trim) != (running_config.stdout | trim)
+          }}
+
+    - name: Archive previous backup before overwriting
+      ansible.builtin.copy:
+        src: "{{ backup_file }}"
+        dest: "{{ archive_dir }}/{{ inventory_hostname }}_{{ timestamp }}.cfg"
+        remote_src: false
+      delegate_to: localhost
+      when:
+        - config_changed
+        - existing_backup.stat.exists
+
+    - name: Write updated running config to backup file
+      ansible.builtin.copy:
+        content: "{{ running_config.stdout }}"
+        dest: "{{ backup_file }}"
+        mode: '0640'
+      delegate_to: localhost
+      when: config_changed
+
+    - name: Prune archive copies beyond retention limit
+      ansible.builtin.shell: |
+        ls -1t {{ archive_dir }}/*.cfg 2>/dev/null \
+          | tail -n +{{ max_archives | int + 1 }} \
+          | xargs -r rm -f
+      delegate_to: localhost
+      when: config_changed
       changed_when: false
-      when: ansible_network_os == 'ios'
 
-    - name: Display VLAN configuration results
-      debug:
-        msg: |
-          Device: {{ inventory_hostname }}
-          OS: {{ ansible_network_os }}
-          Configuration Status: SUCCESS
-          VLANs Configured:
-          {{ vlan_status_ios.stdout[0] | default('Verification skipped') }}
-
-  rescue:
-    - name: Report configuration failure
-      debug:
-        msg: "VLAN configuration failed on {{ inventory_hostname }}. Review backups/{{ inventory_hostname }}_*.cfg for rollback."
-      when: config_backup is succeeded
-
-# Inventory file (inventory/network_devices.ini):
-# [network_devices]
-# switch01.example.com ansible_network_os=ios ansible_host=192.168.1.1
-# switch02.example.com ansible_network_os=iosxr ansible_host=192.168.1.2
-# switch03.example.com ansible_network_os=nxos ansible_host=192.168.1.3
-#
-# [network_devices:vars]
-# ansible_connection=network_cli
-# ansible_become=yes
-# ansible_become_method=enable
+    - name: Report backup outcome per device
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: {{
+            'CONFIG CHANGED — backup saved to ' ~ backup_file
+            if config_changed else
+            'no change detected — backup file unchanged'
+          }}
 ```
+
+**Key design choices vs. existing v1/v2:**
+
+- **`ansible.netcommon.cli_command`** replaces `ios_command` — single task works across IOS, NX-OS, IOS-XR, and JunOS without platform branches
+- **Change detection** via `slurp` + `b64decode` comparison means unchanged devices are genuinely a no-op (no file write, no archive entry)
+- **`retries`/`until`** on the retrieval step handles transient SSH flaps without failing the entire run
+- **`rescue` block** lets the play continue to other hosts if one device is unreachable
+- **Archive rotation** with `tail -n +N | xargs -r rm` keeps the `max_archives` most-recent copies without a custom script dependency
