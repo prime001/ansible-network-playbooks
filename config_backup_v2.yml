@@ -1,143 +1,128 @@
-The playbook is ready. Here's what it produces — output only the YAML:
-
-```yaml
 ---
-# config_backup_v3.yml - Differential config backup with change detection and archive rotation
+# config_diff_backup.yml
 #
-# Extends v2 with:
-#   - Platform-agnostic retrieval via ansible.netcommon.cli_command (IOS, NX-OS, IOS-XR, JunOS)
-#   - Idempotent writes: backup file is only overwritten when config has actually changed
-#   - Timestamped archive copies retained up to max_archives per device
-#
-# Credentials (ansible-vault):
-#   group_vars/network_devices/vault.yml
-#     vault_ansible_password: !vault |  <encrypted>
-#     vault_enable_password:  !vault |  <encrypted>
+# Incremental configuration backup with change detection.
+# Pulls running-config from IOS/IOS-XE devices, compares against the
+# most recent archive, and writes a new timestamped file only when the
+# config has changed. Produces a per-host diff summary at the end.
 #
 # Inventory example:
-#   [routers]
-#   rtr-core-01  ansible_host=10.0.1.1  ansible_network_os=ios
-#   rtr-edge-01  ansible_host=10.0.3.1  ansible_network_os=iosxr
+#   [core_switches]
+#   sw-core-01 ansible_host=10.0.1.1
+#   sw-core-02 ansible_host=10.0.1.2
 #
-#   [switches]
-#   sw-dist-01   ansible_host=10.0.2.1  ansible_network_os=nxos
-#   sw-leaf-01   ansible_host=10.0.4.1  ansible_network_os=junos
-#
-#   [network_devices:children]
-#   routers
-#   switches
-#
-#   [network_devices:vars]
+#   [core_switches:vars]
+#   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_user=netadmin
-#   ansible_password={{ vault_ansible_password }}
+#   ansible_user={{ vault_net_user }}       # ansible-vault encrypted
+#   ansible_password={{ vault_net_pass }}
 #   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_become_pass={{ vault_enable_password }}
+#   ansible_become_pass={{ vault_enable_pass }}
+#
+# Usage:
+#   ansible-playbook config_diff_backup.yml -i inventory.yml --ask-vault-pass
+#   ansible-playbook config_diff_backup.yml -i inventory.yml -e "backup_root=/mnt/nfs/configs"
 
-- name: Differential config backup with change detection and archive rotation
-  hosts: network_devices
+- name: Incremental config backup with change detection
+  hosts: core_switches
   gather_facts: false
+  serial: 10
 
   vars:
-    backup_dir: "{{ playbook_dir }}/backups"
-    archive_dir: "{{ backup_dir }}/archive/{{ inventory_hostname }}"
-    backup_file: "{{ backup_dir }}/{{ inventory_hostname }}.cfg"
+    backup_root: "{{ playbook_dir }}/backups"
     timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
-    max_archives: 5
+    host_backup_dir: "{{ backup_root }}/{{ inventory_hostname }}"
+    latest_link: "{{ host_backup_dir }}/latest.cfg"
+    new_backup: "{{ host_backup_dir }}/{{ timestamp }}.cfg"
 
   tasks:
-    - name: Ensure local backup directories exist
+    - name: Ensure per-host backup directory exists
       ansible.builtin.file:
-        path: "{{ item }}"
+        path: "{{ host_backup_dir }}"
         state: directory
-        mode: '0750'
-      loop:
-        - "{{ backup_dir }}"
-        - "{{ archive_dir }}"
+        mode: "0750"
       delegate_to: localhost
 
-    - name: Retrieve running configuration from device
+    - name: Pull running configuration
       block:
-        - name: Fetch running-config via platform-agnostic CLI
-          ansible.netcommon.cli_command:
-            command: show running-config
-          register: running_config
-          retries: 2
+        - name: Fetch running-config
+          cisco.ios.ios_command:
+            commands: show running-config
+          register: running_cfg
+          retries: 3
           delay: 5
-          until: running_config is not failed
+          until: running_cfg is not failed
 
       rescue:
-        - name: Report retrieval failure
+        - name: Log fetch failure and continue
           ansible.builtin.debug:
-            msg: "ERROR: Could not retrieve config from {{ inventory_hostname }} ({{ ansible_host }})"
+            msg: "WARN: Could not retrieve running-config from {{ inventory_hostname }} — skipping."
+        - name: Mark host as failed non-fatally
+          ansible.builtin.set_fact:
+            fetch_failed: true
 
-        - name: Abort backup for this host
-          ansible.builtin.fail:
-            msg: "Config retrieval failed after retries — skipping {{ inventory_hostname }}"
+    - name: Proceed only when config was retrieved
+      when: not (fetch_failed | default(false))
+      block:
+        - name: Write candidate config to temp file
+          ansible.builtin.copy:
+            content: "{{ running_cfg.stdout[0] }}"
+            dest: "{{ new_backup }}.tmp"
+            mode: "0640"
+          delegate_to: localhost
 
-    - name: Check whether a previous backup exists
-      ansible.builtin.stat:
-        path: "{{ backup_file }}"
-      register: existing_backup
-      delegate_to: localhost
+        - name: Check whether a previous backup exists
+          ansible.builtin.stat:
+            path: "{{ latest_link }}"
+          register: latest_stat
+          delegate_to: localhost
 
-    - name: Read previous backup for comparison
-      ansible.builtin.slurp:
-        src: "{{ backup_file }}"
-      register: previous_config
-      delegate_to: localhost
-      when: existing_backup.stat.exists
+        - name: Diff candidate against latest backup
+          ansible.builtin.command:
+            cmd: diff "{{ latest_link }}" "{{ new_backup }}.tmp"
+          register: cfg_diff
+          failed_when: cfg_diff.rc > 1          # rc=0 no change, rc=1 changed, rc>1 error
+          changed_when: false
+          when: latest_stat.stat.exists
+          delegate_to: localhost
 
-    - name: Determine whether running config has changed
-      ansible.builtin.set_fact:
-        config_changed: >-
-          {{
-            not existing_backup.stat.exists
-            or (previous_config.content | b64decode | trim) != (running_config.stdout | trim)
-          }}
+        - name: Determine whether config changed
+          ansible.builtin.set_fact:
+            config_changed: >-
+              {{ not latest_stat.stat.exists or (cfg_diff.rc | default(1)) == 1 }}
 
-    - name: Archive previous backup before overwriting
-      ansible.builtin.copy:
-        src: "{{ backup_file }}"
-        dest: "{{ archive_dir }}/{{ inventory_hostname }}_{{ timestamp }}.cfg"
-        remote_src: false
-      delegate_to: localhost
-      when:
-        - config_changed
-        - existing_backup.stat.exists
+        - name: Promote temp file to timestamped backup (config changed)
+          ansible.builtin.command:
+            cmd: mv "{{ new_backup }}.tmp" "{{ new_backup }}"
+          delegate_to: localhost
+          when: config_changed
 
-    - name: Write updated running config to backup file
-      ansible.builtin.copy:
-        content: "{{ running_config.stdout }}"
-        dest: "{{ backup_file }}"
-        mode: '0640'
-      delegate_to: localhost
-      when: config_changed
+        - name: Update latest symlink
+          ansible.builtin.file:
+            src: "{{ new_backup }}"
+            dest: "{{ latest_link }}"
+            state: link
+            force: true
+          delegate_to: localhost
+          when: config_changed
 
-    - name: Prune archive copies beyond retention limit
-      ansible.builtin.shell: |
-        ls -1t {{ archive_dir }}/*.cfg 2>/dev/null \
-          | tail -n +{{ max_archives | int + 1 }} \
-          | xargs -r rm -f
-      delegate_to: localhost
-      when: config_changed
-      changed_when: false
+        - name: Remove temp file (no change detected)
+          ansible.builtin.file:
+            path: "{{ new_backup }}.tmp"
+            state: absent
+          delegate_to: localhost
+          when: not config_changed
 
-    - name: Report backup outcome per device
-      ansible.builtin.debug:
-        msg: >-
-          {{ inventory_hostname }}: {{
-            'CONFIG CHANGED — backup saved to ' ~ backup_file
-            if config_changed else
-            'no change detected — backup file unchanged'
-          }}
-```
-
-**Key design choices vs. existing v1/v2:**
-
-- **`ansible.netcommon.cli_command`** replaces `ios_command` — single task works across IOS, NX-OS, IOS-XR, and JunOS without platform branches
-- **Change detection** via `slurp` + `b64decode` comparison means unchanged devices are genuinely a no-op (no file write, no archive entry)
-- **`retries`/`until`** on the retrieval step handles transient SSH flaps without failing the entire run
-- **`rescue` block** lets the play continue to other hosts if one device is unreachable
-- **Archive rotation** with `tail -n +N | xargs -r rm` keeps the `max_archives` most-recent copies without a custom script dependency
+        - name: Report per-host result
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }}:
+              {% if config_changed %}
+              CONFIG CHANGED — saved {{ new_backup }}
+              {% if latest_stat.stat.exists %}
+              Diff ({{ cfg_diff.stdout_lines | length }} line(s) differ)
+              {% endif %}
+              {% else %}
+              no change since last backup
+              {% endif %}
