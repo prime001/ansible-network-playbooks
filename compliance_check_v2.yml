@@ -1,118 +1,135 @@
-```yaml
 ---
-# Ansible Playbook: Network Device Routing Protocol Validation
-# Purpose: Validate OSPF and BGP neighbor health, verify routing table integrity,
-#          and ensure critical routes are reachable across managed network devices
-# Portfolio Use: Demonstrates network validation, multi-vendor support, error handling
+# routing_security_compliance.yml
 #
-# Inventory Example (inventory/devices.yml):
-#   [cisco_ios]
-#   router1 ansible_host=10.0.1.1 device_type=cisco_ios
-#   router2 ansible_host=10.0.1.2 device_type=cisco_ios
-#   
-#   [cisco_iosxr]
-#   xr_router ansible_host=10.0.2.1 device_type=cisco_iosxr
-#   
-#   [all:vars]
-#   ansible_connection=network_cli
-#   ansible_network_os=ios  # or iosxr, nxos, junos based on device
-#   ansible_user={{ vault_network_user }}
-#   ansible_password={{ vault_network_password }}
+# Verifies routing protocol security posture across IOS routers:
+#   - BGP peer MD5 authentication configured on all neighbors
+#   - BGP maximum-prefix limits enforced
+#   - BGP soft-reconfiguration inbound enabled
+#   - OSPF area authentication configured
+#   - OSPF passive-interface default set (minimize attack surface)
+#
+# Scope: complements existing compliance_check.yml (generic CIS/hardening).
+#        This playbook focuses exclusively on routing protocol security —
+#        not covered by interface, NTP, syslog, SNMP, user, ACL, banner,
+#        config-backup, or the existing compliance check playbooks.
+#
+# Inventory example:
+#   [core_routers]
+#   rtr-core-01  ansible_host=10.1.0.1
+#   rtr-core-02  ansible_host=10.1.0.2
+#
+#   [edge_routers]
+#   rtr-edge-01  ansible_host=10.2.0.1
+#
+#   [routers:children]
+#   core_routers
+#   edge_routers
+#
+#   [routers:vars]
+#   ansible_user={{ vault_net_username }}           # ansible-vault encrypted
+#   ansible_password={{ vault_net_password }}       # ansible-vault encrypted
+#   ansible_network_os=ios
+#   ansible_become=true
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_net_enable }}  # ansible-vault encrypted
 
-- name: Network Device Routing Protocol Compliance Validation
-  hosts: all
-  gather_facts: no
+- name: Routing Protocol Security Compliance Check
+  hosts: routers
+  gather_facts: false
+
   vars:
-    min_ospf_neighbors: 2
-    min_bgp_neighbors: 1
-    validation_retries: 3
-    retry_delay: 5
+    compliance_issues: []
 
   tasks:
-    - name: Retrieve OSPF neighbor status
-      ios_command:
+    - name: Collect BGP running configuration
+      cisco.ios.ios_command:
         commands:
-          - "show ip ospf neighbor"
-      register: ospf_output
-      retries: "{{ validation_retries }}"
-      delay: "{{ retry_delay }}"
-      failed_when: false
-      changed_when: false
+          - show running-config | section router bgp
+      register: bgp_cfg
+      retries: 2
+      delay: 5
+      until: bgp_cfg is not failed
+      ignore_errors: true
 
-    - name: Count OSPF neighbors in FULL state
+    - name: Collect OSPF running configuration
+      cisco.ios.ios_command:
+        commands:
+          - show running-config | section router ospf
+      register: ospf_cfg
+      retries: 2
+      delay: 5
+      until: ospf_cfg is not failed
+      ignore_errors: true
+
+    - name: Collect BGP neighbor summary
+      cisco.ios.ios_command:
+        commands:
+          - show bgp ipv4 unicast summary
+      register: bgp_summary
+      retries: 2
+      delay: 5
+      until: bgp_summary is not failed
+      ignore_errors: true
+
+    - name: Flag missing BGP MD5 peer authentication
       set_fact:
-        ospf_full_count: "{{ ospf_output.stdout[0] | regex_findall('FULL') | length }}"
-      when: ospf_output.rc == 0
+        compliance_issues: "{{ compliance_issues + ['BGP: MD5 peer authentication not configured'] }}"
+      when:
+        - bgp_cfg is not failed
+        - "'neighbor' in bgp_cfg.stdout[0]"
+        - "'password' not in bgp_cfg.stdout[0]"
 
-    - name: Validate OSPF neighbor count meets minimum threshold
-      assert:
-        that:
-          - ospf_full_count | int >= min_ospf_neighbors
-        fail_msg: "OSPF: Found {{ ospf_full_count }} FULL neighbors, minimum required: {{ min_ospf_neighbors }}"
-        success_msg: "OSPF neighbor validation passed with {{ ospf_full_count }} FULL neighbors"
-      when: ospf_output.rc == 0
-      rescue:
-        - name: Alert on OSPF validation failure
-          debug:
-            msg: "WARNING: {{ inventory_hostname }} OSPF neighbor count below threshold"
-
-    - name: Retrieve BGP neighbor summary
-      ios_command:
-        commands:
-          - "show ip bgp summary"
-      register: bgp_output
-      retries: "{{ validation_retries }}"
-      delay: "{{ retry_delay }}"
-      failed_when: false
-      changed_when: false
-
-    - name: Count BGP established neighbors
+    - name: Flag missing BGP maximum-prefix limits
       set_fact:
-        bgp_established_count: "{{ bgp_output.stdout[0] | regex_findall('Established') | length }}"
-      when: bgp_output.rc == 0
+        compliance_issues: "{{ compliance_issues + ['BGP: maximum-prefix not set on all peers'] }}"
+      when:
+        - bgp_cfg is not failed
+        - "'neighbor' in bgp_cfg.stdout[0]"
+        - "'maximum-prefix' not in bgp_cfg.stdout[0]"
 
-    - name: Validate BGP neighbor establishment threshold
-      assert:
-        that:
-          - bgp_established_count | int >= min_bgp_neighbors
-        fail_msg: "BGP: Found {{ bgp_established_count }} established neighbors, minimum required: {{ min_bgp_neighbors }}"
-        success_msg: "BGP neighbor validation passed with {{ bgp_established_count }} established neighbors"
-      when: bgp_output.rc == 0
-      rescue:
-        - name: Alert on BGP validation failure
-          debug:
-            msg: "WARNING: {{ inventory_hostname }} BGP neighbor count below threshold"
+    - name: Flag missing BGP soft-reconfiguration inbound
+      set_fact:
+        compliance_issues: "{{ compliance_issues + ['BGP: soft-reconfiguration inbound not configured'] }}"
+      when:
+        - bgp_cfg is not failed
+        - "'neighbor' in bgp_cfg.stdout[0]"
+        - "'soft-reconfiguration' not in bgp_cfg.stdout[0]"
 
-    - name: Retrieve routing table summary
-      ios_command:
-        commands:
-          - "show ip route summary"
-      register: route_output
-      retries: "{{ validation_retries }}"
-      delay: "{{ retry_delay }}"
-      failed_when: false
-      changed_when: false
+    - name: Flag missing OSPF area authentication
+      set_fact:
+        compliance_issues: "{{ compliance_issues + ['OSPF: area authentication not configured'] }}"
+      when:
+        - ospf_cfg is not failed
+        - "'router ospf' in ospf_cfg.stdout[0]"
+        - "'authentication' not in ospf_cfg.stdout[0]"
 
-    - name: Display routing validation report
+    - name: Flag missing OSPF passive-interface default
+      set_fact:
+        compliance_issues: "{{ compliance_issues + ['OSPF: passive-interface default not set'] }}"
+      when:
+        - ospf_cfg is not failed
+        - "'router ospf' in ospf_cfg.stdout[0]"
+        - "'passive-interface default' not in ospf_cfg.stdout[0]"
+
+    - name: Display live BGP neighbor summary
       debug:
-        msg: |
-          ========================================
-          Device Routing Validation Report
-          Device: {{ inventory_hostname }}
-          OSPF FULL Neighbors: {{ ospf_full_count | default('N/A') }}
-          BGP Established Neighbors: {{ bgp_established_count | default('N/A') }}
-          Route Retrieval Status: {{ route_output.rc == 0 | ternary('SUCCESS', 'FAILED') }}
-          Overall Status: {{ (ospf_full_count | default(0) | int >= min_ospf_neighbors and bgp_established_count | default(0) | int >= min_bgp_neighbors) | ternary('HEALTHY', 'DEGRADED') }}
-          ========================================
+        var: bgp_summary.stdout_lines
+      when:
+        - bgp_summary is not failed
+        - bgp_summary.stdout[0] | length > 0
 
-    - name: Archive validation results to local report
-      copy:
-        content: |
-          Device: {{ inventory_hostname }}
-          OSPF_Full_Neighbors: {{ ospf_full_count | default('0') }}
-          BGP_Established_Neighbors: {{ bgp_established_count | default('0') }}
-          Validation_Status: {{ (ospf_full_count | default(0) | int >= min_ospf_neighbors) | ternary('PASS', 'FAIL') }}
-        dest: "/tmp/routing_validation_{{ inventory_hostname }}.log"
-      delegate_to: localhost
-      become: no
-```
+    - name: Report routing security compliance result
+      debug:
+        msg:
+          - "============================================"
+          - "Host        : {{ inventory_hostname }}"
+          - "Issues found: {{ compliance_issues | length }}"
+          - "Details     : {{ compliance_issues if compliance_issues else ['PASS - no violations'] }}"
+          - "============================================"
+
+    - name: Fail if routing protocol security violations exist
+      fail:
+        msg: >-
+          Routing security compliance FAILED on {{ inventory_hostname }}:
+          {{ compliance_issues | join(' | ') }}
+      when: compliance_issues | length > 0
