@@ -1,138 +1,112 @@
 ---
-# routing_facts.yml
+# bgp_facts_gathering.yml
 #
-# Collects BGP neighbor state, OSPF adjacencies, and routing-table summary
-# across IOS, IOS-XR, NX-OS, and Junos devices.
+# Collects BGP neighbor state, prefix counts, and AS path data across
+# IOS, IOS-XR, NX-OS, and JunOS platforms. Saves a per-host JSON
+# summary to ./reports/bgp_facts/. Distinct from facts_gathering*.yml
+# which targets device hardware/interface/version facts.
 #
-# Complements facts_gathering.yml (device inventory) and facts_gathering_v2.yml
-# (interface counters). This playbook focuses on Layer 3 routing protocol state.
+# Vault reference: ansible-vault encrypt_string secrets.yml
+# Variables expected (group_vars/all/vault.yml):
+#   vault_net_username: "netops"
+#   vault_net_password: "{{ vault_net_password }}"
+#   vault_net_enable:   "{{ vault_net_enable }}"   # IOS only
 #
-# Credentials: store in Ansible Vault — group_vars/all/vault.yml
-#   vault_net_user: admin
-#   vault_net_password: <secret>
-#   vault_net_enable: <secret>
+# Inventory example:
+# [core_routers]
+# rtr-core-01 ansible_host=10.0.0.1  ansible_network_os=ios
+# rtr-core-02 ansible_host=10.0.0.2  ansible_network_os=iosxr
 #
-# Inventory example (inventory/hosts.yml):
-#   all:
-#     children:
-#       routers:
-#         hosts:
-#           core-rtr-01:
-#             ansible_host: 192.168.1.1
-#             ansible_network_os: ios
-#           dc-spine-01:
-#             ansible_host: 192.168.1.2
-#             ansible_network_os: nxos
-#           pe-router-01:
-#             ansible_host: 192.168.1.3
-#             ansible_network_os: iosxr
+# [dc_spine]
+# spine-01    ansible_host=10.1.0.1  ansible_network_os=nxos
+#
+# [all:vars]
+# ansible_user="{{ vault_net_username }}"
+# ansible_password="{{ vault_net_password }}"
+# ansible_become=true
+# ansible_become_method=enable
+# ansible_connection=network_cli
+#
 
-- name: Gather routing protocol facts — BGP, OSPF, routing table
-  hosts: routers
+- name: Gather BGP neighbor facts from multi-vendor network devices
+  hosts: all
   gather_facts: false
-  connection: network_cli
-
   vars:
-    ansible_user: "{{ vault_net_user }}"
-    ansible_password: "{{ vault_net_password }}"
-    ansible_become: true
-    ansible_become_method: enable
-    ansible_become_password: "{{ vault_net_enable }}"
-    report_dir: "{{ playbook_dir }}/reports/routing_facts"
-    timestamp: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
-
-    cmd_bgp:
-      ios: "show ip bgp summary"
-      iosxe: "show ip bgp summary"
-      iosxr: "show bgp ipv4 unicast summary"
-      nxos: "show bgp ipv4 unicast summary"
-      junos: "show bgp summary"
-
-    cmd_ospf:
-      ios: "show ip ospf neighbor"
-      iosxe: "show ip ospf neighbor"
-      iosxr: "show ospf neighbor"
-      nxos: "show ip ospf neighbors"
-      junos: "show ospf neighbor"
-
-    cmd_routes:
-      ios: "show ip route summary"
-      iosxe: "show ip route summary"
-      iosxr: "show route summary"
-      nxos: "show ip route summary"
-      junos: "show route summary"
+    report_dir: "./reports/bgp_facts"
+    bgp_cmd_map:
+      ios:    "show bgp summary"
+      iosxr:  "show bgp summary"
+      nxos:   "show bgp summary"
+      junos:  "show bgp summary"
 
   tasks:
-    - name: Create report directory
-      file:
+    - name: Ensure local report directory exists
+      delegate_to: localhost
+      run_once: true
+      ansible.builtin.file:
         path: "{{ report_dir }}"
         state: directory
         mode: "0755"
-      delegate_to: localhost
-      run_once: true
 
-    - name: Collect routing protocol state
+    - name: Collect BGP summary output
       block:
-        - name: BGP neighbor summary
-          cli_command:
-            command: "{{ cmd_bgp[ansible_network_os] | default('show ip bgp summary') }}"
-          register: bgp_out
-          failed_when: false
+        - name: Run BGP summary command
+          ansible.netcommon.cli_command:
+            command: "{{ bgp_cmd_map[ansible_network_os] | default('show bgp summary') }}"
+          register: bgp_raw
+          retries: 3
+          delay: 5
+          until: bgp_raw is not failed
+          failed_when:
+            - bgp_raw.failed
+            - "'% Invalid' not in (bgp_raw.stdout | default(''))"
+
+        - name: Collect BGP neighbor detail (IOS / IOS-XR)
+          ansible.netcommon.cli_command:
+            command: "show bgp neighbors"
+          register: bgp_neighbors_raw
+          when: ansible_network_os in ['ios', 'iosxr']
           retries: 2
           delay: 5
-
-        - name: OSPF neighbor state
-          cli_command:
-            command: "{{ cmd_ospf[ansible_network_os] | default('show ip ospf neighbor') }}"
-          register: ospf_out
-          failed_when: false
-          retries: 2
-          delay: 5
-
-        - name: Routing table summary
-          cli_command:
-            command: "{{ cmd_routes[ansible_network_os] | default('show ip route summary') }}"
-          register: routes_out
-          retries: 2
-          delay: 5
-
-        - name: Display collected facts
-          debug:
-            msg:
-              - "=== {{ inventory_hostname }} ({{ ansible_network_os }}) ==="
-              - "--- BGP ---"
-              - "{{ bgp_out.stdout_lines | default(['not configured']) }}"
-              - "--- OSPF ---"
-              - "{{ ospf_out.stdout_lines | default(['not configured']) }}"
-              - "--- Routes ---"
-              - "{{ routes_out.stdout_lines }}"
-
-        - name: Write per-host routing fact report
-          copy:
-            content: |
-              Host      : {{ inventory_hostname }}
-              Platform  : {{ ansible_network_os }}
-              Collected : {{ timestamp }}
-
-              [BGP Summary]
-              {{ bgp_out.stdout | default('Not configured') }}
-
-              [OSPF Neighbors]
-              {{ ospf_out.stdout | default('Not configured') }}
-
-              [Route Summary]
-              {{ routes_out.stdout }}
-            dest: "{{ report_dir }}/{{ inventory_hostname }}_routing.txt"
-          delegate_to: localhost
+          until: bgp_neighbors_raw is not failed
 
       rescue:
-        - name: Report collection failure
-          debug:
-            msg: "FAILED: {{ inventory_hostname }} — {{ ansible_failed_result.msg | default('connection or command error') }}"
+        - name: Log collection failure and continue
+          ansible.builtin.debug:
+            msg: "BGP fact collection failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
 
-        - name: Log failed host
-          lineinfile:
-            path: "{{ report_dir }}/failed_hosts.log"
-            line: "{{ inventory_hostname }} failed at {{ timestamp }}"
-            create: true
-          delegate_to: localhost
+        - name: Mark host as failed non-fatally
+          ansible.builtin.set_fact:
+            bgp_collection_failed: true
+
+    - name: Parse and display BGP summary
+      ansible.builtin.debug:
+        msg: |
+          === BGP Summary: {{ inventory_hostname }} ({{ ansible_network_os }}) ===
+          {{ bgp_raw.stdout | default('No output collected') }}
+      when: bgp_collection_failed is not defined
+
+    - name: Save BGP facts report to local file
+      delegate_to: localhost
+      ansible.builtin.copy:
+        content: |
+          # BGP Facts Report
+          # Host: {{ inventory_hostname }}
+          # Platform: {{ ansible_network_os }}
+          # Collected: {{ ansible_date_time.iso8601 | default('unknown') }}
+
+          ## BGP Summary
+          {{ bgp_raw.stdout | default('collection failed') }}
+
+          ## BGP Neighbors
+          {{ bgp_neighbors_raw.stdout | default('N/A - not collected for this platform') }}
+        dest: "{{ report_dir }}/{{ inventory_hostname }}_bgp_facts.txt"
+        mode: "0644"
+      when: bgp_collection_failed is not defined
+
+    - name: Summarize collection results
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {% if bgp_collection_failed is defined %}FAILED - skipped report{% else %}OK -
+          report saved to {{ report_dir }}/{{ inventory_hostname }}_bgp_facts.txt{% endif %}
