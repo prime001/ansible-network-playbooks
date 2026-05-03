@@ -1,109 +1,141 @@
-```yaml
----
-- name: Configure Spanning Tree Protocol (STP) on Network Devices
-  hosts: network_devices
-  gather_facts: no
-  
-  # Device credentials stored in ansible-vault for security
-  # Create vault password: ansible-vault encrypt_string 'password' --name 'ansible_password'
-  vars:
-    ansible_connection: network_cli
-    ansible_port: 22
-    ansible_command_timeout: 30
-    
-    # STP configuration parameters
-    stp_mode: "rapid"
-    stp_bridge_priority: 4096
-    stp_forward_delay: 15
-    stp_hello_time: 2
-    stp_max_age: 20
-    
-    # Interface-level STP priority configuration
-    stp_priority_interfaces:
-      - interface: "GigabitEthernet0/0/1"
-        priority: 128
-        port_fast: yes
-        bpdu_guard: yes
-      - interface: "GigabitEthernet0/0/2"
-        priority: 128
-        port_fast: yes
-        bpdu_guard: yes
-  
-  tasks:
-    - name: Gather current spanning tree configuration
-      ansible.netcommon.cli_command:
-        command: "show spanning-tree detail"
-      register: stp_current_config
-      retries: 3
-      delay: 5
-      until: stp_current_config is succeeded
-    
-    - name: Configure global STP settings on Cisco IOS
-      cisco.ios.ios_config:
-        lines:
-          - "spanning-tree mode {{ stp_mode }}"
-          - "spanning-tree bridge priority {{ stp_bridge_priority }}"
-          - "spanning-tree forward-time {{ stp_forward_delay }}"
-          - "spanning-tree hello-time {{ stp_hello_time }}"
-          - "spanning-tree max-age {{ stp_max_age }}"
-      when: ansible_network_os == 'ios'
-      register: ios_stp_config
-      failed_when: "'error' in ios_stp_config.stdout | lower"
-    
-    - name: Configure STP interface priorities and protection
-      cisco.ios.ios_config:
-        lines:
-          - "spanning-tree port-priority {{ item.priority }}"
-          - "spanning-tree portfast"
-          - "spanning-tree bpdu-guard enable"
-        parents: "interface {{ item.interface }}"
-      loop: "{{ stp_priority_interfaces }}"
-      when: ansible_network_os == 'ios'
-      register: stp_interface_config
-    
-    - name: Verify STP configuration deployment
-      ansible.netcommon.cli_command:
-        command: "show spanning-tree brief"
-      register: stp_verification
-      failed_when: stp_verification.stdout is not defined
-    
-    - name: Display STP configuration report
-      ansible.builtin.debug:
-        msg: |
-          Spanning Tree Protocol Configuration Report
-          ============================================
-          Device: {{ inventory_hostname }}
-          STP Mode: {{ stp_mode | upper }}
-          Bridge Priority: {{ stp_bridge_priority }}
-          Hello Time: {{ stp_hello_time }}s
-          Forward Delay: {{ stp_forward_delay }}s
-          Max Age: {{ stp_max_age }}s
-          
-          Interfaces Configured: {{ stp_priority_interfaces | length }}
-          Configuration Status: SUCCESS
-    
-    - name: Persist configuration to startup-config
-      ansible.netcommon.cli_command:
-        command: "copy running-config startup-config"
-      when: ansible_network_os in ['ios', 'nxos', 'iosxr']
-      ignore_errors: yes
-  
-  rescue:
-    - name: Log configuration deployment failure
-      ansible.builtin.debug:
-        msg: "STP configuration failed on {{ inventory_hostname }}: {{ ansible_failed_result | default('Unknown error') }}"
-    
-    - name: Attempt configuration rollback
-      ansible.netcommon.cli_command:
-        command: "reload"
-      ignore_errors: yes
+Looking at the repo structure, `acl_deploy.yml` and `acl_deploy_v2.yml` already cover basic ACL deployment. I'll write a lifecycle-focused variant — baseline capture, deploy, post-verify, and automated rollback — which is meaningfully different from a straight deploy playbook.
 
-# Inventory Example:
-# [network_devices]
-# core-switch-01 ansible_host=192.168.1.10 ansible_user=admin ansible_network_os=ios
-# core-switch-02 ansible_host=192.168.1.11 ansible_user=admin ansible_network_os=ios
-# [network_devices:vars]
-# ansible_password={{ vault_ansible_password }}
-# ansible_become=yes
-# ansible_become_method=enable
-```
+---
+# acl_deploy_v3.yml — ACL Lifecycle: Baseline, Deploy, Verify, Rollback
+#
+# Extends v1/v2 with a full deployment lifecycle: snapshot pre-state,
+# push extended named ACL, verify entries survive in running-config,
+# bind to interfaces, and auto-rollback on any failure.
+#
+# Inventory example:
+#   [core_routers]
+#   rtr-core-01  ansible_host=10.0.1.1
+#   rtr-core-02  ansible_host=10.0.1.2
+#
+#   [core_routers:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_net_username }}        # ansible-vault encrypted
+#   ansible_password={{ vault_net_password }}     # ansible-vault encrypted
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_enable_password }}
+#
+# Usage:
+#   ansible-playbook acl_deploy_v3.yml -i inventory/production.yml --ask-vault-pass
+#   ansible-playbook acl_deploy_v3.yml -i inventory/production.yml --ask-vault-pass -e "rollback_on_failure=false"
+
+- name: ACL Lifecycle Management — Baseline, Deploy, Verify, Rollback
+  hosts: core_routers
+  gather_facts: false
+  collections:
+    - cisco.ios
+
+  vars:
+    ansible_user: "{{ vault_net_username }}"
+    ansible_password: "{{ vault_net_password }}"
+    ansible_become_password: "{{ vault_enable_password }}"
+
+    acl_name: "BLOCK_RFC1918_INBOUND"
+    rollback_on_failure: true
+
+    acl_lines:
+      - "10 deny ip 10.0.0.0 0.255.255.255 any log"
+      - "20 deny ip 172.16.0.0 0.15.255.255 any log"
+      - "30 deny ip 192.168.0.0 0.0.255.255 any log"
+      - "40 permit ip any any"
+
+    apply_to_interfaces:
+      - interface: GigabitEthernet0/1
+        direction: in
+
+  tasks:
+    - name: Snapshot pre-deployment ACL state
+      ios_command:
+        commands:
+          - "show ip access-lists {{ acl_name }}"
+      register: acl_baseline
+      retries: 2
+      delay: 5
+      ignore_errors: true
+
+    - name: Store baseline for rollback comparison
+      set_fact:
+        pre_deploy_acl: "{{ acl_baseline.stdout[0] | default('') }}"
+
+    - name: Display baseline (empty signals a fresh deployment)
+      debug:
+        msg: "{{ inventory_hostname }} pre-deploy: {{ pre_deploy_acl if pre_deploy_acl else 'ACL absent — fresh deployment' }}"
+
+    - name: Deploy ACL and bind to interfaces
+      block:
+        - name: Configure named extended ACL
+          ios_config:
+            lines: "{{ acl_lines }}"
+            parents: "ip access-list extended {{ acl_name }}"
+            save_when: changed
+          register: acl_result
+          retries: 2
+          delay: 10
+
+        - name: Bind ACL to interfaces
+          ios_config:
+            lines:
+              - "ip access-group {{ acl_name }} {{ item.direction }}"
+            parents: "interface {{ item.interface }}"
+            save_when: changed
+          loop: "{{ apply_to_interfaces }}"
+          register: intf_result
+
+        - name: Post-deployment verification
+          ios_command:
+            commands:
+              - "show ip access-lists {{ acl_name }}"
+              - "show running-config | section ip access-list extended {{ acl_name }}"
+          register: post_verify
+          failed_when: acl_name not in post_verify.stdout[0]
+          retries: 2
+          delay: 5
+
+        - name: Report successful deployment
+          debug:
+            msg: |
+              {{ inventory_hostname }} — {{ acl_name }} deployed successfully
+              Config changed: {{ acl_result.changed }}
+              Active ACL entry count: {{ post_verify.stdout[0].split('\n') | select('match', '.*permit|.*deny') | list | length }}
+              Running-config confirmed:
+              {{ post_verify.stdout[1] }}
+
+      rescue:
+        - name: Capture diagnostic state on failure
+          ios_command:
+            commands:
+              - "show ip access-lists {{ acl_name }}"
+              - "show logging | last 15"
+          register: failure_diag
+          ignore_errors: true
+
+        - name: Rollback — remove failed ACL and interface bindings
+          ios_config:
+            lines:
+              - "no ip access-list extended {{ acl_name }}"
+            save_when: always
+          when: rollback_on_failure | bool
+          register: rollback_result
+
+        - name: Confirm rollback removed the ACL
+          ios_command:
+            commands:
+              - "show ip access-lists {{ acl_name }}"
+          register: rollback_verify
+          when: rollback_on_failure | bool
+          ignore_errors: true
+
+        - name: Emit failure and rollback summary
+          debug:
+            msg: |
+              DEPLOYMENT FAILED on {{ inventory_hostname }}
+              Rollback performed: {{ rollback_on_failure }}
+              ACL state after rollback: {{ rollback_verify.stdout[0] | default('N/A — rollback skipped') }}
+              Diagnostic log tail: {{ failure_diag.stdout[1] | default('unavailable') }}
+          failed_when: true
