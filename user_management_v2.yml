@@ -1,103 +1,119 @@
 ---
-# aaa_config.yml
-# Configures AAA (Authentication, Authorization, Accounting) using RADIUS/TACACS+
-# with local fallback — distinct from local user management (user_management_v2.yml).
+# =============================================================================
+# Playbook: SSH Public Key Deployment & SSH Hardening
+# Description: Deploys user SSH public keys for certificate-based auth and
+#              enforces SSH hardening parameters (version, timeout, retries,
+#              DH key size) on Cisco IOS/IOS-XE network devices.
+#              Distinct from user_management.yml (password-based accounts) —
+#              this playbook manages key-based authentication and SSH policy.
 #
-# Inventory example:
-#   [network_devices]
-#   router1 ansible_host=192.168.1.1 ansible_network_os=ios
-#   switch1 ansible_host=192.168.1.2 ansible_network_os=ios
+# Credentials: Loaded via ansible-vault
+#   vault file: group_vars/all/vault.yml
+#   ansible-vault encrypt_string '<secret>' --name 'vault_net_pass'
 #
-#   [network_devices:vars]
+# Inventory Example:
+#   [core_switches]
+#   sw-core-01  ansible_host=10.10.10.1
+#   sw-core-02  ansible_host=10.10.10.2
+#
+#   [core_switches:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
 #   ansible_user={{ vault_net_user }}
-#   ansible_password={{ vault_net_password }}
+#   ansible_password={{ vault_net_pass }}
 #   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_password }}
-#   # Credentials stored in: group_vars/network_devices/vault.yml (ansible-vault encrypted)
+#   ansible_become_password={{ vault_enable_pass }}
+#
+# Usage:
+#   ansible-playbook ssh_pubkey_hardening.yml -i inventory/production \
+#     --vault-password-file ~/.vault_pass -e "target_hosts=core_switches"
+# =============================================================================
 
-- name: Configure AAA with RADIUS/TACACS+ and local fallback
-  hosts: network_devices
+- name: SSH Public Key Deployment and Hardening
+  hosts: "{{ target_hosts | default('all') }}"
   gather_facts: false
-  connection: network_cli
 
   vars:
-    tacacs_server_host: "{{ vault_tacacs_host }}"
-    tacacs_server_key: "{{ vault_tacacs_key }}"
-    radius_server_host: "{{ vault_radius_host }}"
-    radius_server_key: "{{ vault_radius_key }}"
-    aaa_timeout: 5
-    aaa_retransmit: 2
+    ssh_version: 2
+    ssh_timeout_seconds: 60
+    ssh_auth_retries: 3
+    ssh_dh_min_bits: 2048
+
+    # Public keys per user — sensitive values should live in vault.yml
+    ssh_pubkey_users:
+      - username: netadmin
+        pubkey: "{{ vault_netadmin_pubkey | default('REPLACE_WITH_VAULT_REF') }}"
+        privilege: 15
+      - username: netops
+        pubkey: "{{ vault_netops_pubkey | default('REPLACE_WITH_VAULT_REF') }}"
+        privilege: 7
 
   tasks:
-    - name: Apply AAA configuration
+    - name: Enforce SSH version and hardening parameters
+      cisco.ios.ios_config:
+        lines:
+          - "ip ssh version {{ ssh_version }}"
+          - "ip ssh time-out {{ ssh_timeout_seconds }}"
+          - "ip ssh authentication-retries {{ ssh_auth_retries }}"
+          - "ip ssh dh min size {{ ssh_dh_min_bits }}"
+        save_when: changed
+      register: ssh_hardening_result
+      retries: 2
+      delay: 5
+      until: ssh_hardening_result is not failed
+
+    - name: Deploy SSH public keys for managed users
       block:
-        - name: Configure TACACS+ server
+        - name: Push public key for each user
           cisco.ios.ios_config:
             lines:
-              - "tacacs server TACACS-PRIMARY"
-              - " address ipv4 {{ tacacs_server_host }}"
-              - " key {{ tacacs_server_key }}"
-              - " timeout {{ aaa_timeout }}"
-          register: tacacs_result
-
-        - name: Configure RADIUS server
-          cisco.ios.ios_config:
-            lines:
-              - "radius server RADIUS-PRIMARY"
-              - " address ipv4 {{ radius_server_host }} auth-port 1812 acct-port 1813"
-              - " key {{ radius_server_key }}"
-              - " timeout {{ aaa_timeout }}"
-              - " retransmit {{ aaa_retransmit }}"
-          register: radius_result
-
-        - name: Configure AAA server groups
-          cisco.ios.ios_config:
-            lines:
-              - "aaa group server tacacs+ TACACS-GROUP"
-              - " server name TACACS-PRIMARY"
-              - "aaa group server radius RADIUS-GROUP"
-              - " server name RADIUS-PRIMARY"
-
-        - name: Configure AAA authentication and authorization policies
-          cisco.ios.ios_config:
-            lines:
-              - "aaa new-model"
-              - "aaa authentication login default group TACACS-GROUP local"
-              - "aaa authentication enable default group TACACS-GROUP enable"
-              - "aaa authorization exec default group TACACS-GROUP local if-authenticated"
-              - "aaa authorization commands 15 default group TACACS-GROUP local if-authenticated"
-              - "aaa accounting exec default start-stop group TACACS-GROUP"
-              - "aaa accounting commands 15 default start-stop group TACACS-GROUP"
-          register: aaa_policy_result
-
-        - name: Verify AAA servers are reachable
-          cisco.ios.ios_command:
-            commands:
-              - "show aaa servers"
-              - "show tacacs"
-          register: aaa_status
-          retries: 2
-          delay: 3
-          failed_when:
-            - aaa_status.stdout[0] is not defined
-
-        - name: Display AAA server status
-          ansible.builtin.debug:
-            msg: "{{ aaa_status.stdout_lines }}"
+              - "username {{ item.username }} privilege {{ item.privilege }}"
+              - "ip ssh pubkey-chain"
+              - "  username {{ item.username }}"
+              - "  key-string"
+              - "  {{ item.pubkey }}"
+              - "  exit"
+              - "exit"
+          loop: "{{ ssh_pubkey_users }}"
+          loop_control:
+            label: "{{ item.username }}"
+          register: pubkey_result
+          changed_when: pubkey_result.changed
 
       rescue:
-        - name: Log AAA configuration failure
+        - name: Report public key push failure
           ansible.builtin.debug:
-            msg: "AAA configuration failed on {{ inventory_hostname }}. Manual review required."
+            msg: >
+              Failed to push SSH public key on {{ inventory_hostname }}.
+              Verify key format (RSA, single line) and IOS version >= 12.3(14)T.
 
-        - name: Preserve local authentication fallback
-          cisco.ios.ios_config:
-            lines:
-              - "aaa authentication login default local"
-              - "aaa authentication enable default enable"
-          ignore_errors: true
-
-        - name: Fail with context
+        - name: Abort play for this host on key push failure
           ansible.builtin.fail:
-            msg: "AAA config failed on {{ inventory_hostname }}. Local auth fallback applied.
+            msg: "SSH pubkey deployment failed — halting to prevent partial state"
+
+    - name: Collect SSH status for verification
+      cisco.ios.ios_command:
+        commands:
+          - show ip ssh
+      register: ssh_status_output
+      retries: 2
+      delay: 3
+      until: ssh_status_output is not failed
+
+    - name: Assert SSH version 2 is active
+      ansible.builtin.assert:
+        that:
+          - "'version 2.0' in ssh_status_output.stdout[0]"
+        fail_msg: "SSH version 2 not confirmed on {{ inventory_hostname }} — check IOS crypto key configuration"
+        success_msg: "SSH version 2 confirmed on {{ inventory_hostname }}"
+
+    - name: Display full SSH status
+      ansible.builtin.debug:
+        var: ssh_status_output.stdout_lines[0]
+
+    - name: Summarize changes applied
+      ansible.builtin.debug:
+        msg: >
+          {{ inventory_hostname }}: hardening={{ ssh_hardening_result.changed }},
+          pubkeys_configured={{ ssh_pubkey_users | map(attribute='username') | list }}
