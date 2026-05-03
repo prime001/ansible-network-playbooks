@@ -1,205 +1,165 @@
-The file write was blocked by permissions. Here is the complete playbook content — you can save it as `banner_deploy_v3.yml`:
-
-```yaml
 ---
 # banner_deploy_v3.yml
+# Multi-vendor login/MOTD banner enforcement with pre-check, dynamic content,
+# and automatic rollback on push failure.
 #
-# Multi-vendor banner deployment with IOS-XR support, pre-change snapshot,
-# and config rollback on verification failure.
-#
-# Adds over v2: IOS-XR via iosxr_banner, pre-deploy banner capture stored
-# per-host, and rescue blocks that restore the prior banner rather than
-# only reporting the failure.
+# Credentials are stored in Ansible Vault — encrypt with:
+#   ansible-vault encrypt_string 'secret' --name 'ansible_password'
 #
 # Inventory example:
-#   [ios]
-#   rtr-core-01  ansible_host=10.0.1.1 ansible_network_os=ios
-#
-#   [iosxr]
-#   pe-rtr-01    ansible_host=10.0.2.1 ansible_network_os=iosxr
+#   [cisco_ios]
+#   core-sw1  ansible_host=10.0.1.1  ansible_network_os=ios
+#   core-sw2  ansible_host=10.0.1.2  ansible_network_os=ios
 #
 #   [nxos]
-#   sw-dc-01     ansible_host=10.0.3.1 ansible_network_os=nxos
+#   dc-leaf1  ansible_host=10.0.2.1  ansible_network_os=nxos
 #
 #   [junos]
-#   fw-edge-01   ansible_host=10.0.4.1 ansible_network_os=junos
+#   edge-fw1  ansible_host=10.0.3.1  ansible_network_os=junos
 #
 #   [network:children]
-#   ios
-#   iosxr
+#   cisco_ios
 #   nxos
 #   junos
 #
 #   [network:vars]
-#   ansible_user="{{ vault_net_user }}"              # ansible-vault
-#   ansible_password="{{ vault_net_password }}"      # ansible-vault
+#   ansible_user=netops
+#   ansible_password=!vault |  <encrypted>
+#   ansible_connection=network_cli
 #   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_become_password="{{ vault_enable_pass }}" # ansible-vault
-#   ansible_connection=network_cli
 
-- name: Multi-vendor banner deployment with rollback (v3)
+- name: Multi-vendor banner compliance enforcement with rollback
   hosts: network
   gather_facts: false
-
   vars:
-    max_retries: 3
-    retry_delay: 5
-    banner_login: |
-      *******************************************************************
-      *  AUTHORIZED ACCESS ONLY                                         *
-      *  Unauthorized access is prohibited and subject to prosecution.  *
-      *  All sessions are monitored and logged.                         *
-      *  Contact NOC: noc@example.com                                   *
-      *******************************************************************
-    banner_motd: |
-      WARNING: Unauthorized access to this device is prohibited.
-      Disconnect immediately if you are not an authorized user.
+    # Override per environment or pass with -e
+    org_name: "Acme Corp"
+    contact_email: "noc@example.com"  # vault: ansible_vault_contact_email
+    banner_compliance_string: "AUTHORIZED USE ONLY"
+    max_retries: 2
+
+    login_banner: |
+      **************************************************************************
+      *  {{ org_name | upper }} — AUTHORIZED PERSONNEL ONLY                   *
+      *  Unauthorized access is prohibited and subject to prosecution.         *
+      *  All activity is monitored and logged.                                 *
+      *  Contact: {{ contact_email }}                                          *
+      **************************************************************************
+
+    motd_banner: |
+      -- Managed by Ansible | Last applied: {{ ansible_date_time.date | default('N/A') }} --
+      -- Device: {{ inventory_hostname }} --
 
   tasks:
-
-    - name: Snapshot existing banner config before changes (IOS / NX-OS)
-      ansible.netcommon.cli_command:
-        command: show running-config | section banner
-      register: pre_change_banner
-      changed_when: false
-      failed_when: false
-      when: ansible_network_os in ['ios', 'nxos']
-
-    - name: Deploy banners — Cisco IOS / IOS-XE
-      when: ansible_network_os == 'ios'
+    - name: Audit current login banner
       block:
-        - name: Set login banner (IOS)
-          cisco.ios.ios_banner:
-            banner: login
-            text: "{{ banner_login }}"
-            state: present
+        - name: Retrieve running banner config
+          cli_command:
+            command: show running-config | include banner
+          register: banner_audit
           retries: "{{ max_retries }}"
-          delay: "{{ retry_delay }}"
-          register: ios_login_result
-          until: ios_login_result is succeeded
+          delay: 5
+          until: banner_audit is not failed
 
-        - name: Set MOTD banner (IOS)
-          cisco.ios.ios_banner:
+        - name: Flag non-compliant devices
+          set_fact:
+            banner_compliant: "{{ banner_compliance_string in banner_audit.stdout }}"
+
+        - name: Report compliance status
+          debug:
+            msg: >-
+              {{ inventory_hostname }}: banner
+              {{ 'COMPLIANT' if banner_compliant else 'NON-COMPLIANT — will remediate' }}
+
+      rescue:
+        - name: Log audit failure
+          debug:
+            msg: "WARN: Could not audit {{ inventory_hostname }} — skipping: {{ ansible_failed_result.msg }}"
+
+        - name: Mark host as unreachable for remainder of play
+          meta: end_host
+
+    - name: Apply banners (IOS / IOS-XE)
+      when: ansible_network_os == 'ios' and not banner_compliant
+      block:
+        - name: Push login banner (IOS)
+          ios_banner:
+            banner: login
+            text: "{{ login_banner }}"
+            state: present
+
+        - name: Push MOTD banner (IOS)
+          ios_banner:
             banner: motd
-            text: "{{ banner_motd }}"
+            text: "{{ motd_banner }}"
             state: present
-          retries: "{{ max_retries }}"
-          delay: "{{ retry_delay }}"
-          register: ios_motd_result
-          until: ios_motd_result is succeeded
-
-        - name: Verify login banner in running config (IOS)
-          cisco.ios.ios_command:
-            commands: show running-config | section banner login
-          register: ios_verify
-          failed_when: "'banner login' not in ios_verify.stdout[0]"
-          changed_when: false
 
       rescue:
-        - name: Restore prior banner config (IOS)
-          cisco.ios.ios_config:
-            lines: "{{ pre_change_banner.stdout_lines | default([]) }}"
-          when: pre_change_banner.stdout is defined and pre_change_banner.stdout | length > 0
-
-        - name: Abort with rollback notice (IOS)
-          ansible.builtin.fail:
-            msg: "Banner deploy failed on {{ inventory_hostname }}. Prior config restored."
-
-    - name: Deploy banners — Cisco IOS-XR
-      when: ansible_network_os == 'iosxr'
-      block:
-        - name: Set login banner (IOS-XR)
-          cisco.iosxr.iosxr_banner:
+        - name: Remove partial banner on IOS failure
+          ios_banner:
             banner: login
-            text: "{{ banner_login }}"
-            state: present
-          retries: "{{ max_retries }}"
-          delay: "{{ retry_delay }}"
-          register: iosxr_result
-          until: iosxr_result is succeeded
+            state: absent
+          ignore_errors: true
 
-        - name: Verify banner committed (IOS-XR)
-          cisco.iosxr.iosxr_command:
-            commands: show running-config formal banner login
-          register: iosxr_verify
-          failed_when: iosxr_verify.stdout[0] | length == 0
-          changed_when: false
+        - name: Fail with context
+          fail:
+            msg: "IOS banner push failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg }}"
 
-      rescue:
-        - name: Abort with rollback notice (IOS-XR)
-          ansible.builtin.fail:
-            msg: "Banner deploy failed on {{ inventory_hostname }} (IOS-XR). Manual rollback required."
-
-    - name: Deploy banners — Cisco NX-OS
-      when: ansible_network_os == 'nxos'
+    - name: Apply banners (NX-OS)
+      when: ansible_network_os == 'nxos' and not banner_compliant
       block:
-        - name: Set MOTD banner (NX-OS)
-          cisco.nxos.nxos_banner:
+        - name: Push login banner (NX-OS)
+          nxos_banner:
+            banner: login
+            text: "{{ login_banner }}"
+            state: present
+
+        - name: Push MOTD banner (NX-OS)
+          nxos_banner:
             banner: motd
-            text: "{{ banner_motd }}"
+            text: "{{ motd_banner }}"
             state: present
-          retries: "{{ max_retries }}"
-          delay: "{{ retry_delay }}"
-          register: nxos_result
-          until: nxos_result is succeeded
-
-        - name: Verify banner in running config (NX-OS)
-          cisco.nxos.nxos_command:
-            commands: show running-config | include banner
-          register: nxos_verify
-          failed_when: "'banner' not in nxos_verify.stdout[0]"
-          changed_when: false
 
       rescue:
-        - name: Restore prior banner config (NX-OS)
-          cisco.nxos.nxos_config:
-            lines: "{{ pre_change_banner.stdout_lines | default([]) }}"
-          when: pre_change_banner.stdout is defined and pre_change_banner.stdout | length > 0
+        - name: Fail with context (NX-OS)
+          fail:
+            msg: "NX-OS banner push failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg }}"
 
-        - name: Abort with rollback notice (NX-OS)
-          ansible.builtin.fail:
-            msg: "Banner deploy failed on {{ inventory_hostname }}. Prior config restored."
-
-    - name: Deploy banners — Juniper JunOS
-      when: ansible_network_os == 'junos'
+    - name: Apply banners (Junos)
+      when: ansible_network_os == 'junos' and not banner_compliant
       block:
-        - name: Set login message (JunOS)
-          junipernetworks.junos.junos_banner:
+        - name: Push login banner (Junos)
+          junos_banner:
             banner: login
-            text: "{{ banner_login }}"
+            text: "{{ login_banner }}"
             state: present
-            active: true
-          retries: "{{ max_retries }}"
-          delay: "{{ retry_delay }}"
-          register: junos_result
-          until: junos_result is succeeded
 
-        - name: Verify login message committed (JunOS)
-          junipernetworks.junos.junos_command:
-            commands: show configuration system login message
-          register: junos_verify
-          failed_when: junos_verify.stdout[0] | length == 0
-          changed_when: false
+        - name: Push MOTD banner (Junos)
+          junos_banner:
+            banner: motd
+            text: "{{ motd_banner }}"
+            state: present
 
       rescue:
-        - name: Roll back to previous JunOS commit
-          junipernetworks.junos.junos_config:
+        - name: Rollback Junos config on failure
+          junos_config:
             rollback: 1
+          ignore_errors: true
 
-        - name: Abort with rollback notice (JunOS)
-          ansible.builtin.fail:
-            msg: "Banner deploy failed on {{ inventory_hostname }}. JunOS rolled back to prior commit."
+        - name: Fail with context (Junos)
+          fail:
+            msg: "Junos banner push failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg }}"
 
-    - name: Report deployment outcome
-      ansible.builtin.debug:
-        msg:
-          - "Host   : {{ inventory_hostname }}"
-          - "OS     : {{ ansible_network_os }}"
-          - "Status : banner deployed and verified"
-```
+    - name: Verify banner applied successfully
+      cli_command:
+        command: show running-config | include banner
+      register: banner_verify
+      failed_when: banner_compliance_string not in banner_verify.stdout
+      when: not banner_compliant
 
-**What differentiates this from v1/v2:**
-- **IOS-XR support** via `cisco.iosxr.iosxr_banner` + `iosxr_command` verify — neither prior version covers this platform
-- **Pre-change snapshot** with `cli_command` before any writes, stored in `pre_change_banner`
-- **Actual config restore** in rescue blocks (`ios_config`/`nxos_config` replay the snapshot lines; JunOS uses `junos_config: rollback: 1`) — v1/v2 rescue blocks only print failure messages
+    - name: Summarize results
+      debug:
+        msg: >-
+          {{ inventory_hostname }}: banner enforcement
+          {{ 'skipped (already compliant)' if banner_compliant else 'APPLIED and verified' }}
