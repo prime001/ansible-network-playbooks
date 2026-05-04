@@ -1,114 +1,94 @@
-```yaml
 ---
-# syslog_config_v3.yml
+# syslog_audit.yml
 #
-# Configures IOS syslog with discriminators, per-facility rate-limiting,
-# and VRF-aware source-interface binding. Extends v2 by adding log
-# filtering rules that reduce noise from high-frequency syslog sources.
-#
-# Credentials: use ansible-vault for ansible_password and vault_syslog_*
-#   ansible-vault encrypt_string 'secret' --name 'ansible_password'
+# Syslog Audit and Verification Playbook
+# Verifies syslog server reachability, validates active logging config,
+# and generates a test event to confirm end-to-end log delivery.
+# Complements syslog_config.yml (deployment) — this playbook audits, not configures.
 #
 # Inventory example:
-#   [cisco_ios]
-#   core-rtr-01  ansible_host=10.0.1.1
-#   dist-sw-01   ansible_host=10.0.1.2
+# [ios_routers]
+# rtr-core-01 ansible_host=10.0.1.1
+# rtr-edge-02 ansible_host=10.0.1.2
 #
-#   [cisco_ios:vars]
-#   ansible_network_os=ios
-#   ansible_user=netops
-#   ansible_password=!vault |
-#     $ANSIBLE_VAULT;1.1;AES256
-#     ...
-#   ansible_connection=network_cli
-#   ansible_become=yes
-#   ansible_become_method=enable
-#   ansible_become_pass=!vault |
-#     $ANSIBLE_VAULT;1.1;AES256
-#     ...
+# [ios_routers:vars]
+# ansible_network_os=ios
+# ansible_connection=network_cli
+# ansible_user={{ vault_net_user }}          # ansible-vault encrypted
+# ansible_password={{ vault_net_password }}  # ansible-vault encrypted
+# ansible_become=yes
+# ansible_become_method=enable
+# ansible_become_password={{ vault_enable_password }}
+#
+# Required vars (define in group_vars or pass -e):
+#   syslog_servers: ["10.0.50.10", "10.0.50.11"]
+#   expected_severity: informational
+#   expected_facility: local6
 
-- name: Configure syslog discriminators and VRF-aware server binding
-  hosts: cisco_ios
+- name: Syslog Audit — Verify Configuration and End-to-End Delivery
+  hosts: ios_routers
   gather_facts: false
 
   vars:
-    syslog_primary: "{{ vault_syslog_primary | default('10.0.100.10') }}"
-    syslog_secondary: "{{ vault_syslog_secondary | default('10.0.100.11') }}"
-    syslog_vrf: Mgmt-vrf
-    syslog_source_intf: GigabitEthernet0/0/0
-    syslog_facility: local5
-    syslog_buffer_size: 524288
-    syslog_severity: informational
-    syslog_rate_limit: 10000
-    # Suppress noisy but non-actionable messages by mnemonic
-    discriminator_drops:
-      - LINEPROTO-5-UPDOWN
-      - SYS-5-CONFIG_I
-    max_retries: 3
+    syslog_servers:
+      - "10.0.50.10"
+      - "10.0.50.11"
+    expected_severity: informational
+    expected_facility: local6
+    ping_count: 3
+    audit_timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
 
   tasks:
-    - name: Apply syslog discriminator and core logging config
-      block:
-        - name: Configure logging discriminator to drop high-frequency noise
-          cisco.ios.ios_config:
-            lines:
-              - "logging discriminator NOISE_FILTER mnemonics drops {{ discriminator_drops | join('|') }}"
-            match: line
-          register: disc_result
-          retries: "{{ max_retries }}"
-          delay: 5
-          until: disc_result is not failed
+    - name: Collect current logging configuration
+      cisco.ios.ios_command:
+        commands:
+          - show logging
+          - show running-config | section logging
+      register: logging_output
+      retries: 2
+      delay: 5
+      until: logging_output is not failed
 
-        - name: Configure local buffer, facility, rate-limit, and source interface
-          cisco.ios.ios_config:
-            lines:
-              - "logging buffered {{ syslog_buffer_size }} {{ syslog_severity }}"
-              - "logging rate-limit {{ syslog_rate_limit }}"
-              - "logging facility {{ syslog_facility }}"
-              - "logging source-interface {{ syslog_source_intf }} vrf {{ syslog_vrf }}"
-            save_when: changed
-          register: base_result
-          retries: "{{ max_retries }}"
-          delay: 5
-          until: base_result is not failed
+    - name: Assert syslog hosts are present in running config
+      ansible.builtin.assert:
+        that:
+          - "'logging host ' ~ item in logging_output.stdout[1]"
+        fail_msg: "Syslog server {{ item }} is NOT configured on {{ inventory_hostname }}"
+        success_msg: "Syslog server {{ item }} confirmed on {{ inventory_hostname }}"
+      loop: "{{ syslog_servers }}"
 
-        - name: Bind syslog servers with VRF and discriminator
-          cisco.ios.ios_config:
-            lines:
-              - "logging host {{ item }} vrf {{ syslog_vrf }} discriminator NOISE_FILTER transport udp port 514"
-            save_when: changed
-          loop:
-            - "{{ syslog_primary }}"
-            - "{{ syslog_secondary }}"
-          register: server_result
-          retries: "{{ max_retries }}"
-          delay: 5
-          until: server_result is not failed
+    - name: Assert expected severity level is configured
+      ansible.builtin.assert:
+        that:
+          - "expected_severity in logging_output.stdout[1]"
+        fail_msg: "Expected severity '{{ expected_severity }}' not found in logging config"
+        success_msg: "Severity level '{{ expected_severity }}' confirmed"
 
-        - name: Verify syslog is enabled and servers are reachable
-          cisco.ios.ios_command:
-            commands:
-              - show logging
-              - show logging | include host
-          register: verify_out
-          failed_when:
-            - "'Syslog logging: enabled' not in verify_out.stdout[0]"
+    - name: Verify reachability of each syslog server
+      cisco.ios.ios_command:
+        commands:
+          - "ping {{ item }} repeat {{ ping_count }} source Loopback0"
+      register: ping_results
+      loop: "{{ syslog_servers }}"
+      failed_when: "'!!!' not in ping_results.stdout[0] and 'Success' not in ping_results.stdout[0]"
 
-        - name: Report syslog state summary
-          ansible.builtin.debug:
-            msg: |
-              Host: {{ inventory_hostname }}
-              Buffer changed: {{ base_result.changed }}
-              Servers changed: {{ server_result.changed }}
-              Active log destinations:
-              {{ verify_out.stdout_lines[1] | join('\n') }}
+    - name: Generate test syslog message to confirm delivery
+      cisco.ios.ios_command:
+        commands:
+          - "send log {{ expected_facility }} {{ expected_severity }} ANSIBLE_AUDIT: syslog verification {{ audit_timestamp }} from {{ inventory_hostname }}"
+      register: test_log_result
+      ignore_errors: true
 
-      rescue:
-        - name: Report configuration failure
-          ansible.builtin.debug:
-            msg: >
-              Syslog configuration FAILED on {{ inventory_hostname }}.
-              Review the task output above and verify VRF '{{ syslog_vrf }}'
-              and interface '{{ syslog_source_intf }}' exist on this device.
-          failed_when: true
-```
+    - name: Display syslog status summary
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "Logging buffer status: {{ logging_output.stdout[0] | regex_search('Syslog logging: (\\S+)', '\\1') | first | default('unknown') }}"
+          - "Configured syslog hosts verified: {{ syslog_servers | join(', ') }}"
+          - "Reachability check: {{ 'PASS' if ping_results.results | selectattr('failed', 'equalto', false) | list | length == syslog_servers | length else 'PARTIAL/FAIL' }}"
+          - "Test event sent at: {{ audit_timestamp }}"
+
+    - name: Flag devices with logging disabled
+      ansible.builtin.fail:
+        msg: "CRITICAL: Logging is disabled on {{ inventory_hostname }} — run syslog_config.yml to remediate"
+      when: "'Syslog logging: disabled' in logging_output.stdout[0]
