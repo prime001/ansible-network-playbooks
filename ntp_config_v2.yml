@@ -1,108 +1,116 @@
-Looking at the existing files, NTP config is already covered by ntp_config.yml, ntp_config_v2.yml, and numbered variants. I'll write an NTP authentication hardening + drift verification playbook — a distinct angle not covered by basic NTP server configuration.
-
-```yaml
 ---
-# ntp_auth_verify.yml
-# Configures NTP authentication (MD5 keys + trusted-key) and verifies
-# clock sync/stratum post-deployment. Distinct from ntp_config.yml
-# (server list push) — this hardens existing NTP associations and
-# validates the result.
-#
-# Credentials: ansible-vault encrypted group_vars/all/vault.yml
-#   vault_net_username, vault_net_password, vault_ntp_key_string
+# NTP Authentication and Stratum Validation
+# Configures NTP MD5 authentication keys and validates stratum reachability.
+# Extends ntp_config.yml (server list) and ntp_config_v2.yml (source interface)
+# by enforcing cryptographic authentication and asserting acceptable stratum depth.
 #
 # Inventory example:
-# [core_routers]
-# rtr-core-01 ansible_host=10.0.1.1
-# rtr-core-02 ansible_host=10.0.1.2
+#   [ios_routers]
+#   core-rtr-01 ansible_host=10.0.0.1 ansible_network_os=ios
+#   core-rtr-02 ansible_host=10.0.0.2 ansible_network_os=ios
 #
-# [core_routers:vars]
-# ansible_network_os=ios
-# ansible_connection=network_cli
-# ansible_user={{ vault_net_username }}
-# ansible_password={{ vault_net_password }}
+#   [ios_routers:vars]
+#   ansible_user={{ vault_net_user }}
+#   ansible_password={{ vault_net_password }}
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_enable_password }}
+#   ansible_connection=network_cli
 
-- name: Harden NTP authentication and verify clock synchronisation
-  hosts: core_routers
+- name: Configure NTP Authentication and Validate Stratum
+  hosts: ios_routers
   gather_facts: false
 
   vars:
-    ntp_key_id: 1
-    ntp_key_type: md5
-    ntp_key_string: "{{ vault_ntp_key_string }}"
-    max_stratum: 4
-    max_drift_seconds: 2
-    ntp_source_interface: Loopback0
+    # All credentials must be encrypted with: ansible-vault encrypt_string
+    ansible_user: "{{ vault_net_user }}"
+    ansible_password: "{{ vault_net_password }}"
+    ansible_become_password: "{{ vault_enable_password }}"
+    ntp_auth_key_id: 1
+    ntp_auth_key_string: "{{ vault_ntp_auth_key }}"
+    ntp_max_stratum: 5
+    ntp_servers:
+      - 10.0.0.253
+      - 10.0.0.254
 
   tasks:
-    - name: Apply NTP authentication key and trusted-key config
+    - name: Apply NTP authentication and validate sync state
       block:
-        - name: Push NTP authentication lines
+        - name: Enable NTP authentication and register trusted key
           cisco.ios.ios_config:
             lines:
-              - "ntp authentication-key {{ ntp_key_id }} {{ ntp_key_type }} {{ ntp_key_string }}"
-              - "ntp authenticate"
-              - "ntp trusted-key {{ ntp_key_id }}"
-              - "ntp source {{ ntp_source_interface }}"
+              - ntp authenticate
+              - "ntp authentication-key {{ ntp_auth_key_id }} md5 {{ ntp_auth_key_string }}"
+              - "ntp trusted-key {{ ntp_auth_key_id }}"
             save_when: changed
           register: ntp_auth_result
           retries: 2
           delay: 5
           until: ntp_auth_result is not failed
 
-        - name: Confirm running-config reflects authentication
-          cisco.ios.ios_command:
-            commands: "show running-config | include ntp"
-          register: ntp_running_cfg
-          failed_when: "'ntp authenticate' not in ntp_running_cfg.stdout[0]"
+        - name: Bind NTP servers to authentication key
+          cisco.ios.ios_config:
+            lines:
+              - "ntp server {{ item }} key {{ ntp_auth_key_id }}"
+          loop: "{{ ntp_servers }}"
+          register: ntp_server_result
+          retries: 2
+          delay: 5
+          until: ntp_server_result is not failed
 
-      rescue:
-        - name: Log authentication push failure
-          ansible.builtin.debug:
-            msg: "NTP auth config failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg }}"
-
-        - name: Abort remaining tasks for this host
-          ansible.builtin.meta: end_host
-
-    - name: Verify NTP synchronisation status
-      block:
-        - name: Collect NTP associations detail
+        - name: Collect NTP associations and clock status
           cisco.ios.ios_command:
             commands:
               - show ntp associations detail
               - show ntp status
-          register: ntp_status
+          register: ntp_verification
           retries: 3
           delay: 10
-          until: "'Clock is synchronized' in ntp_status.stdout[1]"
+          until: ntp_verification is not failed
 
-        - name: Parse stratum from NTP status output
+        - name: Assert at least one synchronized peer exists
+          ansible.builtin.fail:
+            msg: "No synchronized NTP peer — verify server reachability and authentication key"
+          when: >
+            'synchronized' not in ntp_verification.stdout[1] | lower and
+            '*' not in ntp_verification.stdout[0]
+
+        - name: Parse stratum from clock status output
           ansible.builtin.set_fact:
-            current_stratum: >-
-              {{ ntp_status.stdout[1]
-                 | regex_search('stratum\s+(\d+)', '\1')
-                 | first | int }}
+            ntp_stratum: "{{ ntp_verification.stdout[1] | regex_search('stratum (\\d+)', '\\1') | first | int }}"
+          when: "'stratum' in ntp_verification.stdout[1]"
 
-        - name: Enforce stratum ceiling
-          ansible.builtin.assert:
-            that: current_stratum <= max_stratum
-            fail_msg: >-
-              {{ inventory_hostname }} stratum {{ current_stratum }}
-              exceeds allowed maximum of {{ max_stratum }}
-            success_msg: "Stratum {{ current_stratum }} — within policy"
+        - name: Assert stratum is within acceptable depth
+          ansible.builtin.fail:
+            msg: "NTP stratum {{ ntp_stratum }} exceeds configured maximum ({{ ntp_max_stratum }})"
+          when: ntp_stratum is defined and ntp_stratum | int > ntp_max_stratum | int
+
+        - name: Report NTP authentication and stratum results
+          ansible.builtin.debug:
+            msg:
+              - "Host       : {{ inventory_hostname }}"
+              - "Auth config: {{ ntp_auth_result.changed | ternary('updated', 'already correct') }}"
+              - "Stratum    : {{ ntp_stratum | default('unknown') }}"
+              - "Clock state: {{ ntp_verification.stdout[1] | regex_search('Clock is (\\S+)', '\\1') | first | default('unknown') }}"
 
       rescue:
-        - name: Report sync failure after retries
+        - name: Log configuration failure
           ansible.builtin.debug:
-            msg: >-
-              {{ inventory_hostname }} failed to synchronise NTP within
-              retry window. Manual investigation required.
+            msg: "NTP auth/validation failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
 
-    - name: Display NTP verification summary
-      ansible.builtin.debug:
-        msg:
-          host: "{{ inventory_hostname }}"
-          auth_config_changed: "{{ ntp_auth_result.changed }}"
-          stratum: "{{ current_stratum | default('unknown') }}"
-          status_output: "{{ ntp_status.stdout[1].split('\n') | first }}"
-```
+        - name: Capture live NTP state for post-mortem
+          cisco.ios.ios_command:
+            commands:
+              - show ntp associations
+              - show run | include ntp
+          register: ntp_diagnostic
+          ignore_errors: true
+
+        - name: Emit diagnostic output
+          ansible.builtin.debug:
+            var: ntp_diagnostic.stdout_lines
+          when: ntp_diagnostic is defined
+
+        - name: Propagate failure after rescue
+          ansible.builtin.fail:
+            msg: "NTP authentication setup failed on {{ inventory_hostname }} — review diagnostic output above
