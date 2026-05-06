@@ -1,142 +1,112 @@
-No other skills apply to this well-defined YAML generation task. Writing the VLAN management playbook now — it's a natural gap in the existing set (interface_management covers IP/admin-state, but VLAN database + switchport assignment isn't there yet).
-
 ---
-# vlan_management.yml
-#
-# Manages VLAN database creation and switchport VLAN assignments (access + trunk)
-# on Cisco IOS and NX-OS devices. Complements interface_management.yml, which
-# handles IP addressing and admin state.
-#
-# Credentials: stored in Ansible Vault
-#   ansible-vault create group_vars/all/vault.yml
-#   Keys: vault_net_user, vault_net_password, vault_net_enable
+# =============================================================================
+# Unused Interface Audit and Secure Shutdown
+# Identifies notconnect/disabled access ports, stamps them with a datestamped
+# description, and optionally admin-shuts them to reduce the attack surface.
+# Run quarterly on access-layer switches as part of port-security hygiene.
 #
 # Inventory example:
 #   [access_switches]
-#   sw-access-01  ansible_host=10.10.10.11  ansible_network_os=ios
-#   sw-access-02  ansible_host=10.10.10.12  ansible_network_os=ios
+#   sw-access-01  ansible_host=10.1.1.1
+#   sw-access-02  ansible_host=10.1.1.2
+#   sw-access-03  ansible_host=10.1.1.3
 #
-#   [distribution_switches]
-#   sw-dist-01  ansible_host=10.10.10.21  ansible_network_os=nxos
+#   [access_switches:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user="{{ vault_net_user }}"
+#   ansible_password="{{ vault_net_password }}"
+#   ansible_become=true
+#   ansible_become_method=enable
+#   ansible_become_password="{{ vault_enable_pass }}"
 #
-#   [switches:children]
-#   access_switches
-#   distribution_switches
+# Vault-encrypted vars (ansible-vault encrypt_string):
+#   vault_net_user | vault_net_password | vault_enable_pass
+# =============================================================================
 
-- name: VLAN Management - database, access ports, and trunk assignments
-  hosts: switches
+- name: Unused Interface Audit and Secure Shutdown
+  hosts: "{{ target_hosts | default('access_switches') }}"
   gather_facts: false
-  connection: network_cli
-
   vars:
-    ansible_user: "{{ vault_net_user }}"
-    ansible_password: "{{ vault_net_password }}"
-    ansible_become: true
-    ansible_become_method: enable
-    ansible_become_password: "{{ vault_net_enable }}"
-
-    vlans:
-      - id: 10
-        name: CORP_DATA
-      - id: 20
-        name: CORP_VOICE
-      - id: 30
-        name: MANAGEMENT
-      - id: 40
-        name: SERVERS
-
-    access_ports:
-      - interface: GigabitEthernet0/1
-        vlan: 10
-      - interface: GigabitEthernet0/2
-        vlan: 20
-
-    trunk_ports:
-      - interface: GigabitEthernet0/24
-        allowed_vlans: "10,20,30,40"
+    shutdown_unused: false         # dry-run by default; set true to enforce shutdowns
+    audit_date: "{{ lookup('pipe', 'date +%Y-%m-%d') }}"
+    unused_description: "UNUSED - Secured {{ audit_date }}"
+    excluded_ports:                # uplinks, management, and SVIs — never touched
+      - GigabitEthernet0/0
+      - GigabitEthernet0/1
+      - GigabitEthernet1/1
+      - Vlan1
+      - Loopback0
 
   tasks:
-
-    - name: Configure VLAN database (IOS)
+    - name: Audit and remediate unused interfaces
       block:
-        - name: Create VLANs on IOS
-          cisco.ios.ios_vlans:
-            config: "{{ vlans | map('combine', {'state': 'active'}) | list }}"
-            state: merged
-          register: ios_vlan_result
-          retries: 2
-          delay: 5
-          until: ios_vlan_result is not failed
-          when: ansible_network_os == 'ios'
 
-        - name: Create VLANs on NX-OS
-          cisco.nxos.nxos_vlans:
-            config: "{{ vlans | map('combine', {'enabled': true}) | list }}"
-            state: merged
-          register: nxos_vlan_result
-          retries: 2
+        - name: Collect interface status table
+          cisco.ios.ios_command:
+            commands:
+              - show interfaces status
+          register: iface_status
+          retries: 3
           delay: 5
-          until: nxos_vlan_result is not failed
-          when: ansible_network_os == 'nxos'
+          until: iface_status is not failed
+          failed_when:
+            - iface_status.stdout[0] is not search('Port|Interface')
+
+        - name: Parse notconnect and disabled port names
+          ansible.builtin.set_fact:
+            down_ports: >-
+              {{
+                iface_status.stdout[0]
+                | regex_findall('(?m)^((?:Gi|Fa|Te|Eth)\S+)\s+.*(?:notconnect|disabled)')
+                | difference(excluded_ports)
+                | list
+              }}
+
+        - name: Display ports flagged for audit
+          ansible.builtin.debug:
+            msg: "{{ inventory_hostname }} — {{ down_ports | length }} unused port(s) found: {{ down_ports }}"
+
+        - name: Stamp unused ports with datestamped description
+          cisco.ios.ios_config:
+            lines:
+              - "description {{ unused_description }}"
+            parents: "interface {{ item }}"
+          loop: "{{ down_ports }}"
+          when: down_ports | length > 0
+          register: desc_changes
+
+        - name: Admin-shut unused ports (requires shutdown_unused true)
+          cisco.ios.ios_config:
+            lines:
+              - shutdown
+            parents: "interface {{ item }}"
+          loop: "{{ down_ports }}"
+          when:
+            - shutdown_unused | bool
+            - down_ports | length > 0
+          register: shutdown_changes
+
+        - name: Persist configuration when changes were made
+          cisco.ios.ios_config:
+            save_when: modified
 
       rescue:
-        - name: Report VLAN database failure
+        - name: Log failure with context
           ansible.builtin.debug:
-            msg: "VLAN configuration failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown') }}"
+            msg: >-
+              Audit failed on {{ inventory_hostname }}:
+              {{ ansible_failed_result.msg | default('verify connectivity and vault credentials') }}
 
-        - name: Abort on VLAN failure
+        - name: Abort run for this host
           ansible.builtin.fail:
-            msg: "Halting play — VLAN database setup failed on {{ inventory_hostname }}"
+            msg: "Audit incomplete on {{ inventory_hostname }} — manual review required"
 
-    - name: Assign access-mode switchports (IOS)
-      cisco.ios.ios_l2_interfaces:
-        config:
-          - name: "{{ item.interface }}"
-            mode: access
-            access:
-              vlan: "{{ item.vlan }}"
-        state: merged
-      loop: "{{ access_ports }}"
-      register: access_result
-      failed_when: access_result.failed is defined and access_result.failed
-      when:
-        - ansible_network_os == 'ios'
-        - access_ports | length > 0
-
-    - name: Assign trunk-mode switchports (IOS)
-      cisco.ios.ios_l2_interfaces:
-        config:
-          - name: "{{ item.interface }}"
-            mode: trunk
-            trunk:
-              allowed_vlans: "{{ item.allowed_vlans }}"
-              encapsulation: dot1q
-        state: merged
-      loop: "{{ trunk_ports }}"
-      register: trunk_result
-      failed_when: trunk_result.failed is defined and trunk_result.failed
-      when:
-        - ansible_network_os == 'ios'
-        - trunk_ports | length > 0
-
-    - name: Verify VLAN database post-configuration
-      cisco.ios.ios_command:
-        commands:
-          - show vlan brief
-      register: vlan_verify
-      when: ansible_network_os == 'ios'
-
-    - name: Display VLAN verification output
-      ansible.builtin.debug:
-        var: vlan_verify.stdout_lines
-      when:
-        - vlan_verify is defined
-        - not vlan_verify.skipped | default(false)
-
-    - name: Configuration summary
+    - name: Print per-host audit summary
       ansible.builtin.debug:
         msg:
-          - "Host            : {{ inventory_hostname }}"
-          - "VLANs applied   : {{ vlans | map(attribute='id') | list }}"
-          - "Access ports    : {{ access_ports | map(attribute='interface') | list }}"
-          - "Trunk ports     : {{ trunk_ports | map(attribute='interface') | list }}
+          - "Host             : {{ inventory_hostname }}"
+          - "Unused ports     : {{ down_ports | default([]) | length }}"
+          - "Descriptions set : {{ (desc_changes.results | default([])) | selectattr('changed') | list | length }}"
+          - "Ports shut down  : {{ (shutdown_changes.results | default([])) | selectattr('changed') | list | length }}"
+          - "Mode             : {{ 'ENFORCE' if shutdown_unused else 'DRY RUN — set shutdown_unused: true to apply shutdowns' }}
