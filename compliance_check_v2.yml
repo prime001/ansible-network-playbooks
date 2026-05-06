@@ -1,135 +1,110 @@
 ---
-# routing_security_compliance.yml
+# ssh_crypto_compliance.yml
 #
-# Verifies routing protocol security posture across IOS routers:
-#   - BGP peer MD5 authentication configured on all neighbors
-#   - BGP maximum-prefix limits enforced
-#   - BGP soft-reconfiguration inbound enabled
-#   - OSPF area authentication configured
-#   - OSPF passive-interface default set (minimize attack surface)
+# Audits SSH version enforcement and RSA host-key strength on Cisco IOS devices
+# against CIS IOS Benchmark v4.1 controls:
+#   - 1.4.1  SSH protocol version 2 only
+#   - 1.4.2  RSA host key >= 2048 bits
+#   - 1.4.3  VTY lines restrict transport to SSH
 #
-# Scope: complements existing compliance_check.yml (generic CIS/hardening).
-#        This playbook focuses exclusively on routing protocol security —
-#        not covered by interface, NTP, syslog, SNMP, user, ACL, banner,
-#        config-backup, or the existing compliance check playbooks.
+# Credentials sourced from Ansible Vault:
+#   ansible-vault create group_vars/network_devices/vault.yml
+#   vault contents:
+#     vault_ansible_user: netadmin
+#     vault_ansible_password: <secret>
+#     vault_ansible_become_password: <enable_secret>
 #
-# Inventory example:
-#   [core_routers]
-#   rtr-core-01  ansible_host=10.1.0.1
-#   rtr-core-02  ansible_host=10.1.0.2
+# Inventory example (inventory/hosts.yml):
+# ---
+# all:
+#   children:
+#     network_devices:
+#       hosts:
+#         core-sw-01:
+#           ansible_host: 192.168.1.1
+#         dist-rtr-01:
+#           ansible_host: 192.168.1.254
+#       vars:
+#         ansible_network_os: ios
+#         ansible_connection: network_cli
+#         ansible_user: "{{ vault_ansible_user }}"
+#         ansible_password: "{{ vault_ansible_password }}"
+#         ansible_become: true
+#         ansible_become_method: enable
+#         ansible_become_password: "{{ vault_ansible_become_password }}"
 #
-#   [edge_routers]
-#   rtr-edge-01  ansible_host=10.2.0.1
-#
-#   [routers:children]
-#   core_routers
-#   edge_routers
-#
-#   [routers:vars]
-#   ansible_user={{ vault_net_username }}           # ansible-vault encrypted
-#   ansible_password={{ vault_net_password }}       # ansible-vault encrypted
-#   ansible_network_os=ios
-#   ansible_become=true
-#   ansible_become_method=enable
-#   ansible_become_password={{ vault_net_enable }}  # ansible-vault encrypted
+# Usage:
+#   ansible-playbook ssh_crypto_compliance.yml -i inventory/hosts.yml --ask-vault-pass
 
-- name: Routing Protocol Security Compliance Check
-  hosts: routers
+- name: SSH and Crypto Key Hardening Compliance Audit
+  hosts: network_devices
   gather_facts: false
-
   vars:
-    compliance_issues: []
+    min_rsa_bits: 2048
+    audit_failures: []
 
   tasks:
-    - name: Collect BGP running configuration
-      cisco.ios.ios_command:
-        commands:
-          - show running-config | section router bgp
-      register: bgp_cfg
-      retries: 2
-      delay: 5
-      until: bgp_cfg is not failed
-      ignore_errors: true
+    - name: Collect SSH and crypto posture
+      block:
+        - name: Run SSH and crypto show commands
+          cisco.ios.ios_command:
+            commands:
+              - show ip ssh
+              - show crypto key mypubkey rsa
+              - show running-config | section line vty
+          register: audit_output
+          retries: 2
+          delay: 5
+          until: audit_output is not failed
 
-    - name: Collect OSPF running configuration
-      cisco.ios.ios_command:
-        commands:
-          - show running-config | section router ospf
-      register: ospf_cfg
-      retries: 2
-      delay: 5
-      until: ospf_cfg is not failed
-      ignore_errors: true
+        - name: Flag SSH version 1 or SSH disabled
+          ansible.builtin.set_fact:
+            audit_failures: "{{ audit_failures + ['SSH not restricted to version 2 (CIS 1.4.1)'] }}"
+          when: "'version 2' not in audit_output.stdout[0] | lower"
 
-    - name: Collect BGP neighbor summary
-      cisco.ios.ios_command:
-        commands:
-          - show bgp ipv4 unicast summary
-      register: bgp_summary
-      retries: 2
-      delay: 5
-      until: bgp_summary is not failed
-      ignore_errors: true
+        - name: Extract RSA key size from crypto output
+          ansible.builtin.set_fact:
+            rsa_key_size: "{{ audit_output.stdout[1] | regex_search('(\\d{3,4}) bit', '\\1') | first | int }}"
+          when: audit_output.stdout[1] | regex_search('\\d{3,4} bit')
 
-    - name: Flag missing BGP MD5 peer authentication
-      set_fact:
-        compliance_issues: "{{ compliance_issues + ['BGP: MD5 peer authentication not configured'] }}"
-      when:
-        - bgp_cfg is not failed
-        - "'neighbor' in bgp_cfg.stdout[0]"
-        - "'password' not in bgp_cfg.stdout[0]"
+        - name: Flag insufficient RSA key length
+          ansible.builtin.set_fact:
+            audit_failures: "{{ audit_failures + ['RSA key ' + rsa_key_size | string + ' bits < ' + min_rsa_bits | string + ' required (CIS 1.4.2)'] }}"
+          when:
+            - rsa_key_size is defined
+            - rsa_key_size | int < min_rsa_bits
 
-    - name: Flag missing BGP maximum-prefix limits
-      set_fact:
-        compliance_issues: "{{ compliance_issues + ['BGP: maximum-prefix not set on all peers'] }}"
-      when:
-        - bgp_cfg is not failed
-        - "'neighbor' in bgp_cfg.stdout[0]"
-        - "'maximum-prefix' not in bgp_cfg.stdout[0]"
+        - name: Flag missing RSA host key
+          ansible.builtin.set_fact:
+            audit_failures: "{{ audit_failures + ['No RSA host key detected — run: crypto key generate rsa modulus 2048 (CIS 1.4.2)'] }}"
+          when: not audit_output.stdout[1] | regex_search('\\d{3,4} bit')
 
-    - name: Flag missing BGP soft-reconfiguration inbound
-      set_fact:
-        compliance_issues: "{{ compliance_issues + ['BGP: soft-reconfiguration inbound not configured'] }}"
-      when:
-        - bgp_cfg is not failed
-        - "'neighbor' in bgp_cfg.stdout[0]"
-        - "'soft-reconfiguration' not in bgp_cfg.stdout[0]"
+        - name: Flag VTY transport not restricted to SSH
+          ansible.builtin.set_fact:
+            audit_failures: "{{ audit_failures + ['VTY transport input not limited to ssh (CIS 1.4.3)'] }}"
+          when: "'transport input ssh' not in audit_output.stdout[2]"
 
-    - name: Flag missing OSPF area authentication
-      set_fact:
-        compliance_issues: "{{ compliance_issues + ['OSPF: area authentication not configured'] }}"
-      when:
-        - ospf_cfg is not failed
-        - "'router ospf' in ospf_cfg.stdout[0]"
-        - "'authentication' not in ospf_cfg.stdout[0]"
+      rescue:
+        - name: Mark device unreachable in audit results
+          ansible.builtin.set_fact:
+            audit_failures: "{{ audit_failures + ['COLLECTION ERROR — verify connectivity and credentials'] }}"
 
-    - name: Flag missing OSPF passive-interface default
-      set_fact:
-        compliance_issues: "{{ compliance_issues + ['OSPF: passive-interface default not set'] }}"
-      when:
-        - ospf_cfg is not failed
-        - "'router ospf' in ospf_cfg.stdout[0]"
-        - "'passive-interface default' not in ospf_cfg.stdout[0]"
+        - name: Log collection failure
+          ansible.builtin.debug:
+            msg: "Could not collect data from {{ inventory_hostname }} — skipping crypto checks"
 
-    - name: Display live BGP neighbor summary
-      debug:
-        var: bgp_summary.stdout_lines
-      when:
-        - bgp_summary is not failed
-        - bgp_summary.stdout[0] | length > 0
+    - name: Display raw command output
+      ansible.builtin.debug:
+        var: audit_output.stdout_lines
+      when: audit_output is defined and audit_output is not failed
 
-    - name: Report routing security compliance result
-      debug:
-        msg:
-          - "============================================"
-          - "Host        : {{ inventory_hostname }}"
-          - "Issues found: {{ compliance_issues | length }}"
-          - "Details     : {{ compliance_issues if compliance_issues else ['PASS - no violations'] }}"
-          - "============================================"
-
-    - name: Fail if routing protocol security violations exist
-      fail:
+    - name: Print per-device compliance result
+      ansible.builtin.debug:
         msg: >-
-          Routing security compliance FAILED on {{ inventory_hostname }}:
-          {{ compliance_issues | join(' | ') }}
-      when: compliance_issues | length > 0
+          [{{ inventory_hostname }}] SSH/Crypto Compliance:
+          {{ 'PASS' if audit_failures | length == 0 else 'FAIL — ' + audit_failures | join(' | ') }}
+
+    - name: Fail play when violations detected
+      ansible.builtin.fail:
+        msg: "{{ inventory_hostname }}: {{ audit_failures | length }} violation(s) — {{ audit_failures | join(', ') }}"
+      when: audit_failures | length > 0
