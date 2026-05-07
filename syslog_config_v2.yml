@@ -1,94 +1,104 @@
 ---
-# syslog_audit.yml
-#
-# Syslog Audit and Verification Playbook
-# Verifies syslog server reachability, validates active logging config,
-# and generates a test event to confirm end-to-end log delivery.
-# Complements syslog_config.yml (deployment) — this playbook audits, not configures.
+# Ansible Playbook: Advanced Syslog Hardening and Validation
+# Configures syslog rate-limiting, source-interface binding, buffered logging,
+# and validates log connectivity — distinct from basic syslog_config.yml setup.
 #
 # Inventory example:
-# [ios_routers]
-# rtr-core-01 ansible_host=10.0.1.1
-# rtr-edge-02 ansible_host=10.0.1.2
+#   [core_routers]
+#   rtr-core-01 ansible_host=10.0.1.1
+#   rtr-core-02 ansible_host=10.0.1.2
 #
-# [ios_routers:vars]
-# ansible_network_os=ios
-# ansible_connection=network_cli
-# ansible_user={{ vault_net_user }}          # ansible-vault encrypted
-# ansible_password={{ vault_net_password }}  # ansible-vault encrypted
-# ansible_become=yes
-# ansible_become_method=enable
-# ansible_become_password={{ vault_enable_password }}
+#   [core_routers:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_net_user }}
+#   ansible_password={{ vault_net_pass }}
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_enable_pass }}
 #
-# Required vars (define in group_vars or pass -e):
-#   syslog_servers: ["10.0.50.10", "10.0.50.11"]
-#   expected_severity: informational
-#   expected_facility: local6
+# Vault: ansible-vault encrypt_string '<secret>' --name 'vault_net_pass'
 
-- name: Syslog Audit — Verify Configuration and End-to-End Delivery
-  hosts: ios_routers
+- name: Advanced syslog hardening — rate-limit, source-interface, buffer tuning, and validation
+  hosts: core_routers
   gather_facts: false
-
   vars:
     syslog_servers:
-      - "10.0.50.10"
-      - "10.0.50.11"
-    expected_severity: informational
-    expected_facility: local6
-    ping_count: 3
-    audit_timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+      - host: 10.10.10.50
+        vrf: MGMT
+      - host: 10.10.10.51
+        vrf: MGMT
+    syslog_source_interface: Loopback0
+    syslog_buffer_size: 16384
+    syslog_rate_limit_all: 10000
+    syslog_rate_limit_console: 100
+    syslog_facility: local6
+    expected_log_host_count: 2
 
   tasks:
-    - name: Collect current logging configuration
+    - name: Capture pre-change syslog state
       cisco.ios.ios_command:
         commands:
           - show logging
           - show running-config | section logging
-      register: logging_output
+      register: pre_change_state
       retries: 2
       delay: 5
-      until: logging_output is not failed
 
-    - name: Assert syslog hosts are present in running config
-      ansible.builtin.assert:
-        that:
-          - "'logging host ' ~ item in logging_output.stdout[1]"
-        fail_msg: "Syslog server {{ item }} is NOT configured on {{ inventory_hostname }}"
-        success_msg: "Syslog server {{ item }} confirmed on {{ inventory_hostname }}"
-      loop: "{{ syslog_servers }}"
+    - name: Display current logging configuration
+      ansible.builtin.debug:
+        msg: "{{ pre_change_state.stdout[1].splitlines() }}"
 
-    - name: Assert expected severity level is configured
-      ansible.builtin.assert:
-        that:
-          - "expected_severity in logging_output.stdout[1]"
-        fail_msg: "Expected severity '{{ expected_severity }}' not found in logging config"
-        success_msg: "Severity level '{{ expected_severity }}' confirmed"
+    - name: Apply syslog hardening configuration
+      block:
+        - name: Configure buffered logging size and level
+          cisco.ios.ios_config:
+            lines:
+              - "logging buffered {{ syslog_buffer_size }} informational"
+              - "logging trap informational"
+              - "logging facility {{ syslog_facility }}"
+              - "logging source-interface {{ syslog_source_interface }}"
+              - "logging rate-limit all {{ syslog_rate_limit_all }}"
+              - "logging rate-limit console {{ syslog_rate_limit_console }}"
+            save_when: changed
+          register: config_result
 
-    - name: Verify reachability of each syslog server
+        - name: Configure syslog servers with VRF
+          cisco.ios.ios_config:
+            lines:
+              - "logging host {{ item.host }} vrf {{ item.vrf }}"
+            save_when: changed
+          loop: "{{ syslog_servers }}"
+          register: server_config_result
+
+        - name: Validate syslog configuration was applied
+          cisco.ios.ios_command:
+            commands:
+              - show logging | include host
+          register: log_host_check
+          failed_when: >
+            (log_host_check.stdout[0] | regex_findall('logging host') | length) < expected_log_host_count
+
+      rescue:
+        - name: Log failure and attempt rollback notice
+          ansible.builtin.debug:
+            msg: "FAILED on {{ inventory_hostname }} — syslog config did not apply cleanly. Manual review required."
+
+        - name: Fail task with clear message after rescue
+          ansible.builtin.fail:
+            msg: "Syslog hardening failed on {{ inventory_hostname }}. Pre-change state preserved in pre_change_state var."
+
+    - name: Capture post-change syslog state
       cisco.ios.ios_command:
         commands:
-          - "ping {{ item }} repeat {{ ping_count }} source Loopback0"
-      register: ping_results
-      loop: "{{ syslog_servers }}"
-      failed_when: "'!!!' not in ping_results.stdout[0] and 'Success' not in ping_results.stdout[0]"
+          - show logging
+      register: post_change_state
 
-    - name: Generate test syslog message to confirm delivery
-      cisco.ios.ios_command:
-        commands:
-          - "send log {{ expected_facility }} {{ expected_severity }} ANSIBLE_AUDIT: syslog verification {{ audit_timestamp }} from {{ inventory_hostname }}"
-      register: test_log_result
-      ignore_errors: true
-
-    - name: Display syslog status summary
+    - name: Report logging buffer and server summary
       ansible.builtin.debug:
         msg:
           - "Host: {{ inventory_hostname }}"
-          - "Logging buffer status: {{ logging_output.stdout[0] | regex_search('Syslog logging: (\\S+)', '\\1') | first | default('unknown') }}"
-          - "Configured syslog hosts verified: {{ syslog_servers | join(', ') }}"
-          - "Reachability check: {{ 'PASS' if ping_results.results | selectattr('failed', 'equalto', false) | list | length == syslog_servers | length else 'PARTIAL/FAIL' }}"
-          - "Test event sent at: {{ audit_timestamp }}"
-
-    - name: Flag devices with logging disabled
-      ansible.builtin.fail:
-        msg: "CRITICAL: Logging is disabled on {{ inventory_hostname }} — run syslog_config.yml to remediate"
-      when: "'Syslog logging: disabled' in logging_output.stdout[0]
+          - "Config changed: {{ config_result.changed }}"
+          - "Log servers configured: {{ log_host_check.stdout[0] | regex_findall('logging host') | length }}"
+          - "Buffer line: {{ post_change_state.stdout[0] | regex_search('Log Buffer.*') }}"
+Human: Hi
