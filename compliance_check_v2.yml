@@ -1,110 +1,123 @@
+```yaml
 ---
-# ssh_crypto_compliance.yml
+# ospf_config.yml
 #
-# Audits SSH version enforcement and RSA host-key strength on Cisco IOS devices
-# against CIS IOS Benchmark v4.1 controls:
-#   - 1.4.1  SSH protocol version 2 only
-#   - 1.4.2  RSA host key >= 2048 bits
-#   - 1.4.3  VTY lines restrict transport to SSH
+# Configures OSPF process ID, router-id, network advertisements, passive
+# interfaces, and area 0 MD5 authentication on Cisco IOS routers.
 #
-# Credentials sourced from Ansible Vault:
-#   ansible-vault create group_vars/network_devices/vault.yml
-#   vault contents:
-#     vault_ansible_user: netadmin
-#     vault_ansible_password: <secret>
-#     vault_ansible_become_password: <enable_secret>
+# Prerequisites: ansible-galaxy collection install cisco.ios
+# Credentials: store secrets in ansible-vault — see vault_net_* vars below
 #
-# Inventory example (inventory/hosts.yml):
-# ---
-# all:
-#   children:
-#     network_devices:
-#       hosts:
-#         core-sw-01:
-#           ansible_host: 192.168.1.1
-#         dist-rtr-01:
-#           ansible_host: 192.168.1.254
-#       vars:
-#         ansible_network_os: ios
-#         ansible_connection: network_cli
-#         ansible_user: "{{ vault_ansible_user }}"
-#         ansible_password: "{{ vault_ansible_password }}"
-#         ansible_become: true
-#         ansible_become_method: enable
-#         ansible_become_password: "{{ vault_ansible_become_password }}"
+# Inventory example:
+#   [core_routers]
+#   r1  ansible_host=10.10.10.1
+#   r2  ansible_host=10.10.10.2
 #
-# Usage:
-#   ansible-playbook ssh_crypto_compliance.yml -i inventory/hosts.yml --ask-vault-pass
+#   [core_routers:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_net_user }}
+#   ansible_password={{ vault_net_password }}
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_enable_password }}
+#
+# Usage: ansible-playbook ospf_config.yml -i inventory/network.yml --ask-vault-pass
 
-- name: SSH and Crypto Key Hardening Compliance Audit
-  hosts: network_devices
+- name: Configure OSPF Routing Protocol on Core Routers
+  hosts: core_routers
   gather_facts: false
   vars:
-    min_rsa_bits: 2048
-    audit_failures: []
+    # ansible-vault encrypt_string 'admin' --name 'vault_net_user'
+    ospf_process_id: 1
+    ospf_reference_bandwidth: 10000
+    ospf_area0_auth: true
+    ospf_networks:
+      - { prefix: "10.0.0.0",    wildcard: "0.0.255.255", area: 0 }
+      - { prefix: "192.168.0.0", wildcard: "0.0.255.255", area: 1 }
+    ospf_passive_interfaces:
+      - GigabitEthernet0/2
+      - Loopback0
 
   tasks:
-    - name: Collect SSH and crypto posture
+    - name: Capture pre-change OSPF state
+      cisco.ios.ios_command:
+        commands:
+          - show ip ospf neighbor
+          - show ip route ospf
+      register: pre_change_state
+      retries: 2
+      delay: 5
+
+    - name: Display pre-change OSPF neighbors and routes
+      ansible.builtin.debug:
+        msg: "{{ pre_change_state.stdout_lines }}"
+
+    - name: Deploy OSPF configuration
       block:
-        - name: Run SSH and crypto show commands
+        - name: Set OSPF global parameters
+          cisco.ios.ios_config:
+            lines:
+              - "router-id {{ ansible_host }}"
+              - "auto-cost reference-bandwidth {{ ospf_reference_bandwidth }}"
+            parents: "router ospf {{ ospf_process_id }}"
+            save_when: changed
+
+        - name: Advertise networks into OSPF areas
+          cisco.ios.ios_config:
+            lines:
+              - "network {{ item.prefix }} {{ item.wildcard }} area {{ item.area }}"
+            parents: "router ospf {{ ospf_process_id }}"
+            save_when: changed
+          loop: "{{ ospf_networks }}"
+
+        - name: Suppress OSPF hellos on stub interfaces
+          cisco.ios.ios_config:
+            lines:
+              - "passive-interface {{ item }}"
+            parents: "router ospf {{ ospf_process_id }}"
+            save_when: changed
+          loop: "{{ ospf_passive_interfaces }}"
+
+        - name: Enable MD5 authentication on backbone area
+          cisco.ios.ios_config:
+            lines:
+              - "area 0 authentication message-digest"
+            parents: "router ospf {{ ospf_process_id }}"
+            save_when: changed
+          when: ospf_area0_auth | bool
+
+        - name: Verify OSPF process is active
           cisco.ios.ios_command:
             commands:
-              - show ip ssh
-              - show crypto key mypubkey rsa
-              - show running-config | section line vty
-          register: audit_output
-          retries: 2
-          delay: 5
-          until: audit_output is not failed
-
-        - name: Flag SSH version 1 or SSH disabled
-          ansible.builtin.set_fact:
-            audit_failures: "{{ audit_failures + ['SSH not restricted to version 2 (CIS 1.4.1)'] }}"
-          when: "'version 2' not in audit_output.stdout[0] | lower"
-
-        - name: Extract RSA key size from crypto output
-          ansible.builtin.set_fact:
-            rsa_key_size: "{{ audit_output.stdout[1] | regex_search('(\\d{3,4}) bit', '\\1') | first | int }}"
-          when: audit_output.stdout[1] | regex_search('\\d{3,4} bit')
-
-        - name: Flag insufficient RSA key length
-          ansible.builtin.set_fact:
-            audit_failures: "{{ audit_failures + ['RSA key ' + rsa_key_size | string + ' bits < ' + min_rsa_bits | string + ' required (CIS 1.4.2)'] }}"
-          when:
-            - rsa_key_size is defined
-            - rsa_key_size | int < min_rsa_bits
-
-        - name: Flag missing RSA host key
-          ansible.builtin.set_fact:
-            audit_failures: "{{ audit_failures + ['No RSA host key detected — run: crypto key generate rsa modulus 2048 (CIS 1.4.2)'] }}"
-          when: not audit_output.stdout[1] | regex_search('\\d{3,4} bit')
-
-        - name: Flag VTY transport not restricted to SSH
-          ansible.builtin.set_fact:
-            audit_failures: "{{ audit_failures + ['VTY transport input not limited to ssh (CIS 1.4.3)'] }}"
-          when: "'transport input ssh' not in audit_output.stdout[2]"
+              - "show ip ospf | include Router ID"
+          register: ospf_verify
+          failed_when: "'Router ID' not in ospf_verify.stdout[0]"
+          retries: 3
+          delay: 10
 
       rescue:
-        - name: Mark device unreachable in audit results
-          ansible.builtin.set_fact:
-            audit_failures: "{{ audit_failures + ['COLLECTION ERROR — verify connectivity and credentials'] }}"
-
-        - name: Log collection failure
+        - name: Log OSPF deployment failure
           ansible.builtin.debug:
-            msg: "Could not collect data from {{ inventory_hostname }} — skipping crypto checks"
+            msg: >
+              OSPF configuration failed on {{ inventory_hostname }}:
+              {{ ansible_failed_result.msg | default('see device logs') }}
 
-    - name: Display raw command output
+        - name: Halt play for this host
+          ansible.builtin.fail:
+            msg: "OSPF deployment failed on {{ inventory_hostname }} — manual review required"
+
+    - name: Capture post-change OSPF state
+      cisco.ios.ios_command:
+        commands:
+          - show ip ospf neighbor
+          - show ip ospf interface brief
+      register: post_change_state
+
+    - name: Display post-change OSPF summary
       ansible.builtin.debug:
-        var: audit_output.stdout_lines
-      when: audit_output is defined and audit_output is not failed
-
-    - name: Print per-device compliance result
-      ansible.builtin.debug:
-        msg: >-
-          [{{ inventory_hostname }}] SSH/Crypto Compliance:
-          {{ 'PASS' if audit_failures | length == 0 else 'FAIL — ' + audit_failures | join(' | ') }}
-
-    - name: Fail play when violations detected
-      ansible.builtin.fail:
-        msg: "{{ inventory_hostname }}: {{ audit_failures | length }} violation(s) — {{ audit_failures | join(', ') }}"
-      when: audit_failures | length > 0
+        msg:
+          - "Device     : {{ inventory_hostname }}"
+          - "Neighbors  : {{ post_change_state.stdout_lines[0] }}"
+          - "Interfaces : {{ post_change_state.stdout_lines[1] }}"
+```
