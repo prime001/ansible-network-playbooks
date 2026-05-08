@@ -1,113 +1,105 @@
 ---
-# routing_state_gather.yml
-# Collects BGP peer states, OSPF adjacencies, and IP route summary from IOS/IOS-XE devices.
-# Complements facts_gathering*.yml (device/interface facts) with live routing protocol state.
+# BGP Neighbor Health Check and Route Table Snapshot
 #
-# Credentials sourced from Ansible Vault — group_vars/network/vault.yml must define:
-#   vault_net_user, vault_net_pass, vault_net_enable
+# Collects BGP neighbor states, advertised/received prefix counts, and
+# routing table summary across IOS/IOS-XE devices. Fails the play if any
+# BGP session is not in Established state so that monitoring catches flaps.
 #
-# Inventory example:
-#   [core_routers]
-#   core-rtr-01  ansible_host=10.0.1.1
-#   core-rtr-02  ansible_host=10.0.1.2
+# Credentials: ansible-vault encrypted group_vars/network/vault.yml
+#   vault_ansible_user: "{{ vault_ansible_user }}"
+#   vault_ansible_password: "{{ vault_ansible_password }}"
+#   vault_ansible_become_password: "{{ vault_ansible_become_password }}"
 #
-#   [core_routers:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user={{ vault_net_user }}
-#   ansible_password={{ vault_net_pass }}
-#   ansible_become=yes
-#   ansible_become_method=enable
-#   ansible_become_pass={{ vault_net_enable }}
-#
-# Usage: ansible-playbook routing_state_gather.yml -i inventory/hosts --ask-vault-pass
+# Inventory example (inventory/hosts.yml):
+# ---
+# all:
+#   children:
+#     bgp_routers:
+#       hosts:
+#         core-rtr-01:
+#           ansible_host: 192.168.1.1
+#           bgp_expected_neighbor_count: 4
+#         core-rtr-02:
+#           ansible_host: 192.168.1.2
+#           bgp_expected_neighbor_count: 4
+#       vars:
+#         ansible_network_os: ios
+#         ansible_connection: network_cli
+#         ansible_user: "{{ vault_ansible_user }}"
+#         ansible_password: "{{ vault_ansible_password }}"
+#         ansible_become: true
+#         ansible_become_method: enable
+#         ansible_become_password: "{{ vault_ansible_become_password }}"
+#         bgp_expected_neighbor_count: 2
 
-- name: Gather routing protocol state from core routers
-  hosts: core_routers
+- name: BGP Neighbor Health Check and Route Table Snapshot
+  hosts: bgp_routers
   gather_facts: false
+
   vars:
-    output_dir: "./routing_state_reports"
-    timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+    bgp_expected_neighbor_count: "{{ bgp_expected_neighbor_count | default(1) }}"
+    bgp_session_state_pattern: "Established"
 
   tasks:
-    - name: Ensure local report directory exists
-      delegate_to: localhost
-      run_once: true
-      file:
-        path: "{{ output_dir }}"
-        state: directory
-        mode: '0755'
-
-    - name: Collect routing protocol state
+    - name: Collect BGP neighbor summary
       block:
-        - name: Retrieve BGP summary
-          ios_command:
+        - name: Run show ip bgp summary
+          cisco.ios.ios_command:
             commands:
               - show ip bgp summary
-            retries: 3
-            interval: 5
-          register: bgp_summary
-          failed_when: >
-            bgp_summary.failed and
-            'BGP not active' not in (bgp_summary.stdout[0] | default(''))
+          register: bgp_summary_output
+          retries: 3
+          delay: 5
+          until: bgp_summary_output.failed == false
 
-        - name: Retrieve OSPF neighbor table
-          ios_command:
-            commands:
-              - show ip ospf neighbor
-            retries: 3
-            interval: 5
-          register: ospf_neighbors
-
-        - name: Retrieve IP route summary
-          ios_command:
+        - name: Run show ip route summary
+          cisco.ios.ios_command:
             commands:
               - show ip route summary
-            retries: 2
-            interval: 3
-          register: route_summary
+          register: route_summary_output
+          retries: 2
+          delay: 5
+          until: route_summary_output.failed == false
 
-        - name: Display BGP peer state
-          debug:
-            msg: "{{ bgp_summary.stdout_lines[0] }}"
-          when: bgp_summary.stdout[0] | default('') | length > 0
+        - name: Run show ip bgp neighbors (state detail)
+          cisco.ios.ios_command:
+            commands:
+              - show ip bgp neighbors | include BGP neighbor|BGP state
+          register: bgp_neighbors_output
+          retries: 2
+          delay: 5
+          until: bgp_neighbors_output.failed == false
 
-        - name: Display OSPF adjacencies
-          debug:
-            msg: "{{ ospf_neighbors.stdout_lines[0] }}"
-          when: ospf_neighbors.stdout[0] | default('') | length > 0
-
-        - name: Display route count summary
-          debug:
-            msg: "{{ route_summary.stdout_lines[0] }}"
-          when: route_summary.stdout[0] | default('') | length > 0
-
-        - name: Write per-device routing state report
-          delegate_to: localhost
-          copy:
-            content: |
-              === Routing State Report: {{ inventory_hostname }} ===
-              Collected: {{ timestamp }}
-
-              --- BGP Summary ---
-              {{ bgp_summary.stdout[0] | default('BGP not configured or not active') }}
-
-              --- OSPF Neighbors ---
-              {{ ospf_neighbors.stdout[0] | default('OSPF not configured') }}
-
-              --- IP Route Summary ---
-              {{ route_summary.stdout[0] | default('No routing table data') }}
-            dest: "{{ output_dir }}/{{ inventory_hostname }}_routing_{{ timestamp }}.txt"
+        - name: Assert all BGP sessions are Established
+          ansible.builtin.assert:
+            that:
+              - bgp_neighbors_output.stdout[0] | regex_findall('BGP state = Established') | length | int >= bgp_expected_neighbor_count | int
+            fail_msg: >
+              {{ inventory_hostname }}: Expected {{ bgp_expected_neighbor_count }}
+              Established BGP session(s), found
+              {{ bgp_neighbors_output.stdout[0] | regex_findall('BGP state = Established') | length }}.
+              Check for flapping peers.
+            success_msg: "{{ inventory_hostname }}: All {{ bgp_expected_neighbor_count }} BGP session(s) Established."
 
       rescue:
-        - name: Report collection failure
-          debug:
+        - name: Log BGP collection failure
+          ansible.builtin.debug:
             msg: >
-              Routing state collection failed on {{ inventory_hostname }}:
-              {{ ansible_failed_result.msg | default('unknown error') }}
+              ALERT: BGP health check failed on {{ inventory_hostname }}.
+              Error: {{ bgp_summary_output.msg | default(bgp_neighbors_output.msg | default('unknown')) }}
 
-        - name: Write failure marker for downstream processing
-          delegate_to: localhost
-          copy:
-            content: "FAILED {{ timestamp }}: {{ ansible_failed_result.msg | default('unknown') }}\n"
-            dest: "{{ output_dir }}/{{ inventory_hostname }}_FAILED_{{ timestamp }}.txt
+        - name: Fail explicitly so the play is marked failed
+          ansible.builtin.fail:
+            msg: "BGP neighbor check did not complete successfully on {{ inventory_hostname }}."
+
+    - name: Display BGP summary output
+      ansible.builtin.debug:
+        msg: "{{ bgp_summary_output.stdout_lines[0] }}"
+
+    - name: Display route table summary
+      ansible.builtin.debug:
+        msg: "{{ route_summary_output.stdout_lines[0] }}"
+
+    - name: Report BGP neighbor states
+      ansible.builtin.debug:
+        msg: "{{ bgp_neighbors_output.stdout_lines[0] }}
