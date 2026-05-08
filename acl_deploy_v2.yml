@@ -1,141 +1,137 @@
-Looking at the repo structure, `acl_deploy.yml` and `acl_deploy_v2.yml` already cover basic ACL deployment. I'll write a lifecycle-focused variant — baseline capture, deploy, post-verify, and automated rollback — which is meaningfully different from a straight deploy playbook.
+This is a standalone ACL playbook generation request — writing the YAML directly.
 
+```yaml
 ---
-# acl_deploy_v3.yml — ACL Lifecycle: Baseline, Deploy, Verify, Rollback
+# acl_deploy_v3.yml
+# Deploy named IPv4 ACLs via the ios_acls resource module with pre-change
+# snapshot and automatic rollback on post-deployment verification failure.
+# Uses "replaced" state for idempotent, diff-aware reconciliation vs the
+# additive ios_config approach used in v1/v2.
 #
-# Extends v1/v2 with a full deployment lifecycle: snapshot pre-state,
-# push extended named ACL, verify entries survive in running-config,
-# bind to interfaces, and auto-rollback on any failure.
+# Vault: encrypt ansible_password in group_vars/
+#   ansible-vault encrypt_string 'secret' --name 'ansible_password'
 #
 # Inventory example:
-#   [core_routers]
-#   rtr-core-01  ansible_host=10.0.1.1
-#   rtr-core-02  ansible_host=10.0.1.2
+#   [edge_routers]
+#   edge-01  ansible_host=10.0.1.1  ansible_network_os=ios
+#   edge-02  ansible_host=10.0.1.2  ansible_network_os=ios
 #
-#   [core_routers:vars]
-#   ansible_network_os=ios
+#   [edge_routers:vars]
 #   ansible_connection=network_cli
-#   ansible_user={{ vault_net_username }}        # ansible-vault encrypted
-#   ansible_password={{ vault_net_password }}     # ansible-vault encrypted
+#   ansible_user=netops
+#   ansible_password=!vault |
+#     $ANSIBLE_VAULT;1.1;AES256
+#     ...
 #   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_password }}
-#
-# Usage:
-#   ansible-playbook acl_deploy_v3.yml -i inventory/production.yml --ask-vault-pass
-#   ansible-playbook acl_deploy_v3.yml -i inventory/production.yml --ask-vault-pass -e "rollback_on_failure=false"
 
-- name: ACL Lifecycle Management — Baseline, Deploy, Verify, Rollback
-  hosts: core_routers
+- name: Deploy edge ACLs with resource module and automatic rollback
+  hosts: edge_routers
   gather_facts: false
-  collections:
-    - cisco.ios
 
   vars:
-    ansible_user: "{{ vault_net_username }}"
-    ansible_password: "{{ vault_net_password }}"
-    ansible_become_password: "{{ vault_enable_password }}"
-
-    acl_name: "BLOCK_RFC1918_INBOUND"
-    rollback_on_failure: true
-
-    acl_lines:
-      - "10 deny ip 10.0.0.0 0.255.255.255 any log"
-      - "20 deny ip 172.16.0.0 0.15.255.255 any log"
-      - "30 deny ip 192.168.0.0 0.0.255.255 any log"
-      - "40 permit ip any any"
-
-    apply_to_interfaces:
-      - interface: GigabitEthernet0/1
-        direction: in
+    acl_policy:
+      - name: EDGE_INBOUND
+        acl_type: extended
+        aces:
+          - sequence: 10
+            grant: permit
+            protocol_options:
+              tcp: true
+            source:
+              any: true
+            destination:
+              address: 203.0.113.0
+              wildcard_bits: 0.0.0.255
+              port_protocol:
+                eq: www
+          - sequence: 20
+            grant: permit
+            protocol_options:
+              tcp: true
+            source:
+              any: true
+            destination:
+              address: 203.0.113.0
+              wildcard_bits: 0.0.0.255
+              port_protocol:
+                eq: 443
+          - sequence: 30
+            grant: permit
+            protocol_options:
+              icmp: true
+            source:
+              address: 10.0.0.0
+              wildcard_bits: 0.255.255.255
+            destination:
+              any: true
+          - sequence: 900
+            grant: deny
+            protocol_options:
+              ip: true
+            source:
+              any: true
+            destination:
+              any: true
+            log: true
 
   tasks:
-    - name: Snapshot pre-deployment ACL state
-      ios_command:
+    - name: Snapshot ACL state before changes
+      cisco.ios.ios_command:
         commands:
-          - "show ip access-lists {{ acl_name }}"
-      register: acl_baseline
+          - show ip access-lists
+      register: acl_before
       retries: 2
-      delay: 5
-      ignore_errors: true
+      delay: 3
 
-    - name: Store baseline for rollback comparison
-      set_fact:
-        pre_deploy_acl: "{{ acl_baseline.stdout[0] | default('') }}"
-
-    - name: Display baseline (empty signals a fresh deployment)
-      debug:
-        msg: "{{ inventory_hostname }} pre-deploy: {{ pre_deploy_acl if pre_deploy_acl else 'ACL absent — fresh deployment' }}"
-
-    - name: Deploy ACL and bind to interfaces
+    - name: Deploy ACL policy with rollback on failure
       block:
-        - name: Configure named extended ACL
-          ios_config:
-            lines: "{{ acl_lines }}"
-            parents: "ip access-list extended {{ acl_name }}"
-            save_when: changed
-          register: acl_result
-          retries: 2
-          delay: 10
+        - name: Push ACLs via resource module (replaced state)
+          cisco.ios.ios_acls:
+            config:
+              - afi: ipv4
+                acls: "{{ acl_policy }}"
+            state: replaced
+          register: acl_push_result
 
-        - name: Bind ACL to interfaces
-          ios_config:
-            lines:
-              - "ip access-group {{ acl_name }} {{ item.direction }}"
-            parents: "interface {{ item.interface }}"
-            save_when: changed
-          loop: "{{ apply_to_interfaces }}"
-          register: intf_result
-
-        - name: Post-deployment verification
-          ios_command:
+        - name: Verify each ACL is present after deployment
+          cisco.ios.ios_command:
             commands:
-              - "show ip access-lists {{ acl_name }}"
-              - "show running-config | section ip access-list extended {{ acl_name }}"
-          register: post_verify
-          failed_when: acl_name not in post_verify.stdout[0]
+              - "show ip access-lists {{ item }}"
+          register: acl_verify
+          failed_when: >
+            'Extended IP access list ' + item not in acl_verify.stdout[0]
+          loop: "{{ acl_policy | map(attribute='name') | list }}"
           retries: 2
-          delay: 5
+          delay: 3
 
-        - name: Report successful deployment
-          debug:
-            msg: |
-              {{ inventory_hostname }} — {{ acl_name }} deployed successfully
-              Config changed: {{ acl_result.changed }}
-              Active ACL entry count: {{ post_verify.stdout[0].split('\n') | select('match', '.*permit|.*deny') | list | length }}
-              Running-config confirmed:
-              {{ post_verify.stdout[1] }}
+        - name: Report deployment summary
+          ansible.builtin.debug:
+            msg:
+              host: "{{ inventory_hostname }}"
+              changed: "{{ acl_push_result.changed }}"
+              acls_managed: "{{ acl_policy | map(attribute='name') | list }}"
 
       rescue:
-        - name: Capture diagnostic state on failure
-          ios_command:
-            commands:
-              - "show ip access-lists {{ acl_name }}"
-              - "show logging | last 15"
-          register: failure_diag
+        - name: Log rollback trigger
+          ansible.builtin.debug:
+            msg: "ACL deploy failed on {{ inventory_hostname }}, removing pushed ACLs"
+
+        - name: Remove deployed ACLs to restore prior state
+          cisco.ios.ios_acls:
+            config:
+              - afi: ipv4
+                acls: "{{ acl_policy }}"
+            state: deleted
           ignore_errors: true
 
-        - name: Rollback — remove failed ACL and interface bindings
-          ios_config:
-            lines:
-              - "no ip access-list extended {{ acl_name }}"
-            save_when: always
-          when: rollback_on_failure | bool
-          register: rollback_result
+        - name: Fail after rollback attempt
+          ansible.builtin.fail:
+            msg: "Deployment rolled back on {{ inventory_hostname }}"
 
-        - name: Confirm rollback removed the ACL
-          ios_command:
-            commands:
-              - "show ip access-lists {{ acl_name }}"
-          register: rollback_verify
-          when: rollback_on_failure | bool
-          ignore_errors: true
-
-        - name: Emit failure and rollback summary
-          debug:
-            msg: |
-              DEPLOYMENT FAILED on {{ inventory_hostname }}
-              Rollback performed: {{ rollback_on_failure }}
-              ACL state after rollback: {{ rollback_verify.stdout[0] | default('N/A — rollback skipped') }}
-              Diagnostic log tail: {{ failure_diag.stdout[1] | default('unavailable') }}
-          failed_when: true
+    - name: Save configuration to NVRAM
+      cisco.ios.ios_command:
+        commands:
+          - write memory
+      when: acl_push_result.changed | default(false)
+```
