@@ -1,112 +1,103 @@
 ---
-# =============================================================================
-# Unused Interface Audit and Secure Shutdown
-# Identifies notconnect/disabled access ports, stamps them with a datestamped
-# description, and optionally admin-shuts them to reduce the attack surface.
-# Run quarterly on access-layer switches as part of port-security hygiene.
+# BGP Neighbor Configuration Playbook
+# Configures iBGP and eBGP peers on Cisco IOS routers with timers,
+# next-hop-self for iBGP, and neighbor change logging.
+# Credentials: ansible-vault encrypted (group_vars/bgp_routers/vault.yml)
 #
 # Inventory example:
-#   [access_switches]
-#   sw-access-01  ansible_host=10.1.1.1
-#   sw-access-02  ansible_host=10.1.1.2
-#   sw-access-03  ansible_host=10.1.1.3
+# [bgp_routers]
+# core-rtr-01  ansible_host=10.0.0.1  bgp_asn=65001
+# edge-rtr-01  ansible_host=10.0.0.3  bgp_asn=65001
 #
-#   [access_switches:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user="{{ vault_net_user }}"
-#   ansible_password="{{ vault_net_password }}"
-#   ansible_become=true
-#   ansible_become_method=enable
-#   ansible_become_password="{{ vault_enable_pass }}"
-#
-# Vault-encrypted vars (ansible-vault encrypt_string):
-#   vault_net_user | vault_net_password | vault_enable_pass
-# =============================================================================
+# [bgp_routers:vars]
+# ansible_network_os=ios
+# ansible_connection=network_cli
+# ansible_user={{ vault_ansible_user }}
+# ansible_password={{ vault_ansible_password }}
+# ansible_become=yes
+# ansible_become_method=enable
+# ansible_become_password={{ vault_ansible_enable_password }}
 
-- name: Unused Interface Audit and Secure Shutdown
-  hosts: "{{ target_hosts | default('access_switches') }}"
+- name: Configure BGP Neighbors on Cisco IOS Routers
+  hosts: bgp_routers
   gather_facts: false
+
   vars:
-    shutdown_unused: false         # dry-run by default; set true to enforce shutdowns
-    audit_date: "{{ lookup('pipe', 'date +%Y-%m-%d') }}"
-    unused_description: "UNUSED - Secured {{ audit_date }}"
-    excluded_ports:                # uplinks, management, and SVIs — never touched
-      - GigabitEthernet0/0
-      - GigabitEthernet0/1
-      - GigabitEthernet1/1
-      - Vlan1
-      - Loopback0
+    bgp_timers_keepalive: 30
+    bgp_timers_holdtime: 90
+    bgp_neighbors:
+      - peer_ip: "10.0.0.2"
+        remote_asn: 65001
+        description: "iBGP peer core-rtr-02"
+        update_source: "Loopback0"
+        next_hop_self: true
+      - peer_ip: "203.0.113.1"
+        remote_asn: 65100
+        description: "eBGP ISP-A uplink"
+        update_source: "GigabitEthernet0/0"
+        next_hop_self: false
 
   tasks:
-    - name: Audit and remediate unused interfaces
+    - name: Capture pre-change BGP summary
+      cisco.ios.ios_command:
+        commands:
+          - show ip bgp summary
+      register: bgp_pre_state
+      failed_when: false
+
+    - name: Configure BGP neighbors
       block:
-
-        - name: Collect interface status table
-          cisco.ios.ios_command:
-            commands:
-              - show interfaces status
-          register: iface_status
-          retries: 3
-          delay: 5
-          until: iface_status is not failed
-          failed_when:
-            - iface_status.stdout[0] is not search('Port|Interface')
-
-        - name: Parse notconnect and disabled port names
-          ansible.builtin.set_fact:
-            down_ports: >-
-              {{
-                iface_status.stdout[0]
-                | regex_findall('(?m)^((?:Gi|Fa|Te|Eth)\S+)\s+.*(?:notconnect|disabled)')
-                | difference(excluded_ports)
-                | list
-              }}
-
-        - name: Display ports flagged for audit
-          ansible.builtin.debug:
-            msg: "{{ inventory_hostname }} — {{ down_ports | length }} unused port(s) found: {{ down_ports }}"
-
-        - name: Stamp unused ports with datestamped description
+        - name: Apply neighbor base configuration
           cisco.ios.ios_config:
             lines:
-              - "description {{ unused_description }}"
-            parents: "interface {{ item }}"
-          loop: "{{ down_ports }}"
-          when: down_ports | length > 0
-          register: desc_changes
+              - "neighbor {{ item.peer_ip }} remote-as {{ item.remote_asn }}"
+              - "neighbor {{ item.peer_ip }} description {{ item.description }}"
+              - "neighbor {{ item.peer_ip }} update-source {{ item.update_source }}"
+              - "neighbor {{ item.peer_ip }} timers {{ bgp_timers_keepalive }} {{ bgp_timers_holdtime }}"
+            parents: "router bgp {{ bgp_asn }}"
+          loop: "{{ bgp_neighbors }}"
+          register: neighbor_config
 
-        - name: Admin-shut unused ports (requires shutdown_unused true)
+        - name: Set next-hop-self on iBGP peers
           cisco.ios.ios_config:
             lines:
-              - shutdown
-            parents: "interface {{ item }}"
-          loop: "{{ down_ports }}"
-          when:
-            - shutdown_unused | bool
-            - down_ports | length > 0
-          register: shutdown_changes
+              - "neighbor {{ item.peer_ip }} next-hop-self"
+            parents: "router bgp {{ bgp_asn }}"
+          loop: "{{ bgp_neighbors }}"
+          when: item.next_hop_self | bool
 
-        - name: Persist configuration when changes were made
+        - name: Enable BGP neighbor change logging
+          cisco.ios.ios_config:
+            lines:
+              - "bgp log-neighbor-changes"
+            parents: "router bgp {{ bgp_asn }}"
+
+        - name: Save running configuration
           cisco.ios.ios_config:
             save_when: modified
 
       rescue:
-        - name: Log failure with context
+        - name: Report configuration failure
           ansible.builtin.debug:
-            msg: >-
-              Audit failed on {{ inventory_hostname }}:
-              {{ ansible_failed_result.msg | default('verify connectivity and vault credentials') }}
+            msg: "BGP config failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
 
-        - name: Abort run for this host
+        - name: Abort with context
           ansible.builtin.fail:
-            msg: "Audit incomplete on {{ inventory_hostname }} — manual review required"
+            msg: "BGP neighbor config could not be applied to {{ inventory_hostname }}. Review device logs."
 
-    - name: Print per-host audit summary
+    - name: Poll until BGP neighbor state is readable
+      cisco.ios.ios_command:
+        commands:
+          - "show ip bgp neighbors {{ item.peer_ip }} | include BGP state"
+      register: bgp_verify
+      retries: 6
+      delay: 15
+      until: bgp_verify.stdout[0] is defined
+      loop: "{{ bgp_neighbors }}"
+
+    - name: Display BGP neighbor verification results
       ansible.builtin.debug:
-        msg:
-          - "Host             : {{ inventory_hostname }}"
-          - "Unused ports     : {{ down_ports | default([]) | length }}"
-          - "Descriptions set : {{ (desc_changes.results | default([])) | selectattr('changed') | list | length }}"
-          - "Ports shut down  : {{ (shutdown_changes.results | default([])) | selectattr('changed') | list | length }}"
-          - "Mode             : {{ 'ENFORCE' if shutdown_unused else 'DRY RUN — set shutdown_unused: true to apply shutdowns' }}
+        msg: "{{ inventory_hostname }} - {{ item.item.peer_ip }}: {{ item.stdout[0] }}"
+      loop: "{{ bgp_verify.results }}"
+      loop_control:
+        label: "{{ item.item.peer_ip }}
