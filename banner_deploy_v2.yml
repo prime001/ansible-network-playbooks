@@ -1,141 +1,108 @@
 ---
-# banner_deploy_v3.yml
-# Multi-vendor banner deployment (IOS/IOS-XE, NX-OS, Junos) with
-# pre-change capture, per-platform idempotent push, and rollback on failure.
-#
-# Credentials: store in Ansible Vault — group_vars/all/vault.yml
-#   vault_ansible_user, vault_ansible_password
+# vlan_management.yml
+# Deploys and verifies VLAN definitions on Cisco IOS/IOS-XE switches.
+# Covers create, name, and active-state enforcement across access and distribution tiers.
+# Credentials stored in Ansible Vault — see vars/secrets.yml
 #
 # Inventory example:
-#   [core_routers]
-#   core-rtr-01 ansible_host=10.0.1.1 ansible_network_os=ios
-#   core-rtr-02 ansible_host=10.0.1.2 ansible_network_os=iosxe
+#   [access_switches]
+#   sw-access-01 ansible_host=10.10.1.11 ansible_network_os=ios
+#   sw-access-02 ansible_host=10.10.1.12 ansible_network_os=ios
 #
-#   [distribution]
-#   dist-sw-01 ansible_host=10.0.2.1 ansible_network_os=nxos
+#   [distribution_switches]
+#   sw-dist-01 ansible_host=10.10.1.1 ansible_network_os=ios
 #
-#   [edge]
-#   edge-fw-01 ansible_host=10.0.3.1 ansible_network_os=junos
+#   [switches:children]
+#   access_switches
+#   distribution_switches
 #
-#   [network:children]
-#   core_routers
-#   distribution
-#   edge
+#   [switches:vars]
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_net_user }}
+#   ansible_password={{ vault_net_password }}
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_net_enable }}
 
-- name: Deploy login and MOTD banners across multi-vendor network devices
-  hosts: network
+- name: Deploy and Verify VLAN Configuration on Cisco IOS Switches
+  hosts: switches
   gather_facts: false
-  connection: network_cli
-
   vars:
-    ansible_user: "{{ vault_ansible_user }}"
-    ansible_password: "{{ vault_ansible_password }}"
-    banner_motd: |
-      *********************************************************************
-      *  AUTHORIZED ACCESS ONLY — All activity is logged and monitored.  *
-      *  Unauthorized use is prohibited and subject to prosecution.       *
-      *********************************************************************
-    banner_login: |
-      WARNING: Authorized users only. Disconnect immediately if unauthorized.
-    banner_deployed: false
+    # Encrypt with: ansible-vault encrypt_string --ask-vault-pass 'value' --name 'vault_net_password'
+    vlan_definitions:
+      - { vlan_id: 10,  name: "CORP_DATA",          state: "active" }
+      - { vlan_id: 20,  name: "CORP_VOICE",          state: "active" }
+      - { vlan_id: 30,  name: "CORP_MGMT",           state: "active" }
+      - { vlan_id: 40,  name: "SERVERS",             state: "active" }
+      - { vlan_id: 99,  name: "NATIVE_QUARANTINE",   state: "active" }
+      - { vlan_id: 100, name: "GUEST_WIFI",          state: "active" }
 
   tasks:
-    - name: Capture pre-change banner state (IOS/IOS-XE)
+    - name: Capture VLAN database before changes
       cisco.ios.ios_command:
-        commands: ["show running-config | section banner"]
-      register: pre_banner
-      when: ansible_network_os in ['ios', 'iosxe']
+        commands:
+          - show vlan brief
+      register: vlan_pre_state
       retries: 2
       delay: 5
 
-    - name: Capture pre-change banner state (NX-OS)
-      cisco.nxos.nxos_command:
-        commands: ["show running-config | section banner"]
-      register: pre_banner
-      when: ansible_network_os == 'nxos'
-      retries: 2
-      delay: 5
-
-    - name: Show pre-change banner snapshot
+    - name: Display pre-change VLAN state
       ansible.builtin.debug:
-        msg: "Pre-change on {{ inventory_hostname }}: {{ pre_banner.stdout_lines | default(['(no banner configured)']) }}"
-      when: pre_banner is defined
+        msg: "{{ vlan_pre_state.stdout_lines }}"
 
-    - name: Deploy banners
+    - name: Configure and save VLANs
       block:
-        - name: Push MOTD and login banners (IOS/IOS-XE)
-          cisco.ios.ios_banner:
-            banner: "{{ item.type }}"
-            text: "{{ item.text }}"
-            state: present
-          loop:
-            - { type: motd,  text: "{{ banner_motd }}" }
-            - { type: login, text: "{{ banner_login }}" }
-          when: ansible_network_os in ['ios', 'iosxe']
+        - name: Apply VLAN definitions via ios_vlans
+          cisco.ios.ios_vlans:
+            config:
+              - vlan_id: "{{ item.vlan_id }}"
+                name: "{{ item.name }}"
+                state: "{{ item.state }}"
+            state: merged
+          loop: "{{ vlan_definitions }}"
+          loop_control:
+            label: "VLAN {{ item.vlan_id }} - {{ item.name }}"
+          register: vlan_config_result
 
-        - name: Push MOTD and exec banners (NX-OS)
-          cisco.nxos.nxos_banner:
-            banner: "{{ item.type }}"
-            text: "{{ item.text }}"
-            state: present
-          loop:
-            - { type: motd, text: "{{ banner_motd }}" }
-            - { type: exec, text: "{{ banner_login }}" }
-          when: ansible_network_os == 'nxos'
-
-        - name: Push MOTD and login banners (Junos)
-          junipernetworks.junos.junos_banner:
-            banner: "{{ item.type }}"
-            text: "{{ item.text }}"
-            state: present
-          loop:
-            - { type: motd,  text: "{{ banner_motd }}" }
-            - { type: login, text: "{{ banner_login }}" }
-          when: ansible_network_os == 'junos'
-
-        - name: Mark deployment succeeded
-          ansible.builtin.set_fact:
-            banner_deployed: true
+        - name: Persist running config to startup
+          cisco.ios.ios_config:
+            save_when: changed
 
       rescue:
-        - name: Log failure and attempt rollback
+        - name: Log configuration failure detail
           ansible.builtin.debug:
-            msg: "Banner push FAILED on {{ inventory_hostname }} — removing partial config"
+            msg: >
+              VLAN push failed on {{ inventory_hostname }}:
+              {{ ansible_failed_result.msg | default('no message captured') }}
 
-        - name: Remove partial banners on failure (IOS/IOS-XE)
-          cisco.ios.ios_banner:
-            banner: "{{ item }}"
-            state: absent
-          loop: [motd, login]
-          when: ansible_network_os in ['ios', 'iosxe']
-          ignore_errors: true
-
-        - name: Remove partial banners on failure (NX-OS)
-          cisco.nxos.nxos_banner:
-            banner: "{{ item }}"
-            state: absent
-          loop: [motd, exec]
-          when: ansible_network_os == 'nxos'
-          ignore_errors: true
-
-        - name: Fail with actionable message
+        - name: Abort with clear failure reason
           ansible.builtin.fail:
-            msg: "Banner deployment failed on {{ inventory_hostname }}. Rollback attempted. Review device connectivity and privilege level."
+            msg: "VLAN deployment halted on {{ inventory_hostname }} — review rescue output above."
 
-    - name: Verify banner present in running config (IOS/IOS-XE)
+    - name: Verify each VLAN exists in the database
       cisco.ios.ios_command:
-        commands: ["show running-config | section banner"]
-      register: post_banner
-      failed_when: "'banner' not in post_banner.stdout[0]"
-      when: ansible_network_os in ['ios', 'iosxe'] and banner_deployed
+        commands:
+          - "show vlan id {{ item.vlan_id }}"
+      register: vlan_verify
+      loop: "{{ vlan_definitions }}"
+      loop_control:
+        label: "Verify VLAN {{ item.vlan_id }}"
+      failed_when: "'not found in current VLAN database' in vlan_verify.stdout[0]"
+      retries: 1
+      delay: 3
 
-    - name: Verify banner present in running config (NX-OS)
-      cisco.nxos.nxos_command:
-        commands: ["show running-config | section banner"]
-      register: post_banner
-      failed_when: "'banner' not in post_banner.stdout[0]"
-      when: ansible_network_os == 'nxos' and banner_deployed
+    - name: Capture VLAN database after changes
+      cisco.ios.ios_command:
+        commands:
+          - show vlan brief
+      register: vlan_post_state
 
-    - name: Report deployment result
+    - name: Display post-change VLAN state
       ansible.builtin.debug:
-        msg: "{{ inventory_hostname }} — banner deployment {{ 'VERIFIED OK' if banner_deployed else 'SKIPPED (unsupported OS)' }}
+        msg: "{{ vlan_post_state.stdout_lines }}"
+
+    - name: Summarize results
+      ansible.builtin.debug:
+        msg: >
+          {{ inventory_hostname }}: {{ vlan_definitions | length }} VLANs enforced.
+          Changed={{ vlan_config_result.changed }}.
