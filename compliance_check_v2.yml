@@ -1,123 +1,118 @@
-```yaml
 ---
-# ospf_config.yml
+# vlan_compliance_check.yml
 #
-# Configures OSPF process ID, router-id, network advertisements, passive
-# interfaces, and area 0 MD5 authentication on Cisco IOS routers.
+# Audits VLAN policy compliance on Cisco IOS/IOS-XE access and distribution
+# switches. Verifies required VLANs exist with expected names, the management
+# SVI is operational, and trunk ports are not carrying unintended VLANs.
 #
-# Prerequisites: ansible-galaxy collection install cisco.ios
-# Credentials: store secrets in ansible-vault — see vault_net_* vars below
+# Credentials are stored in Ansible Vault — decrypt at runtime:
+#   ansible-playbook vlan_compliance_check.yml --ask-vault-pass
+#   ansible-playbook vlan_compliance_check.yml --vault-password-file ~/.vault_pass
 #
-# Inventory example:
-#   [core_routers]
-#   r1  ansible_host=10.10.10.1
-#   r2  ansible_host=10.10.10.2
-#
-#   [core_routers:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user={{ vault_net_user }}
-#   ansible_password={{ vault_net_password }}
-#   ansible_become=yes
-#   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_password }}
-#
-# Usage: ansible-playbook ospf_config.yml -i inventory/network.yml --ask-vault-pass
+# Inventory example (inventory/hosts.yml):
+# ---
+# all:
+#   children:
+#     switches:
+#       hosts:
+#         sw-access-01:
+#           ansible_host: 10.0.1.11
+#         sw-dist-01:
+#           ansible_host: 10.0.1.1
+#       vars:
+#         ansible_network_os: ios
+#         ansible_connection: network_cli
+#         ansible_user: "{{ vault_net_user }}"
+#         ansible_password: "{{ vault_net_pass }}"
+#         ansible_become: true
+#         ansible_become_method: enable
+#         ansible_become_pass: "{{ vault_enable_pass }}"
 
-- name: Configure OSPF Routing Protocol on Core Routers
-  hosts: core_routers
+- name: VLAN Compliance Audit — Cisco IOS/IOS-XE
+  hosts: switches
   gather_facts: false
+
   vars:
-    # ansible-vault encrypt_string 'admin' --name 'vault_net_user'
-    ospf_process_id: 1
-    ospf_reference_bandwidth: 10000
-    ospf_area0_auth: true
-    ospf_networks:
-      - { prefix: "10.0.0.0",    wildcard: "0.0.255.255", area: 0 }
-      - { prefix: "192.168.0.0", wildcard: "0.0.255.255", area: 1 }
-    ospf_passive_interfaces:
-      - GigabitEthernet0/2
-      - Loopback0
+    required_vlans:
+      - { id: "10", name: "MGMT" }
+      - { id: "20", name: "SERVERS" }
+      - { id: "30", name: "USERS" }
+      - { id: "40", name: "VOICE" }
+      - { id: "99", name: "NATIVE" }
+    management_vlan: "10"
+    unauthorized_vlans: ["1002", "1003", "1004", "1005"]
 
   tasks:
-    - name: Capture pre-change OSPF state
-      cisco.ios.ios_command:
-        commands:
-          - show ip ospf neighbor
-          - show ip route ospf
-      register: pre_change_state
-      retries: 2
-      delay: 5
-
-    - name: Display pre-change OSPF neighbors and routes
-      ansible.builtin.debug:
-        msg: "{{ pre_change_state.stdout_lines }}"
-
-    - name: Deploy OSPF configuration
+    - name: Collect VLAN and SVI state
       block:
-        - name: Set OSPF global parameters
-          cisco.ios.ios_config:
-            lines:
-              - "router-id {{ ansible_host }}"
-              - "auto-cost reference-bandwidth {{ ospf_reference_bandwidth }}"
-            parents: "router ospf {{ ospf_process_id }}"
-            save_when: changed
-
-        - name: Advertise networks into OSPF areas
-          cisco.ios.ios_config:
-            lines:
-              - "network {{ item.prefix }} {{ item.wildcard }} area {{ item.area }}"
-            parents: "router ospf {{ ospf_process_id }}"
-            save_when: changed
-          loop: "{{ ospf_networks }}"
-
-        - name: Suppress OSPF hellos on stub interfaces
-          cisco.ios.ios_config:
-            lines:
-              - "passive-interface {{ item }}"
-            parents: "router ospf {{ ospf_process_id }}"
-            save_when: changed
-          loop: "{{ ospf_passive_interfaces }}"
-
-        - name: Enable MD5 authentication on backbone area
-          cisco.ios.ios_config:
-            lines:
-              - "area 0 authentication message-digest"
-            parents: "router ospf {{ ospf_process_id }}"
-            save_when: changed
-          when: ospf_area0_auth | bool
-
-        - name: Verify OSPF process is active
+        - name: Gather VLAN database and management SVI
           cisco.ios.ios_command:
             commands:
-              - "show ip ospf | include Router ID"
-          register: ospf_verify
-          failed_when: "'Router ID' not in ospf_verify.stdout[0]"
-          retries: 3
-          delay: 10
+              - show vlan brief
+              - "show interfaces vlan {{ management_vlan }}"
+              - show interfaces trunk
+          register: vlan_data
+          retries: 2
+          delay: 5
+          until: vlan_data is not failed
 
       rescue:
-        - name: Log OSPF deployment failure
+        - name: Flag collection failure for this host
+          ansible.builtin.set_fact:
+            collection_failed: true
+
+        - name: Warn on unreachable device
           ansible.builtin.debug:
-            msg: >
-              OSPF configuration failed on {{ inventory_hostname }}:
-              {{ ansible_failed_result.msg | default('see device logs') }}
+            msg: "WARNING: Could not collect VLAN data from {{ inventory_hostname }} — skipping compliance checks"
 
-        - name: Halt play for this host
-          ansible.builtin.fail:
-            msg: "OSPF deployment failed on {{ inventory_hostname }} — manual review required"
+    - name: Assert required VLANs are present
+      ansible.builtin.assert:
+        that:
+          - "item.id in vlan_data.stdout[0]"
+          - "item.name in vlan_data.stdout[0]"
+        fail_msg: "FAIL [{{ inventory_hostname }}] VLAN {{ item.id }} ({{ item.name }}) missing or misnamed"
+        success_msg: "PASS [{{ inventory_hostname }}] VLAN {{ item.id }} ({{ item.name }}) present"
+      loop: "{{ required_vlans }}"
+      when: collection_failed is not defined
+      ignore_errors: true
+      register: vlan_presence_results
 
-    - name: Capture post-change OSPF state
-      cisco.ios.ios_command:
-        commands:
-          - show ip ospf neighbor
-          - show ip ospf interface brief
-      register: post_change_state
+    - name: Assert management SVI is line-protocol up
+      ansible.builtin.assert:
+        that:
+          - "'line protocol is up' in vlan_data.stdout[1]"
+        fail_msg: "FAIL [{{ inventory_hostname }}] Management SVI vlan{{ management_vlan }} is down"
+        success_msg: "PASS [{{ inventory_hostname }}] Management SVI vlan{{ management_vlan }} is up"
+      when: collection_failed is not defined
+      ignore_errors: true
+      register: svi_result
 
-    - name: Display post-change OSPF summary
+    - name: Assert legacy/default VLANs absent from trunk allowed list
+      ansible.builtin.assert:
+        that:
+          - "item not in vlan_data.stdout[2]"
+        fail_msg: "FAIL [{{ inventory_hostname }}] Unauthorized VLAN {{ item }} found in trunk output"
+        success_msg: "PASS [{{ inventory_hostname }}] Unauthorized VLAN {{ item }} not active on trunks"
+      loop: "{{ unauthorized_vlans }}"
+      when: collection_failed is not defined
+      ignore_errors: true
+      register: trunk_results
+
+    - name: Print per-device compliance summary
       ansible.builtin.debug:
         msg:
-          - "Device     : {{ inventory_hostname }}"
-          - "Neighbors  : {{ post_change_state.stdout_lines[0] }}"
-          - "Interfaces : {{ post_change_state.stdout_lines[1] }}"
-```
+          - "========================================="
+          - "VLAN Compliance Report — {{ inventory_hostname }}"
+          - "========================================="
+          - "Required VLANs : {{ vlan_presence_results.results | selectattr('failed','equalto',false) | list | length }} passed / {{ vlan_presence_results.results | selectattr('failed','equalto',true) | list | length }} failed"
+          - "Management SVI : {{ 'PASS' if not svi_result.failed | default(false) else 'FAIL' }}"
+          - "Trunk hygiene  : {{ trunk_results.results | selectattr('failed','equalto',false) | list | length }} passed / {{ trunk_results.results | selectattr('failed','equalto',true) | list | length }} failed"
+          - "Overall        : {{ 'NON-COMPLIANT' if (vlan_presence_results.results | selectattr('failed','equalto',true) | list | length > 0) or (svi_result.failed | default(false)) or (trunk_results.results | selectattr('failed','equalto',true) | list | length > 0) else 'COMPLIANT' }}"
+      when: collection_failed is not defined
+
+    - name: Dump raw VLAN table when failures detected
+      ansible.builtin.debug:
+        var: vlan_data.stdout_lines[0]
+      when:
+        - collection_failed is not defined
+        - vlan_presence_results.results | selectattr('failed','equalto',true) | list | length > 0
