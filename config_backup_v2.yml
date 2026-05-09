@@ -1,128 +1,104 @@
+The ansible-network-playbooks repo isn't local — generating the playbook content directly.
+
 ---
-# config_diff_backup.yml
+# ios_archive_config.yml
 #
-# Incremental configuration backup with change detection.
-# Pulls running-config from IOS/IOS-XE devices, compares against the
-# most recent archive, and writes a new timestamped file only when the
-# config has changed. Produces a per-host diff summary at the end.
+# Configure IOS on-device config archive feature for automatic local versioning.
+# Each 'write memory' event snapshots the running config to flash, retaining up
+# to archive_max_versions timestamped copies on the device itself.
+#
+# Complements external backup playbooks (config_backup.yml) by adding device-side
+# version history without requiring controller reachability at backup time.
+#
+# Requirements: ansible-galaxy collection install cisco.ios
+# Credentials:  vault_net_user / vault_net_pass — encrypt with:
+#               ansible-vault encrypt_string 'password' --name 'vault_net_pass'
 #
 # Inventory example:
-#   [core_switches]
-#   sw-core-01 ansible_host=10.0.1.1
-#   sw-core-02 ansible_host=10.0.1.2
-#
-#   [core_switches:vars]
+#   [ios_routers]
+#   rtr-core-01  ansible_host=10.0.1.1
+#   rtr-edge-01  ansible_host=10.0.1.2
+#   [ios_routers:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_user={{ vault_net_user }}       # ansible-vault encrypted
-#   ansible_password={{ vault_net_pass }}
-#   ansible_become=yes
-#   ansible_become_method=enable
-#   ansible_become_pass={{ vault_enable_pass }}
-#
-# Usage:
-#   ansible-playbook config_diff_backup.yml -i inventory.yml --ask-vault-pass
-#   ansible-playbook config_diff_backup.yml -i inventory.yml -e "backup_root=/mnt/nfs/configs"
+#   ansible_user=!vault | <see group_vars/all/vault.yml>
+#   ansible_password=!vault | <see group_vars/all/vault.yml>
 
-- name: Incremental config backup with change detection
-  hosts: core_switches
+- name: Configure IOS on-device config archive
+  hosts: ios_routers
   gather_facts: false
-  serial: 10
-
   vars:
-    backup_root: "{{ playbook_dir }}/backups"
-    timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
-    host_backup_dir: "{{ backup_root }}/{{ inventory_hostname }}"
-    latest_link: "{{ host_backup_dir }}/latest.cfg"
-    new_backup: "{{ host_backup_dir }}/{{ timestamp }}.cfg"
+    ansible_user: "{{ vault_net_user }}"
+    ansible_password: "{{ vault_net_pass }}"
+    archive_path: "flash:/archive/cfg"
+    archive_max_versions: 14
+    archive_time_period: 1440
 
   tasks:
-    - name: Ensure per-host backup directory exists
-      ansible.builtin.file:
-        path: "{{ host_backup_dir }}"
-        state: directory
-        mode: "0750"
-      delegate_to: localhost
+    - name: Verify device is reachable and running IOS
+      cisco.ios.ios_command:
+        commands:
+          - show version | include Cisco IOS
+      register: ios_check
+      retries: 3
+      delay: 10
+      until: ios_check is not failed
 
-    - name: Pull running configuration
+    - name: Apply archive configuration
       block:
-        - name: Fetch running-config
-          cisco.ios.ios_command:
-            commands: show running-config
-          register: running_cfg
-          retries: 3
-          delay: 5
-          until: running_cfg is not failed
+        - name: Configure archive stanza
+          cisco.ios.ios_config:
+            lines:
+              - "path {{ archive_path }}"
+              - "maximum {{ archive_max_versions }}"
+              - "time-period {{ archive_time_period }}"
+              - "write-memory"
+            parents: archive
+          register: archive_result
+
+        - name: Write to startup config when changed
+          cisco.ios.ios_config:
+            save_when: changed
+          when: archive_result.changed
 
       rescue:
-        - name: Log fetch failure and continue
+        - name: Log failure details
           ansible.builtin.debug:
-            msg: "WARN: Could not retrieve running-config from {{ inventory_hostname }} — skipping."
-        - name: Mark host as failed non-fatally
-          ansible.builtin.set_fact:
-            fetch_failed: true
+            msg: "Archive setup failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown') }}"
 
-    - name: Proceed only when config was retrieved
-      when: not (fetch_failed | default(false))
-      block:
-        - name: Write candidate config to temp file
-          ansible.builtin.copy:
-            content: "{{ running_cfg.stdout[0] }}"
-            dest: "{{ new_backup }}.tmp"
-            mode: "0640"
-          delegate_to: localhost
+        - name: Abort play for this host
+          ansible.builtin.fail:
+            msg: "Archive configuration failed on {{ inventory_hostname }} — check flash space and privilege level"
 
-        - name: Check whether a previous backup exists
-          ansible.builtin.stat:
-            path: "{{ latest_link }}"
-          register: latest_stat
-          delegate_to: localhost
+    - name: Confirm archive stanza present in running config
+      cisco.ios.ios_command:
+        commands:
+          - show running-config | section ^archive
+      register: archive_verify
+      failed_when: "'path' not in archive_verify.stdout[0]"
 
-        - name: Diff candidate against latest backup
-          ansible.builtin.command:
-            cmd: diff "{{ latest_link }}" "{{ new_backup }}.tmp"
-          register: cfg_diff
-          failed_when: cfg_diff.rc > 1          # rc=0 no change, rc=1 changed, rc>1 error
-          changed_when: false
-          when: latest_stat.stat.exists
-          delegate_to: localhost
+    - name: Trigger immediate archive snapshot
+      cisco.ios.ios_command:
+        commands:
+          - archive config
+      register: snapshot
+      ignore_errors: true
 
-        - name: Determine whether config changed
-          ansible.builtin.set_fact:
-            config_changed: >-
-              {{ not latest_stat.stat.exists or (cfg_diff.rc | default(1)) == 1 }}
+    - name: Retrieve archive file list from device
+      cisco.ios.ios_command:
+        commands:
+          - show archive
+      register: archive_log
+      ignore_errors: true
 
-        - name: Promote temp file to timestamped backup (config changed)
-          ansible.builtin.command:
-            cmd: mv "{{ new_backup }}.tmp" "{{ new_backup }}"
-          delegate_to: localhost
-          when: config_changed
-
-        - name: Update latest symlink
-          ansible.builtin.file:
-            src: "{{ new_backup }}"
-            dest: "{{ latest_link }}"
-            state: link
-            force: true
-          delegate_to: localhost
-          when: config_changed
-
-        - name: Remove temp file (no change detected)
-          ansible.builtin.file:
-            path: "{{ new_backup }}.tmp"
-            state: absent
-          delegate_to: localhost
-          when: not config_changed
-
-        - name: Report per-host result
-          ansible.builtin.debug:
-            msg: >-
-              {{ inventory_hostname }}:
-              {% if config_changed %}
-              CONFIG CHANGED — saved {{ new_backup }}
-              {% if latest_stat.stat.exists %}
-              Diff ({{ cfg_diff.stdout_lines | length }} line(s) differ)
-              {% endif %}
-              {% else %}
-              no change since last backup
-              {% endif %}
+    - name: Report outcome per device
+      ansible.builtin.debug:
+        msg:
+          - "Host         : {{ inventory_hostname }}"
+          - "Archive path : {{ archive_path }}"
+          - "Max versions : {{ archive_max_versions }}"
+          - "Time period  : {{ archive_time_period }} min"
+          - "Config saved : {{ archive_result.changed }}"
+          - "Snapshot     : {{ 'created' if snapshot is not failed else 'failed — check flash space' }}"
+          - "Archive list :"
+          - "{{ archive_log.stdout[0] | default('unavailable') }}
