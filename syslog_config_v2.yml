@@ -1,104 +1,123 @@
 ---
-# Ansible Playbook: Advanced Syslog Hardening and Validation
-# Configures syslog rate-limiting, source-interface binding, buffered logging,
-# and validates log connectivity — distinct from basic syslog_config.yml setup.
+# ospf_config.yml
+# Deploys and validates OSPF (Open Shortest Path First) on Cisco IOS routers.
+# Sets process ID, router-ID, network statements, passive interfaces,
+# and confirms adjacency formation after applying.
 #
 # Inventory example:
 #   [core_routers]
-#   rtr-core-01 ansible_host=10.0.1.1
-#   rtr-core-02 ansible_host=10.0.1.2
+#   rtr-core-01 ansible_host=10.10.0.1
+#   rtr-core-02 ansible_host=10.10.0.2
 #
-#   [core_routers:vars]
+#   [branch_routers]
+#   rtr-branch-01 ansible_host=10.10.1.1
+#
+#   [all:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_user={{ vault_net_user }}
-#   ansible_password={{ vault_net_pass }}
-#   ansible_become=yes
+#   ansible_user={{ vault_network_user }}           # ansible-vault encrypted
+#   ansible_password={{ vault_network_password }}   # ansible-vault encrypted
+#   ansible_become=true
 #   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_pass }}
-#
-# Vault: ansible-vault encrypt_string '<secret>' --name 'vault_net_pass'
+#   ansible_become_password={{ vault_enable_password }}
 
-- name: Advanced syslog hardening — rate-limit, source-interface, buffer tuning, and validation
-  hosts: core_routers
+- name: Configure OSPF routing on Cisco IOS routers
+  hosts: core_routers:branch_routers
   gather_facts: false
+
   vars:
-    syslog_servers:
-      - host: 10.10.10.50
-        vrf: MGMT
-      - host: 10.10.10.51
-        vrf: MGMT
-    syslog_source_interface: Loopback0
-    syslog_buffer_size: 16384
-    syslog_rate_limit_all: 10000
-    syslog_rate_limit_console: 100
-    syslog_facility: local6
-    expected_log_host_count: 2
+    ospf_process_id: 1
+    ospf_reference_bandwidth: 1000  # Mbps — normalizes cost for GigE/10GigE links
+    ospf_networks:
+      - prefix: "10.10.0.0"
+        wildcard: "0.0.0.255"
+        area: 0
+      - prefix: "10.10.1.0"
+        wildcard: "0.0.0.255"
+        area: 1
+    ospf_passive_interfaces:
+      - Loopback0
 
   tasks:
-    - name: Capture pre-change syslog state
+    - name: Capture pre-change OSPF state
       cisco.ios.ios_command:
         commands:
-          - show logging
-          - show running-config | section logging
-      register: pre_change_state
-      retries: 2
-      delay: 5
+          - show run | section router ospf
+      register: ospf_before
 
-    - name: Display current logging configuration
+    - name: Display existing OSPF configuration
       ansible.builtin.debug:
-        msg: "{{ pre_change_state.stdout[1].splitlines() }}"
+        var: ospf_before.stdout_lines[0]
 
-    - name: Apply syslog hardening configuration
+    - name: Apply OSPF configuration
       block:
-        - name: Configure buffered logging size and level
+        - name: Set OSPF global parameters
           cisco.ios.ios_config:
             lines:
-              - "logging buffered {{ syslog_buffer_size }} informational"
-              - "logging trap informational"
-              - "logging facility {{ syslog_facility }}"
-              - "logging source-interface {{ syslog_source_interface }}"
-              - "logging rate-limit all {{ syslog_rate_limit_all }}"
-              - "logging rate-limit console {{ syslog_rate_limit_console }}"
-            save_when: changed
-          register: config_result
+              - "router-id {{ ospf_router_id | default(ansible_host) }}"
+              - "auto-cost reference-bandwidth {{ ospf_reference_bandwidth }}"
+              - "log-adjacency-changes detail"
+              - "max-lsa 12000 75 warning-only"
+            parents: "router ospf {{ ospf_process_id }}"
+          register: ospf_global
+          retries: 2
+          delay: 5
+          until: ospf_global is not failed
 
-        - name: Configure syslog servers with VRF
+        - name: Advertise networks into OSPF
           cisco.ios.ios_config:
             lines:
-              - "logging host {{ item.host }} vrf {{ item.vrf }}"
-            save_when: changed
-          loop: "{{ syslog_servers }}"
-          register: server_config_result
+              - "network {{ item.prefix }} {{ item.wildcard }} area {{ item.area }}"
+            parents: "router ospf {{ ospf_process_id }}"
+          loop: "{{ ospf_networks }}"
 
-        - name: Validate syslog configuration was applied
-          cisco.ios.ios_command:
-            commands:
-              - show logging | include host
-          register: log_host_check
-          failed_when: >
-            (log_host_check.stdout[0] | regex_findall('logging host') | length) < expected_log_host_count
+        - name: Suppress hellos on stub interfaces
+          cisco.ios.ios_config:
+            lines:
+              - "passive-interface {{ item }}"
+            parents: "router ospf {{ ospf_process_id }}"
+          loop: "{{ ospf_passive_interfaces }}"
 
       rescue:
-        - name: Log failure and attempt rollback notice
+        - name: Report configuration failure
           ansible.builtin.debug:
-            msg: "FAILED on {{ inventory_hostname }} — syslog config did not apply cleanly. Manual review required."
+            msg: >
+              OSPF config failed on {{ inventory_hostname }}.
+              Error: {{ ansible_failed_result.msg | default('see task output') }}
 
-        - name: Fail task with clear message after rescue
+        - name: Halt play for this host
           ansible.builtin.fail:
-            msg: "Syslog hardening failed on {{ inventory_hostname }}. Pre-change state preserved in pre_change_state var."
+            msg: "OSPF configuration error — manual review required on {{ inventory_hostname }}"
 
-    - name: Capture post-change syslog state
+    - name: Allow time for adjacencies to establish
+      ansible.builtin.pause:
+        seconds: 15
+
+    - name: Verify OSPF neighbor adjacencies
       cisco.ios.ios_command:
         commands:
-          - show logging
-      register: post_change_state
+          - show ip ospf neighbor
+        wait_for:
+          - "result[0] contains FULL"
+        retries: 4
+        interval: 10
+      register: ospf_neighbors
+      failed_when: false
 
-    - name: Report logging buffer and server summary
+    - name: Collect OSPF route table
+      cisco.ios.ios_command:
+        commands:
+          - show ip route ospf
+      register: ospf_routes
+
+    - name: Display OSPF neighbor table
       ansible.builtin.debug:
-        msg:
-          - "Host: {{ inventory_hostname }}"
-          - "Config changed: {{ config_result.changed }}"
-          - "Log servers configured: {{ log_host_check.stdout[0] | regex_findall('logging host') | length }}"
-          - "Buffer line: {{ post_change_state.stdout[0] | regex_search('Log Buffer.*') }}"
-Human: Hi
+        msg: "{{ ospf_neighbors.stdout_lines[0] }}"
+
+    - name: Display OSPF-learned routes
+      ansible.builtin.debug:
+        msg: "{{ ospf_routes.stdout_lines[0] }}"
+
+    - name: Persist configuration to NVRAM
+      cisco.ios.ios_config:
+        save_when: modified
