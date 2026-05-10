@@ -1,158 +1,118 @@
 ```yaml
 ---
-# AAA Authentication and TACACS+/RADIUS Server Configuration
-# Centralized user authentication, authorization, and accounting
-# for enterprise network device access control and compliance logging.
+# aaa_config.yml
+# Configures AAA (Authentication, Authorization, Accounting) on Cisco IOS devices.
+# Sets up TACACS+ server groups, authentication, authorization, and accounting policies
+# for centralized identity management — companion to local user_management playbooks.
 #
-# Supports: Cisco IOS, IOS-XR, NX-OS, Junos platforms
-# Use Cases: Enterprise AAA integration, compliance audit trails,
-#           centralized user management, privilege authorization
+# Credentials: store the following in Ansible Vault (ansible-vault encrypt vault.yml):
+#   vault_ansible_user, vault_ansible_password, vault_ansible_become_pass,
+#   vault_tacacs_key
 #
-# Inventory Example:
-# [network_devices]
-# router1 ansible_host=10.1.1.1 device_type=ios
-# switch1 ansible_host=10.1.1.2 device_type=nxos
-# [group_vars/network_devices.yml]:
-#   tacacs_key: !vault |encrypted_tacacs_secret
-#   radius_key: !vault |encrypted_radius_secret
+# Inventory example:
+#   [core_switches]
+#   sw-core-01  ansible_host=10.10.1.1
+#   sw-core-02  ansible_host=10.10.1.2
+#
+#   [core_switches:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_become=yes
+#   ansible_become_method=enable
 
-- name: Configure AAA Servers and User Authentication
-  hosts: network_devices
-  gather_facts: no
-  
+- name: Configure AAA centralized authentication on IOS devices
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
   vars:
-    tacacs_servers:
-      - host: 10.100.1.10
-        port: 49
-      - host: 10.100.1.11
-        port: 49
-    radius_servers:
-      - host: 10.100.2.10
-        port: 1812
-      - host: 10.100.2.11
-        port: 1812
-    enable_accounting: true
-    timeout_seconds: 5
+    ansible_user: "{{ vault_ansible_user }}"
+    ansible_password: "{{ vault_ansible_password }}"
+    ansible_become_pass: "{{ vault_ansible_become_pass }}"
+    tacacs_primary: "{{ vault_tacacs_primary | default('10.0.100.10') }}"
+    tacacs_secondary: "{{ vault_tacacs_secondary | default('10.0.100.11') }}"
+    tacacs_key: "{{ vault_tacacs_key }}"
+    tacacs_timeout: 5
 
   tasks:
-    - name: Configure TACACS+ servers
-      ios_config:
-        lines:
-          - "tacacs-server host {{ item.host }} port {{ item.port }} key {{ tacacs_key }}"
-          - "tacacs-server timeout {{ timeout_seconds }}"
-        parents: ""
-        match: line
-      loop: "{{ tacacs_servers }}"
-      register: tacacs_result
-      retries: 2
-      delay: 5
-      failed_when:
-        - tacacs_result is failed
-        - "'invalid' not in tacacs_result.msg | lower"
-      rescue:
-        - name: Log TACACS+ configuration failure
-          debug:
-            msg: "TACACS+ server config failed for {{ item.host }}: {{ tacacs_result.msg }}"
-
-    - name: Configure RADIUS servers
-      ios_config:
-        lines:
-          - "radius-server host {{ item.host }} auth-port {{ item.port }} key {{ radius_key }}"
-          - "radius-server timeout {{ timeout_seconds }}"
-        parents: ""
-        match: line
-      loop: "{{ radius_servers }}"
-      register: radius_result
-      retries: 2
-      delay: 5
-      failed_when:
-        - radius_result is failed
-        - "'invalid' not in radius_result.msg | lower"
-      rescue:
-        - name: Log RADIUS configuration failure
-          debug:
-            msg: "RADIUS server config failed for {{ item.host }}: {{ radius_result.msg }}"
-
-    - name: Configure AAA authentication
-      ios_config:
-        lines:
-          - "aaa new-model"
-          - "aaa authentication login default group tacacs+ group radius local"
-          - "aaa authentication enable default group tacacs+ enable"
-        parents: ""
-        match: exact
-      register: aaa_auth
-      retries: 2
-      delay: 5
-      rescue:
-        - name: Log AAA authentication configuration failure
-          debug:
-            msg: "AAA authentication config failed: {{ aaa_auth.msg }}"
-
-    - name: Configure AAA authorization
-      ios_config:
-        lines:
-          - "aaa authorization exec default group tacacs+ local"
-          - "aaa authorization commands 1 default group tacacs+ local"
-          - "aaa authorization commands 15 default group tacacs+ local"
-        parents: ""
-        match: exact
-      register: aaa_authz
-      retries: 2
-      delay: 5
-      rescue:
-        - name: Log AAA authorization configuration failure
-          debug:
-            msg: "AAA authorization config failed: {{ aaa_authz.msg }}"
-
-    - name: Configure AAA accounting
-      ios_config:
-        lines:
-          - "aaa accounting exec default start-stop group tacacs+ local"
-          - "aaa accounting commands 1 default start-stop group tacacs+ local"
-          - "aaa accounting commands 15 default start-stop group tacacs+ local"
-        parents: ""
-        match: exact
-      when: enable_accounting | bool
-      register: aaa_acct
-      retries: 2
-      delay: 5
-      rescue:
-        - name: Log AAA accounting configuration failure
-          debug:
-            msg: "AAA accounting config failed: {{ aaa_acct.msg }}"
-
-    - name: Verify AAA and server configuration
-      ios_command:
+    - name: Confirm device is reachable before modifying authentication
+      cisco.ios.ios_command:
         commands:
-          - "show aaa servers"
-          - "show running-config | include aaa"
-      register: aaa_verify
+          - show clock
+      register: reachability_check
+      retries: 3
+      delay: 5
+      until: reachability_check is not failed
+
+    - name: Apply AAA configuration
+      block:
+        - name: Configure TACACS+ servers and AAA policies
+          cisco.ios.ios_config:
+            lines:
+              - "tacacs server TACACS-PRIMARY"
+              - " address ipv4 {{ tacacs_primary }}"
+              - " key {{ tacacs_key }}"
+              - " timeout {{ tacacs_timeout }}"
+              - "tacacs server TACACS-SECONDARY"
+              - " address ipv4 {{ tacacs_secondary }}"
+              - " key {{ tacacs_key }}"
+              - " timeout {{ tacacs_timeout }}"
+              - "aaa group server tacacs+ TACACS-SERVERS"
+              - " server name TACACS-PRIMARY"
+              - " server name TACACS-SECONDARY"
+              - "aaa authentication login default group TACACS-SERVERS local"
+              - "aaa authentication enable default group TACACS-SERVERS enable"
+              - "aaa authorization exec default group TACACS-SERVERS local if-authenticated"
+              - "aaa authorization commands 15 default group TACACS-SERVERS local if-authenticated"
+              - "aaa accounting exec default start-stop group TACACS-SERVERS"
+              - "aaa accounting commands 15 default start-stop group TACACS-SERVERS"
+          register: aaa_config_result
+          notify: Save running config
+
+        - name: Validate TACACS+ server reachability
+          cisco.ios.ios_command:
+            commands:
+              - show tacacs
+          register: tacacs_status
+          failed_when: >
+            tacacs_primary not in tacacs_status.stdout[0] and
+            tacacs_secondary not in tacacs_status.stdout[0]
+
+        - name: Display TACACS+ server status
+          ansible.builtin.debug:
+            msg: "{{ inventory_hostname }} TACACS+ state: {{ tacacs_status.stdout_lines[0] }}"
+
+      rescue:
+        - name: Report AAA configuration failure
+          ansible.builtin.debug:
+            msg: >
+              AAA config failed on {{ inventory_hostname }}.
+              Local fallback remains active via 'local' keyword in auth lines.
+              Failure: {{ ansible_failed_result.msg | default('see task output') }}
+
+        - name: Abort play with actionable message
+          ansible.builtin.fail:
+            msg: "AAA configuration failed on {{ inventory_hostname }} — verify TACACS+ reachability and vault_tacacs_key"
+
+    - name: Collect AAA running config for audit record
+      cisco.ios.ios_command:
+        commands:
+          - show running-config | section aaa
+          - show running-config | section tacacs
+      register: aaa_audit
       retries: 2
       delay: 3
+      until: aaa_audit is not failed
 
-    - name: Display configuration results
-      debug:
-        msg: |
-          Device: {{ inventory_hostname }}
-          TACACS+ Servers Configured: {{ tacacs_result.results | selectattr('changed', 'equalto', true) | length }}
-          RADIUS Servers Configured: {{ radius_result.results | selectattr('changed', 'equalto', true) | length }}
-          AAA Authentication Enabled: {{ aaa_auth.changed }}
-          AAA Authorization Enabled: {{ aaa_authz.changed }}
-          AAA Accounting Enabled: {{ aaa_acct.changed if enable_accounting else 'Disabled' }}
-          Server Status: Verified
+    - name: Display final AAA configuration state
+      ansible.builtin.debug:
+        var: aaa_audit.stdout_lines
 
   handlers:
-    - name: Save configuration to NVRAM
-      ios_command:
+    - name: Save running config
+      cisco.ios.ios_command:
         commands:
-          - "write memory"
-      listen: aaa_configured
-      when: not ansible_check_mode
-
-  post_tasks:
-    - name: Confirm AAA configuration
-      debug:
-        msg: "AAA configuration completed for {{ inventory_hostname }}"
-      when: not ansible_check_mode
+          - write memory
+      register: save_output
+      failed_when:
+        - "'OK' not in save_output.stdout[0]"
+        - "'Building configuration' not in save_output.stdout[0]"
 ```
