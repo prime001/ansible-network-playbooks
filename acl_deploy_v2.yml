@@ -1,137 +1,107 @@
-This is a standalone ACL playbook generation request — writing the YAML directly.
-
-```yaml
 ---
-# acl_deploy_v3.yml
-# Deploy named IPv4 ACLs via the ios_acls resource module with pre-change
-# snapshot and automatic rollback on post-deployment verification failure.
-# Uses "replaced" state for idempotent, diff-aware reconciliation vs the
-# additive ios_config approach used in v1/v2.
-#
-# Vault: encrypt ansible_password in group_vars/
-#   ansible-vault encrypt_string 'secret' --name 'ansible_password'
+# Prefix-List Deployment Playbook
+# Manages BGP route-filter prefix lists on Cisco IOS/IOS-XE devices
 #
 # Inventory example:
-#   [edge_routers]
-#   edge-01  ansible_host=10.0.1.1  ansible_network_os=ios
-#   edge-02  ansible_host=10.0.1.2  ansible_network_os=ios
+#   [routers]
+#   r1 ansible_host=10.0.1.1
+#   r2 ansible_host=10.0.1.2
 #
-#   [edge_routers:vars]
+#   [routers:vars]
+#   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_user=netops
-#   ansible_password=!vault |
-#     $ANSIBLE_VAULT;1.1;AES256
-#     ...
+#   ansible_user={{ vault_net_user }}
+#   ansible_password={{ vault_net_password }}
 #   ansible_become=yes
 #   ansible_become_method=enable
+#   ansible_become_password={{ vault_net_enable }}
+#   # Store credentials with: ansible-vault encrypt_string
 
-- name: Deploy edge ACLs with resource module and automatic rollback
-  hosts: edge_routers
+- name: Deploy BGP prefix lists for route filtering
+  hosts: routers
   gather_facts: false
 
   vars:
-    acl_policy:
-      - name: EDGE_INBOUND
-        acl_type: extended
-        aces:
+    # Credentials sourced from ansible-vault encrypted group_vars
+    net_user: "{{ vault_net_user }}"
+    net_password: "{{ vault_net_password }}"
+
+    prefix_lists:
+      - name: ALLOWED_PREFIXES_IN
+        description: "Inbound BGP routes accepted from peers"
+        entries:
           - sequence: 10
-            grant: permit
-            protocol_options:
-              tcp: true
-            source:
-              any: true
-            destination:
-              address: 203.0.113.0
-              wildcard_bits: 0.0.0.255
-              port_protocol:
-                eq: www
+            action: permit
+            prefix: 10.0.0.0/8
+            ge: 16
+            le: 24
           - sequence: 20
-            grant: permit
-            protocol_options:
-              tcp: true
-            source:
-              any: true
-            destination:
-              address: 203.0.113.0
-              wildcard_bits: 0.0.0.255
-              port_protocol:
-                eq: 443
-          - sequence: 30
-            grant: permit
-            protocol_options:
-              icmp: true
-            source:
-              address: 10.0.0.0
-              wildcard_bits: 0.255.255.255
-            destination:
-              any: true
-          - sequence: 900
-            grant: deny
-            protocol_options:
-              ip: true
-            source:
-              any: true
-            destination:
-              any: true
-            log: true
+            action: permit
+            prefix: 172.16.0.0/12
+            ge: 20
+            le: 28
+          - sequence: 999
+            action: deny
+            prefix: 0.0.0.0/0
+            le: 32
+
+      - name: ALLOWED_PREFIXES_OUT
+        description: "Outbound prefixes advertised to BGP peers"
+        entries:
+          - sequence: 10
+            action: permit
+            prefix: 192.168.100.0/24
+          - sequence: 20
+            action: permit
+            prefix: 192.168.200.0/24
+          - sequence: 999
+            action: deny
+            prefix: 0.0.0.0/0
+            le: 32
 
   tasks:
-    - name: Snapshot ACL state before changes
-      cisco.ios.ios_command:
-        commands:
-          - show ip access-lists
-      register: acl_before
-      retries: 2
-      delay: 3
-
-    - name: Deploy ACL policy with rollback on failure
+    - name: Push prefix lists to device
       block:
-        - name: Push ACLs via resource module (replaced state)
-          cisco.ios.ios_acls:
+        - name: Configure prefix list entries
+          cisco.ios.ios_prefix_lists:
             config:
               - afi: ipv4
-                acls: "{{ acl_policy }}"
-            state: replaced
-          register: acl_push_result
+                prefix_lists:
+                  - name: "{{ item.0.name }}"
+                    description: "{{ item.0.description }}"
+                    entries:
+                      - sequence: "{{ item.1.sequence }}"
+                        action: "{{ item.1.action }}"
+                        prefix: "{{ item.1.prefix }}"
+                        ge: "{{ item.1.ge | default(omit) }}"
+                        le: "{{ item.1.le | default(omit) }}"
+            state: merged
+          loop: "{{ prefix_lists | subelements('entries') }}"
+          loop_control:
+            label: "{{ item.0.name }} seq {{ item.1.sequence }}"
+          register: prefix_result
+          retries: 2
+          delay: 5
+          until: prefix_result is not failed
 
-        - name: Verify each ACL is present after deployment
+        - name: Verify prefix lists are present
           cisco.ios.ios_command:
             commands:
-              - "show ip access-lists {{ item }}"
-          register: acl_verify
+              - "show ip prefix-list summary"
+          register: verify_output
           failed_when: >
-            'Extended IP access list ' + item not in acl_verify.stdout[0]
-          loop: "{{ acl_policy | map(attribute='name') | list }}"
-          retries: 2
-          delay: 3
+            'ALLOWED_PREFIXES_IN' not in verify_output.stdout[0] or
+            'ALLOWED_PREFIXES_OUT' not in verify_output.stdout[0]
 
-        - name: Report deployment summary
+        - name: Display prefix list summary
           ansible.builtin.debug:
-            msg:
-              host: "{{ inventory_hostname }}"
-              changed: "{{ acl_push_result.changed }}"
-              acls_managed: "{{ acl_policy | map(attribute='name') | list }}"
+            msg: "{{ verify_output.stdout_lines[0] }}"
 
       rescue:
-        - name: Log rollback trigger
+        - name: Log failure details
           ansible.builtin.debug:
-            msg: "ACL deploy failed on {{ inventory_hostname }}, removing pushed ACLs"
+            msg: "Prefix list deployment failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
 
-        - name: Remove deployed ACLs to restore prior state
-          cisco.ios.ios_acls:
-            config:
-              - afi: ipv4
-                acls: "{{ acl_policy }}"
-            state: deleted
-          ignore_errors: true
-
-        - name: Fail after rollback attempt
+        - name: Abort play for this host
           ansible.builtin.fail:
-            msg: "Deployment rolled back on {{ inventory_hostname }}"
-
-    - name: Save configuration to NVRAM
-      cisco.ios.ios_command:
-        commands:
-          - write memory
-      when: acl_push_result.changed | default(false)
-```
+            msg: "Prefix list deployment could not complete on {{ inventory_hostname }}. Review device connectivity and BGP config.
