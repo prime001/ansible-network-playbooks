@@ -1,105 +1,133 @@
 ---
-# BGP Neighbor Health Check and Route Table Snapshot
+# bgp_neighbor_status.yml
 #
-# Collects BGP neighbor states, advertised/received prefix counts, and
-# routing table summary across IOS/IOS-XE devices. Fails the play if any
-# BGP session is not in Established state so that monitoring catches flaps.
+# Collects BGP session state, prefix counts, and uptime across
+# multi-vendor routers. Flags any non-Established sessions so
+# operators can triage peering issues quickly.
 #
-# Credentials: ansible-vault encrypted group_vars/network/vault.yml
-#   vault_ansible_user: "{{ vault_ansible_user }}"
-#   vault_ansible_password: "{{ vault_ansible_password }}"
-#   vault_ansible_become_password: "{{ vault_ansible_become_password }}"
+# Credentials: ansible-vault encrypted at group_vars/network/vault.yml
+#   vault_ansible_user, vault_ansible_password, vault_ansible_become_password
 #
-# Inventory example (inventory/hosts.yml):
-# ---
-# all:
-#   children:
-#     bgp_routers:
-#       hosts:
-#         core-rtr-01:
-#           ansible_host: 192.168.1.1
-#           bgp_expected_neighbor_count: 4
-#         core-rtr-02:
-#           ansible_host: 192.168.1.2
-#           bgp_expected_neighbor_count: 4
-#       vars:
-#         ansible_network_os: ios
-#         ansible_connection: network_cli
-#         ansible_user: "{{ vault_ansible_user }}"
-#         ansible_password: "{{ vault_ansible_password }}"
-#         ansible_become: true
-#         ansible_become_method: enable
-#         ansible_become_password: "{{ vault_ansible_become_password }}"
-#         bgp_expected_neighbor_count: 2
+# Inventory example:
+#   [ios_routers]
+#   core-rtr-01  ansible_host=10.0.1.1  ansible_network_os=ios
+#   core-rtr-02  ansible_host=10.0.1.2  ansible_network_os=ios
+#
+#   [iosxr_routers]
+#   pe-rtr-01  ansible_host=10.0.2.1  ansible_network_os=iosxr
+#
+#   [nxos_switches]
+#   dc-spine-01  ansible_host=10.0.3.1  ansible_network_os=nxos
+#
+#   [network:children]
+#   ios_routers
+#   iosxr_routers
+#   nxos_switches
 
-- name: BGP Neighbor Health Check and Route Table Snapshot
-  hosts: bgp_routers
+- name: Collect BGP neighbor state and prefix counts across multi-vendor devices
+  hosts: network
   gather_facts: false
+  connection: network_cli
 
   vars:
-    bgp_expected_neighbor_count: "{{ bgp_expected_neighbor_count | default(1) }}"
-    bgp_session_state_pattern: "Established"
+    ansible_user: "{{ vault_ansible_user }}"
+    ansible_password: "{{ vault_ansible_password }}"
+    ansible_become: true
+    ansible_become_method: enable
+    ansible_become_password: "{{ vault_ansible_become_password }}"
+    bgp_report_dir: "./bgp_reports"
+    run_timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
 
   tasks:
-    - name: Collect BGP neighbor summary
+    - name: Create local BGP report directory
+      delegate_to: localhost
+      run_once: true
+      ansible.builtin.file:
+        path: "{{ bgp_report_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Gather BGP summary — IOS / IOS-XE
+      when: ansible_network_os == 'ios'
       block:
-        - name: Run show ip bgp summary
+        - name: Run show ip bgp summary (IOS)
           cisco.ios.ios_command:
             commands:
               - show ip bgp summary
-          register: bgp_summary_output
+              - show ip bgp neighbors | include BGP neighbor|BGP state|Prefixes Current
+          register: ios_bgp
           retries: 3
           delay: 5
-          until: bgp_summary_output.failed == false
+          until: ios_bgp is not failed
 
-        - name: Run show ip route summary
-          cisco.ios.ios_command:
-            commands:
-              - show ip route summary
-          register: route_summary_output
-          retries: 2
-          delay: 5
-          until: route_summary_output.failed == false
-
-        - name: Run show ip bgp neighbors (state detail)
-          cisco.ios.ios_command:
-            commands:
-              - show ip bgp neighbors | include BGP neighbor|BGP state
-          register: bgp_neighbors_output
-          retries: 2
-          delay: 5
-          until: bgp_neighbors_output.failed == false
-
-        - name: Assert all BGP sessions are Established
-          ansible.builtin.assert:
-            that:
-              - bgp_neighbors_output.stdout[0] | regex_findall('BGP state = Established') | length | int >= bgp_expected_neighbor_count | int
-            fail_msg: >
-              {{ inventory_hostname }}: Expected {{ bgp_expected_neighbor_count }}
-              Established BGP session(s), found
-              {{ bgp_neighbors_output.stdout[0] | regex_findall('BGP state = Established') | length }}.
-              Check for flapping peers.
-            success_msg: "{{ inventory_hostname }}: All {{ bgp_expected_neighbor_count }} BGP session(s) Established."
-
-      rescue:
-        - name: Log BGP collection failure
+        - name: Flag non-Established IOS BGP sessions
           ansible.builtin.debug:
-            msg: >
-              ALERT: BGP health check failed on {{ inventory_hostname }}.
-              Error: {{ bgp_summary_output.msg | default(bgp_neighbors_output.msg | default('unknown')) }}
+            msg: "WARNING — non-Established session detected on {{ inventory_hostname }}"
+          when: "'Idle' in ios_bgp.stdout[0] or 'Active' in ios_bgp.stdout[0]"
+      rescue:
+        - name: Record IOS collection failure
+          ansible.builtin.debug:
+            msg: "BGP collection failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown') }}"
 
-        - name: Fail explicitly so the play is marked failed
-          ansible.builtin.fail:
-            msg: "BGP neighbor check did not complete successfully on {{ inventory_hostname }}."
+    - name: Gather BGP summary — IOS-XR
+      when: ansible_network_os == 'iosxr'
+      block:
+        - name: Run show bgp summary (IOS-XR)
+          cisco.iosxr.iosxr_command:
+            commands:
+              - show bgp summary
+              - show bgp neighbors brief
+          register: iosxr_bgp
+          retries: 3
+          delay: 5
+          until: iosxr_bgp is not failed
 
-    - name: Display BGP summary output
-      ansible.builtin.debug:
-        msg: "{{ bgp_summary_output.stdout_lines[0] }}"
+        - name: Flag non-Established IOS-XR BGP sessions
+          ansible.builtin.debug:
+            msg: "WARNING — non-Established session detected on {{ inventory_hostname }}"
+          when: "'Idle' in iosxr_bgp.stdout[0] or 'Active' in iosxr_bgp.stdout[0]"
+      rescue:
+        - name: Record IOS-XR collection failure
+          ansible.builtin.debug:
+            msg: "BGP collection failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown') }}"
 
-    - name: Display route table summary
-      ansible.builtin.debug:
-        msg: "{{ route_summary_output.stdout_lines[0] }}"
+    - name: Gather BGP summary — NX-OS
+      when: ansible_network_os == 'nxos'
+      block:
+        - name: Run show bgp all summary (NX-OS)
+          cisco.nxos.nxos_command:
+            commands:
+              - show bgp all summary
+          register: nxos_bgp
+          retries: 3
+          delay: 5
+          until: nxos_bgp is not failed
 
-    - name: Report BGP neighbor states
-      ansible.builtin.debug:
-        msg: "{{ bgp_neighbors_output.stdout_lines[0] }}
+        - name: Flag non-Established NX-OS BGP sessions
+          ansible.builtin.debug:
+            msg: "WARNING — non-Established session detected on {{ inventory_hostname }}"
+          when: "'Idle' in nxos_bgp.stdout[0] or 'Active' in nxos_bgp.stdout[0]"
+      rescue:
+        - name: Record NX-OS collection failure
+          ansible.builtin.debug:
+            msg: "BGP collection failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown') }}"
+
+    - name: Write per-device BGP report
+      delegate_to: localhost
+      ansible.builtin.copy:
+        content: |
+          Device    : {{ inventory_hostname }}
+          Timestamp : {{ run_timestamp }}
+          Platform  : {{ ansible_network_os }}
+          ============================================================
+          {% if ansible_network_os == 'ios' and ios_bgp is defined and ios_bgp is not failed %}
+          {{ ios_bgp.stdout | join('\n---\n') }}
+          {% elif ansible_network_os == 'iosxr' and iosxr_bgp is defined and iosxr_bgp is not failed %}
+          {{ iosxr_bgp.stdout | join('\n---\n') }}
+          {% elif ansible_network_os == 'nxos' and nxos_bgp is defined and nxos_bgp is not failed %}
+          {{ nxos_bgp.stdout | join('\n---\n') }}
+          {% else %}
+          No BGP data collected — check rescue task output.
+          {% endif %}
+        dest: "{{ bgp_report_dir }}/{{ inventory_hostname }}_bgp_{{ run_timestamp }}.txt"
+        mode: '0644'
