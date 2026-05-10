@@ -1,114 +1,94 @@
 ---
-# SNMP Trap Configuration Playbook
-# Configures SNMP trap destinations and notification settings on Cisco IOS devices.
-# Complements snmp_config.yml (community/polling) with full trap receiver setup.
+# SNMP Trap Receiver and Notification Category Configuration
 #
-# Inventory example:
-#   [core_routers]
-#   core-rtr-01 ansible_host=10.0.0.1
-#   core-rtr-02 ansible_host=10.0.0.2
+# Configures SNMP trap destinations, source interface, and per-category
+# trap enables on Cisco IOS/IOS-XE devices. Designed to complement
+# snmp_config.yml (community strings, version negotiation) — this playbook
+# manages the trap forwarding pipeline as a separate concern.
 #
-#   [core_routers:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user={{ vault_net_user }}
-#   ansible_password={{ vault_net_password }}
-#   ansible_become=yes
-#   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_password }}
+# Usage:
+#   ansible-playbook snmp_trap_config.yml -i inventory/network.yml --ask-vault-pass
 #
-# Vault: ansible-vault encrypt_string '<secret>' --name 'vault_net_password'
+# Inventory example (inventory/network.yml):
+#   all:
+#     children:
+#       core_routers:
+#         hosts:
+#           core-rtr-01:
+#             ansible_host: 10.0.0.1
+#             ansible_network_os: ios
+#             ansible_connection: network_cli
+#             ansible_user: !vault |
+#               $ANSIBLE_VAULT;1.1;AES256
+#               ...
+#             ansible_password: !vault |
+#               $ANSIBLE_VAULT;1.1;AES256
+#               ...
 
-- name: Configure SNMP trap destinations and notification types
-  hosts: core_routers
+- name: Configure SNMP trap receivers and notification categories
+  hosts: network_devices
   gather_facts: false
 
   vars:
+    # Credentials stored in Ansible Vault — ansible-vault encrypt_string
+    snmp_trap_community: "{{ vault_snmp_trap_community }}"
+    snmp_trap_host: "10.0.1.100"
     snmp_trap_version: "2c"
-    snmp_trap_community: "{{ vault_snmp_trap_community | default('trap-string') }}"
-    snmp_trap_servers:
-      - host: "10.0.10.50"
-        vrf: "MGMT"
-      - host: "10.0.10.51"
-        vrf: "MGMT"
     snmp_source_interface: "Loopback0"
-    snmp_trap_types:
-      - "bgp"
+    snmp_trap_categories:
+      - config
+      - bgp
       - "ospf state-change"
-      - "config"
+      - link
       - "cpu threshold"
-      - "envmon"
-      - "hsrp"
-      - "interface"
-      - "syslog"
+      - memory
 
   tasks:
-    - name: Apply SNMP trap configuration block
+    - name: Configure SNMP trap destinations and notification enables
       block:
-        - name: Configure trap source interface and global trap settings
+        - name: Apply trap receiver, source interface, and per-category enables
           cisco.ios.ios_config:
             lines:
+              - "snmp-server host {{ snmp_trap_host }} version {{ snmp_trap_version }} {{ snmp_trap_community }}"
               - "snmp-server trap-source {{ snmp_source_interface }}"
-              - "snmp-server enable traps"
-            match: line
-          register: trap_global_result
-          retries: 2
-          delay: 5
-          until: trap_global_result is not failed
-
-        - name: Configure individual trap notification types
-          cisco.ios.ios_config:
-            lines:
               - "snmp-server enable traps {{ item }}"
-            match: line
-          loop: "{{ snmp_trap_types }}"
-          register: trap_types_result
-
-        - name: Configure SNMP trap receiver hosts
-          cisco.ios.ios_config:
-            lines:
-              - "snmp-server host {{ item.host }} vrf {{ item.vrf }} version {{ snmp_trap_version }} {{ snmp_trap_community }}"
-            match: line
-          loop: "{{ snmp_trap_servers }}"
-          register: trap_hosts_result
-          retries: 2
+            save_when: changed
+          loop: "{{ snmp_trap_categories }}"
+          register: trap_apply
+          retries: 3
           delay: 5
-          until: trap_hosts_result is not failed
+          until: trap_apply is not failed
 
-        - name: Verify SNMP trap configuration was applied
+        - name: Verify trap receiver appears in running config
           cisco.ios.ios_command:
             commands:
-              - "show snmp host"
-              - "show snmp trap"
-          register: snmp_verify
-          failed_when: >
-            snmp_verify.stdout[0] | length == 0 or
-            'No SNMP' in snmp_verify.stdout[0]
+              - show snmp host
+              - show snmp trap
+          register: snmp_trap_verify
+          failed_when: snmp_trap_verify.stdout[0] is not search(snmp_trap_host)
 
-        - name: Display SNMP trap configuration summary
+        - name: Report trap configuration result
           ansible.builtin.debug:
             msg:
-              - "Host: {{ inventory_hostname }}"
-              - "Trap hosts configured:"
-              - "{{ snmp_verify.stdout[0] }}"
+              - "Device       : {{ inventory_hostname }}"
+              - "Trap receiver: {{ snmp_trap_host }} (SNMPv{{ snmp_trap_version }})"
+              - "Source iface : {{ snmp_source_interface }}"
+              - "Categories   : {{ snmp_trap_categories | join(', ') }}"
+              - "Verification : {{ snmp_trap_verify.stdout[0] }}"
 
       rescue:
-        - name: Log trap configuration failure
+        - name: Log configuration failure details
           ansible.builtin.debug:
-            msg: "SNMP trap configuration failed on {{ inventory_hostname }} — manual review required"
+            msg: >-
+              SNMP trap config failed on {{ inventory_hostname }}.
+              Error: {{ ansible_failed_result.msg | default('see previous task output') }}
 
-        - name: Capture current SNMP state for diagnostics
-          cisco.ios.ios_command:
-            commands:
-              - "show snmp"
-              - "show run | section snmp"
-          register: snmp_diag
+        - name: Remove partial trap host entry to prevent misconfiguration
+          cisco.ios.ios_config:
+            lines:
+              - "no snmp-server host {{ snmp_trap_host }}"
           ignore_errors: true
 
-        - name: Display diagnostic output
-          ansible.builtin.debug:
-            var: snmp_diag.stdout_lines
-
-        - name: Fail task after rescue diagnostics
+        - name: Fail the host after cleanup
           ansible.builtin.fail:
-            msg: "SNMP trap configuration unsuccessful on {{ inventory_hostname }}
+            msg: "SNMP trap configuration was rolled back on {{ inventory_hostname }}.
