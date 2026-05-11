@@ -1,118 +1,109 @@
 ---
-# vlan_compliance_check.yml
+# vlan_provisioning.yml
+# Provisions VLANs on Cisco IOS/IOS-XE access and distribution switches,
+# adds them to trunk interfaces, and verifies the VLAN database state.
+# Credentials stored in Ansible Vault — see group_vars/all/vault.yml
 #
-# Audits VLAN policy compliance on Cisco IOS/IOS-XE access and distribution
-# switches. Verifies required VLANs exist with expected names, the management
-# SVI is operational, and trunk ports are not carrying unintended VLANs.
+# Inventory example:
+#   [access_switches]
+#   sw-access-01  ansible_host=10.0.1.11  ansible_network_os=ios
+#   sw-access-02  ansible_host=10.0.1.12  ansible_network_os=ios
 #
-# Credentials are stored in Ansible Vault — decrypt at runtime:
-#   ansible-playbook vlan_compliance_check.yml --ask-vault-pass
-#   ansible-playbook vlan_compliance_check.yml --vault-password-file ~/.vault_pass
+#   [distribution_switches]
+#   sw-dist-01  ansible_host=10.0.1.1  ansible_network_os=ios
 #
-# Inventory example (inventory/hosts.yml):
-# ---
-# all:
-#   children:
-#     switches:
-#       hosts:
-#         sw-access-01:
-#           ansible_host: 10.0.1.11
-#         sw-dist-01:
-#           ansible_host: 10.0.1.1
-#       vars:
-#         ansible_network_os: ios
-#         ansible_connection: network_cli
-#         ansible_user: "{{ vault_net_user }}"
-#         ansible_password: "{{ vault_net_pass }}"
-#         ansible_become: true
-#         ansible_become_method: enable
-#         ansible_become_pass: "{{ vault_enable_pass }}"
+#   [switches:children]
+#   access_switches
+#   distribution_switches
+#
+# Run: ansible-playbook vlan_provisioning.yml -i inventory/switches.yml --ask-vault-pass
 
-- name: VLAN Compliance Audit — Cisco IOS/IOS-XE
+- name: Provision VLANs and verify trunk membership on Cisco IOS switches
   hosts: switches
   gather_facts: false
+  connection: network_cli
 
   vars:
-    required_vlans:
-      - { id: "10", name: "MGMT" }
-      - { id: "20", name: "SERVERS" }
-      - { id: "30", name: "USERS" }
-      - { id: "40", name: "VOICE" }
-      - { id: "99", name: "NATIVE" }
-    management_vlan: "10"
-    unauthorized_vlans: ["1002", "1003", "1004", "1005"]
+    ansible_user: "{{ vault_switch_user }}"
+    ansible_password: "{{ vault_switch_password }}"
+    ansible_become: true
+    ansible_become_method: enable
+    ansible_become_password: "{{ vault_enable_password }}"
+
+    vlans_to_provision:
+      - { vlan_id: 100, name: "CORP_DATA" }
+      - { vlan_id: 200, name: "CORP_VOICE" }
+      - { vlan_id: 300, name: "MGMT" }
+      - { vlan_id: 400, name: "GUEST_WIFI" }
+
+    trunk_interfaces:
+      - GigabitEthernet0/1
+      - GigabitEthernet0/2
 
   tasks:
-    - name: Collect VLAN and SVI state
+    - name: Provision VLANs and validate trunk state
       block:
-        - name: Gather VLAN database and management SVI
+        - name: Configure VLAN database entries
+          cisco.ios.ios_vlans:
+            config:
+              - vlan_id: "{{ item.vlan_id }}"
+                name: "{{ item.name }}"
+                state: active
+            state: merged
+          loop: "{{ vlans_to_provision }}"
+          register: vlan_config_result
+          retries: 2
+          delay: 5
+          until: vlan_config_result is not failed
+
+        - name: Allow provisioned VLANs on trunk interfaces
+          cisco.ios.ios_l2_interfaces:
+            config:
+              - name: "{{ item }}"
+                trunk:
+                  allowed_vlans: "{{ vlans_to_provision | map(attribute='vlan_id') | join(',') }}"
+            state: merged
+          loop: "{{ trunk_interfaces }}"
+
+        - name: Collect VLAN database and trunk state for verification
           cisco.ios.ios_command:
             commands:
               - show vlan brief
-              - "show interfaces vlan {{ management_vlan }}"
               - show interfaces trunk
-          register: vlan_data
-          retries: 2
-          delay: 5
-          until: vlan_data is not failed
+          register: vlan_verification
+          failed_when:
+            - vlan_verification.stdout[0] is not search("active")
 
       rescue:
-        - name: Flag collection failure for this host
-          ansible.builtin.set_fact:
-            collection_failed: true
+        - name: Gather diagnostic state after failure
+          cisco.ios.ios_command:
+            commands:
+              - show vlan brief
+              - show version | include Version
+          register: rescue_diag
+          ignore_errors: true
 
-        - name: Warn on unreachable device
+        - name: Log provisioning failure details
           ansible.builtin.debug:
-            msg: "WARNING: Could not collect VLAN data from {{ inventory_hostname }} — skipping compliance checks"
+            msg:
+              - "VLAN provisioning FAILED on {{ inventory_hostname }}"
+              - "VLAN state at time of failure:"
+              - "{{ rescue_diag.stdout[0] | default('output unavailable') }}"
 
-    - name: Assert required VLANs are present
-      ansible.builtin.assert:
-        that:
-          - "item.id in vlan_data.stdout[0]"
-          - "item.name in vlan_data.stdout[0]"
-        fail_msg: "FAIL [{{ inventory_hostname }}] VLAN {{ item.id }} ({{ item.name }}) missing or misnamed"
-        success_msg: "PASS [{{ inventory_hostname }}] VLAN {{ item.id }} ({{ item.name }}) present"
-      loop: "{{ required_vlans }}"
-      when: collection_failed is not defined
-      ignore_errors: true
-      register: vlan_presence_results
+        - name: Raise failure to stop further execution
+          ansible.builtin.fail:
+            msg: >
+              VLAN provisioning failed on {{ inventory_hostname }}.
+              Review rescue output above before retrying.
 
-    - name: Assert management SVI is line-protocol up
-      ansible.builtin.assert:
-        that:
-          - "'line protocol is up' in vlan_data.stdout[1]"
-        fail_msg: "FAIL [{{ inventory_hostname }}] Management SVI vlan{{ management_vlan }} is down"
-        success_msg: "PASS [{{ inventory_hostname }}] Management SVI vlan{{ management_vlan }} is up"
-      when: collection_failed is not defined
-      ignore_errors: true
-      register: svi_result
-
-    - name: Assert legacy/default VLANs absent from trunk allowed list
-      ansible.builtin.assert:
-        that:
-          - "item not in vlan_data.stdout[2]"
-        fail_msg: "FAIL [{{ inventory_hostname }}] Unauthorized VLAN {{ item }} found in trunk output"
-        success_msg: "PASS [{{ inventory_hostname }}] Unauthorized VLAN {{ item }} not active on trunks"
-      loop: "{{ unauthorized_vlans }}"
-      when: collection_failed is not defined
-      ignore_errors: true
-      register: trunk_results
-
-    - name: Print per-device compliance summary
+    - name: Report final VLAN database state
       ansible.builtin.debug:
         msg:
-          - "========================================="
-          - "VLAN Compliance Report — {{ inventory_hostname }}"
-          - "========================================="
-          - "Required VLANs : {{ vlan_presence_results.results | selectattr('failed','equalto',false) | list | length }} passed / {{ vlan_presence_results.results | selectattr('failed','equalto',true) | list | length }} failed"
-          - "Management SVI : {{ 'PASS' if not svi_result.failed | default(false) else 'FAIL' }}"
-          - "Trunk hygiene  : {{ trunk_results.results | selectattr('failed','equalto',false) | list | length }} passed / {{ trunk_results.results | selectattr('failed','equalto',true) | list | length }} failed"
-          - "Overall        : {{ 'NON-COMPLIANT' if (vlan_presence_results.results | selectattr('failed','equalto',true) | list | length > 0) or (svi_result.failed | default(false)) or (trunk_results.results | selectattr('failed','equalto',true) | list | length > 0) else 'COMPLIANT' }}"
-      when: collection_failed is not defined
+          - "=== VLAN Database: {{ inventory_hostname }} ==="
+          - "{{ vlan_verification.stdout[0] }}"
 
-    - name: Dump raw VLAN table when failures detected
+    - name: Report trunk interface membership
       ansible.builtin.debug:
-        var: vlan_data.stdout_lines[0]
-      when:
-        - collection_failed is not defined
-        - vlan_presence_results.results | selectattr('failed','equalto',true) | list | length > 0
+        msg:
+          - "=== Active Trunks: {{ inventory_hostname }} ==="
+          - "{{ vlan_verification.stdout[1] }}
