@@ -1,123 +1,117 @@
 ---
-# ospf_config.yml
-# Deploys and validates OSPF (Open Shortest Path First) on Cisco IOS routers.
-# Sets process ID, router-ID, network statements, passive interfaces,
-# and confirms adjacency formation after applying.
+# syslog_audit.yml
+# Audits existing syslog configuration on Cisco IOS devices — verifies
+# expected servers are present, buffer size meets policy, and severity
+# level is set correctly. Read-only: no config changes are made.
+#
+# Credentials: ansible-vault encrypted group_vars/network/vault.yml
+#   vault_net_username, vault_net_password, vault_net_enable
 #
 # Inventory example:
-#   [core_routers]
-#   rtr-core-01 ansible_host=10.10.0.1
-#   rtr-core-02 ansible_host=10.10.0.2
+#   [core_switches]
+#   sw-core-01 ansible_host=10.0.1.1
+#   sw-core-02 ansible_host=10.0.1.2
 #
-#   [branch_routers]
-#   rtr-branch-01 ansible_host=10.10.1.1
+#   [distribution]
+#   dist-01 ansible_host=10.0.2.1
 #
-#   [all:vars]
+#   [core_switches:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_user={{ vault_network_user }}           # ansible-vault encrypted
-#   ansible_password={{ vault_network_password }}   # ansible-vault encrypted
-#   ansible_become=true
-#   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_password }}
 
-- name: Configure OSPF routing on Cisco IOS routers
-  hosts: core_routers:branch_routers
+- name: Syslog Configuration Audit — Verify servers, buffer, and severity
+  hosts: "{{ target_hosts | default('all') }}"
   gather_facts: false
 
   vars:
-    ospf_process_id: 1
-    ospf_reference_bandwidth: 1000  # Mbps — normalizes cost for GigE/10GigE links
-    ospf_networks:
-      - prefix: "10.10.0.0"
-        wildcard: "0.0.0.255"
-        area: 0
-      - prefix: "10.10.1.0"
-        wildcard: "0.0.0.255"
-        area: 1
-    ospf_passive_interfaces:
-      - Loopback0
+    # Override at runtime: -e required_syslog_servers='["10.100.1.50","10.100.1.51"]'
+    required_syslog_servers:
+      - "10.100.1.50"
+      - "10.100.1.51"
+    required_buffer_size: 16384
+    required_severity: "informational"
+    ansible_user: "{{ vault_net_username }}"
+    ansible_password: "{{ vault_net_password }}"
+    ansible_become_password: "{{ vault_net_enable }}"
 
   tasks:
-    - name: Capture pre-change OSPF state
+    - name: Gather current logging configuration
       cisco.ios.ios_command:
         commands:
-          - show run | section router ospf
-      register: ospf_before
+          - show running-config | section logging
+          - show logging
+      register: syslog_output
+      retries: 2
+      delay: 5
+      until: syslog_output is not failed
 
-    - name: Display existing OSPF configuration
+    - name: Parse configured syslog server lines
+      ansible.builtin.set_fact:
+        configured_servers: >-
+          {{
+            syslog_output.stdout[0]
+            | regex_findall('logging host (\S+)')
+          }}
+        buffer_line: >-
+          {{
+            syslog_output.stdout[0]
+            | regex_search('logging buffered (\d+)', '\1')
+            | first | default('0')
+          }}
+        severity_line: >-
+          {{
+            syslog_output.stdout[0]
+            | regex_search('logging trap (\S+)', '\1')
+            | first | default('unset')
+          }}
+
+    - name: Verify required syslog servers are configured
+      ansible.builtin.assert:
+        that:
+          - item in configured_servers
+        fail_msg: "AUDIT FAIL: syslog server {{ item }} missing on {{ inventory_hostname }}"
+        success_msg: "OK: syslog server {{ item }} present on {{ inventory_hostname }}"
+      loop: "{{ required_syslog_servers }}"
+      ignore_errors: true
+      register: server_audit
+
+    - name: Verify logging buffer meets minimum size policy
+      ansible.builtin.assert:
+        that:
+          - buffer_line | int >= required_buffer_size
+        fail_msg: >-
+          AUDIT FAIL: buffer {{ buffer_line }} bytes on {{ inventory_hostname }}
+          is below required {{ required_buffer_size }}
+        success_msg: "OK: buffer size {{ buffer_line }} meets policy on {{ inventory_hostname }}"
+      ignore_errors: true
+      register: buffer_audit
+
+    - name: Verify logging severity level
+      ansible.builtin.assert:
+        that:
+          - severity_line == required_severity
+        fail_msg: >-
+          AUDIT FAIL: trap severity '{{ severity_line }}' on {{ inventory_hostname }}
+          should be '{{ required_severity }}'
+        success_msg: "OK: severity level correct on {{ inventory_hostname }}"
+      ignore_errors: true
+      register: severity_audit
+
+    - name: Display full audit summary
       ansible.builtin.debug:
-        var: ospf_before.stdout_lines[0]
+        msg:
+          - "Host          : {{ inventory_hostname }}"
+          - "Servers found : {{ configured_servers }}"
+          - "Buffer size   : {{ buffer_line }} bytes"
+          - "Trap severity : {{ severity_line }}"
+          - "Server check  : {{ 'PASS' if server_audit is not failed else 'FAIL' }}"
+          - "Buffer check  : {{ 'PASS' if buffer_audit is not failed else 'FAIL' }}"
+          - "Severity check: {{ 'PASS' if severity_audit is not failed else 'FAIL' }}"
 
-    - name: Apply OSPF configuration
-      block:
-        - name: Set OSPF global parameters
-          cisco.ios.ios_config:
-            lines:
-              - "router-id {{ ospf_router_id | default(ansible_host) }}"
-              - "auto-cost reference-bandwidth {{ ospf_reference_bandwidth }}"
-              - "log-adjacency-changes detail"
-              - "max-lsa 12000 75 warning-only"
-            parents: "router ospf {{ ospf_process_id }}"
-          register: ospf_global
-          retries: 2
-          delay: 5
-          until: ospf_global is not failed
-
-        - name: Advertise networks into OSPF
-          cisco.ios.ios_config:
-            lines:
-              - "network {{ item.prefix }} {{ item.wildcard }} area {{ item.area }}"
-            parents: "router ospf {{ ospf_process_id }}"
-          loop: "{{ ospf_networks }}"
-
-        - name: Suppress hellos on stub interfaces
-          cisco.ios.ios_config:
-            lines:
-              - "passive-interface {{ item }}"
-            parents: "router ospf {{ ospf_process_id }}"
-          loop: "{{ ospf_passive_interfaces }}"
-
-      rescue:
-        - name: Report configuration failure
-          ansible.builtin.debug:
-            msg: >
-              OSPF config failed on {{ inventory_hostname }}.
-              Error: {{ ansible_failed_result.msg | default('see task output') }}
-
-        - name: Halt play for this host
-          ansible.builtin.fail:
-            msg: "OSPF configuration error — manual review required on {{ inventory_hostname }}"
-
-    - name: Allow time for adjacencies to establish
-      ansible.builtin.pause:
-        seconds: 15
-
-    - name: Verify OSPF neighbor adjacencies
-      cisco.ios.ios_command:
-        commands:
-          - show ip ospf neighbor
-        wait_for:
-          - "result[0] contains FULL"
-        retries: 4
-        interval: 10
-      register: ospf_neighbors
-      failed_when: false
-
-    - name: Collect OSPF route table
-      cisco.ios.ios_command:
-        commands:
-          - show ip route ospf
-      register: ospf_routes
-
-    - name: Display OSPF neighbor table
-      ansible.builtin.debug:
-        msg: "{{ ospf_neighbors.stdout_lines[0] }}"
-
-    - name: Display OSPF-learned routes
-      ansible.builtin.debug:
-        msg: "{{ ospf_routes.stdout_lines[0] }}"
-
-    - name: Persist configuration to NVRAM
-      cisco.ios.ios_config:
-        save_when: modified
+    - name: Fail play if any audit check did not pass
+      ansible.builtin.fail:
+        msg: "One or more syslog audit checks failed on {{ inventory_hostname }} — review output above."
+      when: >
+        (server_audit is failed) or
+        (buffer_audit is failed) or
+        (severity_audit is failed)
