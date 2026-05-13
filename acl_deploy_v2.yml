@@ -1,107 +1,117 @@
+```yaml
 ---
-# Prefix-List Deployment Playbook
-# Manages BGP route-filter prefix lists on Cisco IOS/IOS-XE devices
+# Ansible Playbook: Named Extended ACL with Object-Group Deployment
+# Manages scalable inbound ACL policies using network object-groups on IOS devices.
+# Provides pre-deployment snapshot, automatic rollback on failure, and post-deploy verification.
+# Requires: ansible-galaxy collection install cisco.ios
 #
 # Inventory example:
-#   [routers]
-#   r1 ansible_host=10.0.1.1
-#   r2 ansible_host=10.0.1.2
+#   [distribution_switches]
+#   dsw-01 ansible_host=10.0.2.1
+#   dsw-02 ansible_host=10.0.2.2
 #
-#   [routers:vars]
+#   [distribution_switches:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_user={{ vault_net_user }}
-#   ansible_password={{ vault_net_password }}
-#   ansible_become=yes
+#   ansible_user={{ vault_net_username }}            # ansible-vault encrypted
+#   ansible_password={{ vault_net_password }}        # ansible-vault encrypted
+#   ansible_become=true
 #   ansible_become_method=enable
-#   ansible_become_password={{ vault_net_enable }}
-#   # Store credentials with: ansible-vault encrypt_string
+#   ansible_become_password={{ vault_enable_password }}  # ansible-vault encrypted
 
-- name: Deploy BGP prefix lists for route filtering
-  hosts: routers
+- name: Deploy Named Extended ACL with Object-Groups on IOS Devices
+  hosts: distribution_switches
   gather_facts: false
-
   vars:
-    # Credentials sourced from ansible-vault encrypted group_vars
-    net_user: "{{ vault_net_user }}"
-    net_password: "{{ vault_net_password }}"
-
-    prefix_lists:
-      - name: ALLOWED_PREFIXES_IN
-        description: "Inbound BGP routes accepted from peers"
-        entries:
-          - sequence: 10
-            action: permit
-            prefix: 10.0.0.0/8
-            ge: 16
-            le: 24
-          - sequence: 20
-            action: permit
-            prefix: 172.16.0.0/12
-            ge: 20
-            le: 28
-          - sequence: 999
-            action: deny
-            prefix: 0.0.0.0/0
-            le: 32
-
-      - name: ALLOWED_PREFIXES_OUT
-        description: "Outbound prefixes advertised to BGP peers"
-        entries:
-          - sequence: 10
-            action: permit
-            prefix: 192.168.100.0/24
-          - sequence: 20
-            action: permit
-            prefix: 192.168.200.0/24
-          - sequence: 999
-            action: deny
-            prefix: 0.0.0.0/0
-            le: 32
+    acl_name: "{{ acl_policy_name | default('CORP-INBOUND') }}"
+    trusted_group: "TRUSTED-NETS"
+    blocked_group: "BLOCKED-NETS"
+    trusted_networks:
+      - "network 10.100.0.0 0.0.255.255"
+      - "network 172.16.0.0 0.0.255.255"
+    blocked_networks:
+      - "network 10.200.99.0 0.0.0.255"
+      - "network 203.0.113.0 0.0.0.255"
+    apply_interface: "{{ target_interface | default('GigabitEthernet1/0/1') }}"
+    acl_direction: "{{ direction | default('in') }}"
 
   tasks:
-    - name: Push prefix lists to device
+    - name: Capture pre-deployment ACL and interface state
+      cisco.ios.ios_command:
+        commands:
+          - "show ip access-lists {{ acl_name }}"
+          - "show ip interface {{ apply_interface }} | include access list"
+      register: pre_state
+      failed_when: false
+
+    - name: Display pre-deployment state
+      ansible.builtin.debug:
+        msg: "{{ pre_state.stdout_lines }}"
+
+    - name: Deploy object-groups and ACL policy
       block:
-        - name: Configure prefix list entries
-          cisco.ios.ios_prefix_lists:
-            config:
-              - afi: ipv4
-                prefix_lists:
-                  - name: "{{ item.0.name }}"
-                    description: "{{ item.0.description }}"
-                    entries:
-                      - sequence: "{{ item.1.sequence }}"
-                        action: "{{ item.1.action }}"
-                        prefix: "{{ item.1.prefix }}"
-                        ge: "{{ item.1.ge | default(omit) }}"
-                        le: "{{ item.1.le | default(omit) }}"
-            state: merged
-          loop: "{{ prefix_lists | subelements('entries') }}"
-          loop_control:
-            label: "{{ item.0.name }} seq {{ item.1.sequence }}"
-          register: prefix_result
+        - name: Configure trusted-source network object-group
+          cisco.ios.ios_config:
+            lines: "{{ trusted_networks }}"
+            parents: "object-group network {{ trusted_group }}"
+
+        - name: Configure blocked-source network object-group
+          cisco.ios.ios_config:
+            lines: "{{ blocked_networks }}"
+            parents: "object-group network {{ blocked_group }}"
+
+        - name: Configure named extended ACL with object-group references
+          cisco.ios.ios_config:
+            lines:
+              - "10 deny   ip object-group {{ blocked_group }} any log"
+              - "20 permit ip object-group {{ trusted_group }} any"
+              - "30 permit ip any any"
+            parents: "ip access-list extended {{ acl_name }}"
+
+        - name: Apply ACL to interface
+          cisco.ios.ios_config:
+            lines:
+              - "ip access-group {{ acl_name }} {{ acl_direction }}"
+            parents: "interface {{ apply_interface }}"
+          register: interface_bind
           retries: 2
           delay: 5
-          until: prefix_result is not failed
+          until: interface_bind is not failed
 
-        - name: Verify prefix lists are present
-          cisco.ios.ios_command:
-            commands:
-              - "show ip prefix-list summary"
-          register: verify_output
-          failed_when: >
-            'ALLOWED_PREFIXES_IN' not in verify_output.stdout[0] or
-            'ALLOWED_PREFIXES_OUT' not in verify_output.stdout[0]
-
-        - name: Display prefix list summary
-          ansible.builtin.debug:
-            msg: "{{ verify_output.stdout_lines[0] }}"
+        - name: Save running configuration to startup
+          cisco.ios.ios_config:
+            save_when: changed
 
       rescue:
-        - name: Log failure details
+        - name: Report failure and begin rollback
           ansible.builtin.debug:
-            msg: "Prefix list deployment failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
+            msg: "ACL deployment failed on {{ inventory_hostname }}. Removing interface binding."
 
-        - name: Abort play for this host
+        - name: Remove ACL interface binding to restore traffic flow
+          cisco.ios.ios_config:
+            lines:
+              - "no ip access-group {{ acl_name }} {{ acl_direction }}"
+            parents: "interface {{ apply_interface }}"
+          failed_when: false
+
+        - name: Fail task after rollback completes
           ansible.builtin.fail:
-            msg: "Prefix list deployment could not complete on {{ inventory_hostname }}. Review device connectivity and BGP config.
+            msg: "Deployment on {{ inventory_hostname }} rolled back. Review errors above."
+
+    - name: Verify ACL binding is active on interface
+      cisco.ios.ios_command:
+        commands:
+          - "show ip interface {{ apply_interface }} | include access list"
+      register: verify_bind
+      failed_when: acl_name not in verify_bind.stdout[0]
+
+    - name: Capture post-deployment ACL hit counters
+      cisco.ios.ios_command:
+        commands:
+          - "show ip access-lists {{ acl_name }}"
+      register: post_state
+
+    - name: Display final ACL configuration and hit counters
+      ansible.builtin.debug:
+        msg: "{{ post_state.stdout_lines }}"
+```
