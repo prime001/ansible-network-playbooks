@@ -1,133 +1,123 @@
 ---
-# bgp_neighbor_status.yml
+# routing_topology_facts.yml
 #
-# Collects BGP session state, prefix counts, and uptime across
-# multi-vendor routers. Flags any non-Established sessions so
-# operators can triage peering issues quickly.
-#
-# Credentials: ansible-vault encrypted at group_vars/network/vault.yml
-#   vault_ansible_user, vault_ansible_password, vault_ansible_become_password
+# Collects Layer 3 topology data: BGP/OSPF neighbor states, CDP/LLDP neighbors,
+# and routing table summaries. Complements facts_gathering.yml (device-level facts)
+# by focusing on protocol adjacencies and reachability state.
 #
 # Inventory example:
-#   [ios_routers]
-#   core-rtr-01  ansible_host=10.0.1.1  ansible_network_os=ios
-#   core-rtr-02  ansible_host=10.0.1.2  ansible_network_os=ios
+#   [core_routers]
+#   rtr-core-01 ansible_host=10.0.0.1
+#   rtr-core-02 ansible_host=10.0.0.2
 #
-#   [iosxr_routers]
-#   pe-rtr-01  ansible_host=10.0.2.1  ansible_network_os=iosxr
+#   [edge_routers]
+#   rtr-edge-01 ansible_host=10.0.1.1
 #
-#   [nxos_switches]
-#   dc-spine-01  ansible_host=10.0.3.1  ansible_network_os=nxos
-#
-#   [network:children]
-#   ios_routers
-#   iosxr_routers
-#   nxos_switches
+#   [core_routers:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_net_user }}        # ansible-vault encrypted
+#   ansible_password={{ vault_net_password }} # ansible-vault encrypted
+#   ansible_become=yes
+#   ansible_become_method=enable
 
-- name: Collect BGP neighbor state and prefix counts across multi-vendor devices
-  hosts: network
+- name: Gather routing topology facts — BGP/OSPF neighbors, CDP/LLDP, route summary
+  hosts: core_routers:edge_routers
   gather_facts: false
-  connection: network_cli
-
   vars:
-    ansible_user: "{{ vault_ansible_user }}"
-    ansible_password: "{{ vault_ansible_password }}"
-    ansible_become: true
-    ansible_become_method: enable
-    ansible_become_password: "{{ vault_ansible_become_password }}"
-    bgp_report_dir: "./bgp_reports"
-    run_timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+    topology_report_dir: "./topology_reports"
+    routing_protocols: "{{ device_routing_protocols | default(['bgp', 'ospf']) }}"
 
   tasks:
-    - name: Create local BGP report directory
+    - name: Collect BGP neighbor summary
+      cisco.ios.ios_command:
+        commands:
+          - show bgp summary
+          - show bgp ipv4 unicast summary
+      register: bgp_summary_output
+      failed_when: false
+      retries: 2
+      delay: 5
+
+    - name: Collect OSPF neighbor state
+      cisco.ios.ios_command:
+        commands:
+          - show ip ospf neighbor
+          - show ip ospf
+      register: ospf_neighbor_output
+      failed_when: false
+      retries: 2
+      delay: 5
+
+    - name: Collect CDP neighbors detail
+      cisco.ios.ios_command:
+        commands:
+          - show cdp neighbors detail
+      register: cdp_neighbors_output
+      failed_when: false
+
+    - name: Collect LLDP neighbors detail
+      cisco.ios.ios_command:
+        commands:
+          - show lldp neighbors detail
+      register: lldp_neighbors_output
+      failed_when: false
+
+    - name: Collect routing table summary
+      cisco.ios.ios_command:
+        commands:
+          - show ip route summary
+          - show ip route
+      register: route_table_output
+      failed_when:
+        - route_table_output.failed
+        - "'Invalid' not in route_table_output.stdout[0]"
+
+    - name: Display BGP neighbor summary
+      ansible.builtin.debug:
+        msg: "{{ bgp_summary_output.stdout_lines[0] }}"
+      when: bgp_summary_output.stdout is defined and bgp_summary_output.stdout[0] != ""
+
+    - name: Display OSPF neighbor state
+      ansible.builtin.debug:
+        msg: "{{ ospf_neighbor_output.stdout_lines[0] }}"
+      when: ospf_neighbor_output.stdout is defined and ospf_neighbor_output.stdout[0] != ""
+
+    - name: Ensure topology report directory exists
+      ansible.builtin.file:
+        path: "{{ topology_report_dir }}"
+        state: directory
+        mode: "0750"
       delegate_to: localhost
       run_once: true
-      ansible.builtin.file:
-        path: "{{ bgp_report_dir }}"
-        state: directory
-        mode: '0755'
 
-    - name: Gather BGP summary — IOS / IOS-XE
-      when: ansible_network_os == 'ios'
-      block:
-        - name: Run show ip bgp summary (IOS)
-          cisco.ios.ios_command:
-            commands:
-              - show ip bgp summary
-              - show ip bgp neighbors | include BGP neighbor|BGP state|Prefixes Current
-          register: ios_bgp
-          retries: 3
-          delay: 5
-          until: ios_bgp is not failed
-
-        - name: Flag non-Established IOS BGP sessions
-          ansible.builtin.debug:
-            msg: "WARNING — non-Established session detected on {{ inventory_hostname }}"
-          when: "'Idle' in ios_bgp.stdout[0] or 'Active' in ios_bgp.stdout[0]"
-      rescue:
-        - name: Record IOS collection failure
-          ansible.builtin.debug:
-            msg: "BGP collection failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown') }}"
-
-    - name: Gather BGP summary — IOS-XR
-      when: ansible_network_os == 'iosxr'
-      block:
-        - name: Run show bgp summary (IOS-XR)
-          cisco.iosxr.iosxr_command:
-            commands:
-              - show bgp summary
-              - show bgp neighbors brief
-          register: iosxr_bgp
-          retries: 3
-          delay: 5
-          until: iosxr_bgp is not failed
-
-        - name: Flag non-Established IOS-XR BGP sessions
-          ansible.builtin.debug:
-            msg: "WARNING — non-Established session detected on {{ inventory_hostname }}"
-          when: "'Idle' in iosxr_bgp.stdout[0] or 'Active' in iosxr_bgp.stdout[0]"
-      rescue:
-        - name: Record IOS-XR collection failure
-          ansible.builtin.debug:
-            msg: "BGP collection failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown') }}"
-
-    - name: Gather BGP summary — NX-OS
-      when: ansible_network_os == 'nxos'
-      block:
-        - name: Run show bgp all summary (NX-OS)
-          cisco.nxos.nxos_command:
-            commands:
-              - show bgp all summary
-          register: nxos_bgp
-          retries: 3
-          delay: 5
-          until: nxos_bgp is not failed
-
-        - name: Flag non-Established NX-OS BGP sessions
-          ansible.builtin.debug:
-            msg: "WARNING — non-Established session detected on {{ inventory_hostname }}"
-          when: "'Idle' in nxos_bgp.stdout[0] or 'Active' in nxos_bgp.stdout[0]"
-      rescue:
-        - name: Record NX-OS collection failure
-          ansible.builtin.debug:
-            msg: "BGP collection failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown') }}"
-
-    - name: Write per-device BGP report
-      delegate_to: localhost
+    - name: Save topology facts to per-host report
       ansible.builtin.copy:
         content: |
-          Device    : {{ inventory_hostname }}
-          Timestamp : {{ run_timestamp }}
-          Platform  : {{ ansible_network_os }}
-          ============================================================
-          {% if ansible_network_os == 'ios' and ios_bgp is defined and ios_bgp is not failed %}
-          {{ ios_bgp.stdout | join('\n---\n') }}
-          {% elif ansible_network_os == 'iosxr' and iosxr_bgp is defined and iosxr_bgp is not failed %}
-          {{ iosxr_bgp.stdout | join('\n---\n') }}
-          {% elif ansible_network_os == 'nxos' and nxos_bgp is defined and nxos_bgp is not failed %}
-          {{ nxos_bgp.stdout | join('\n---\n') }}
-          {% else %}
-          No BGP data collected — check rescue task output.
-          {% endif %}
-        dest: "{{ bgp_report_dir }}/{{ inventory_hostname }}_bgp_{{ run_timestamp }}.txt"
-        mode: '0644'
+          === Routing Topology Report: {{ inventory_hostname }} ===
+          Generated: {{ ansible_date_time.iso8601 | default(lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ')) }}
+
+          --- BGP Summary ---
+          {{ bgp_summary_output.stdout | default('Not available') | join('\n') }}
+
+          --- OSPF Neighbors ---
+          {{ ospf_neighbor_output.stdout | default('Not available') | join('\n') }}
+
+          --- CDP Neighbors ---
+          {{ cdp_neighbors_output.stdout | default('Not available') | join('\n') }}
+
+          --- LLDP Neighbors ---
+          {{ lldp_neighbors_output.stdout | default('Not available') | join('\n') }}
+
+          --- Route Table Summary ---
+          {{ route_table_output.stdout | default('Not available') | join('\n') }}
+        dest: "{{ topology_report_dir }}/{{ inventory_hostname }}_topology_{{ ansible_date_time.date | default(lookup('pipe', 'date +%Y-%m-%d')) }}.txt"
+        mode: "0640"
+      delegate_to: localhost
+
+    - name: Flag hosts with no active BGP or OSPF neighbors
+      ansible.builtin.debug:
+        msg: "WARNING: {{ inventory_hostname }} — no BGP or OSPF neighbor output detected. Verify routing protocol config."
+      when:
+        - (bgp_summary_output.stdout[0] | default('')) == ''
+        - (ospf_neighbor_output.stdout[0] | default('')) == ''
