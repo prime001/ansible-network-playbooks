@@ -1,123 +1,119 @@
 ---
-# routing_topology_facts.yml
+# CDP/LLDP Neighbor Discovery — Layer 2 Topology Mapping
 #
-# Collects Layer 3 topology data: BGP/OSPF neighbor states, CDP/LLDP neighbors,
-# and routing table summaries. Complements facts_gathering.yml (device-level facts)
-# by focusing on protocol adjacencies and reachability state.
+# Discovers adjacencies via CDP (Cisco) and LLDP (multi-vendor) to build
+# a topology snapshot useful for change-window validation and documentation.
+# Distinct from facts_gathering.yml (which uses ios_facts for device state).
 #
 # Inventory example:
-#   [core_routers]
-#   rtr-core-01 ansible_host=10.0.0.1
-#   rtr-core-02 ansible_host=10.0.0.2
+#   [core]
+#   core-sw01  ansible_host=10.0.0.1
+#   core-sw02  ansible_host=10.0.0.2
 #
-#   [edge_routers]
-#   rtr-edge-01 ansible_host=10.0.1.1
+#   [distribution]
+#   dist-sw01  ansible_host=10.0.1.1
 #
-#   [core_routers:vars]
+#   [network:children]
+#   core
+#   distribution
+#
+#   [network:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_user={{ vault_net_user }}        # ansible-vault encrypted
-#   ansible_password={{ vault_net_password }} # ansible-vault encrypted
+#   ansible_user={{ vault_net_user }}          # ansible-vault encrypted
+#   ansible_password={{ vault_net_pass }}      # ansible-vault encrypted
 #   ansible_become=yes
 #   ansible_become_method=enable
+#   ansible_become_pass={{ vault_enable_pass }} # ansible-vault encrypted
 
-- name: Gather routing topology facts — BGP/OSPF neighbors, CDP/LLDP, route summary
-  hosts: core_routers:edge_routers
+- name: Discover CDP/LLDP Neighbors and Map Layer 2 Topology
+  hosts: network
   gather_facts: false
   vars:
-    topology_report_dir: "./topology_reports"
-    routing_protocols: "{{ device_routing_protocols | default(['bgp', 'ospf']) }}"
+    report_dir: "./topology_reports"
+    run_timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
 
   tasks:
-    - name: Collect BGP neighbor summary
-      cisco.ios.ios_command:
-        commands:
-          - show bgp summary
-          - show bgp ipv4 unicast summary
-      register: bgp_summary_output
-      failed_when: false
-      retries: 2
-      delay: 5
 
-    - name: Collect OSPF neighbor state
-      cisco.ios.ios_command:
-        commands:
-          - show ip ospf neighbor
-          - show ip ospf
-      register: ospf_neighbor_output
-      failed_when: false
-      retries: 2
-      delay: 5
-
-    - name: Collect CDP neighbors detail
-      cisco.ios.ios_command:
-        commands:
-          - show cdp neighbors detail
-      register: cdp_neighbors_output
-      failed_when: false
-
-    - name: Collect LLDP neighbors detail
-      cisco.ios.ios_command:
-        commands:
-          - show lldp neighbors detail
-      register: lldp_neighbors_output
-      failed_when: false
-
-    - name: Collect routing table summary
-      cisco.ios.ios_command:
-        commands:
-          - show ip route summary
-          - show ip route
-      register: route_table_output
-      failed_when:
-        - route_table_output.failed
-        - "'Invalid' not in route_table_output.stdout[0]"
-
-    - name: Display BGP neighbor summary
-      ansible.builtin.debug:
-        msg: "{{ bgp_summary_output.stdout_lines[0] }}"
-      when: bgp_summary_output.stdout is defined and bgp_summary_output.stdout[0] != ""
-
-    - name: Display OSPF neighbor state
-      ansible.builtin.debug:
-        msg: "{{ ospf_neighbor_output.stdout_lines[0] }}"
-      when: ospf_neighbor_output.stdout is defined and ospf_neighbor_output.stdout[0] != ""
-
-    - name: Ensure topology report directory exists
-      ansible.builtin.file:
-        path: "{{ topology_report_dir }}"
+    - name: Create local report directory
+      file:
+        path: "{{ report_dir }}"
         state: directory
-        mode: "0750"
+        mode: '0755'
       delegate_to: localhost
       run_once: true
 
-    - name: Save topology facts to per-host report
-      ansible.builtin.copy:
+    - name: Collect neighbor tables
+      block:
+
+        - name: Gather CDP neighbors detail
+          ios_command:
+            commands:
+              - show cdp neighbors detail
+              - show cdp interface
+          register: cdp_raw
+          retries: 3
+          delay: 5
+          until: cdp_raw is not failed
+          failed_when:
+            - cdp_raw.failed
+            - "'CDP is not enabled' not in (cdp_raw.stdout | join(''))"
+
+        - name: Gather LLDP neighbors detail
+          ios_command:
+            commands:
+              - show lldp neighbors detail
+          register: lldp_raw
+          retries: 2
+          delay: 5
+          until: lldp_raw is not failed
+          failed_when:
+            - lldp_raw.failed
+            - "'LLDP is not enabled' not in (lldp_raw.stdout | join(''))"
+
+      rescue:
+
+        - name: Flag collection failure for this host
+          set_fact:
+            collection_failed: true
+
+        - name: Report collection failure
+          debug:
+            msg: >
+              Neighbor collection failed on {{ inventory_hostname }}:
+              {{ ansible_failed_result.msg | default('unknown error') }}
+
+    - name: Display CDP adjacency summary
+      debug:
+        msg: "{{ cdp_raw.stdout_lines[0] }}"
+      when:
+        - collection_failed is not defined
+        - cdp_raw is defined
+        - not cdp_raw.failed
+
+    - name: Display LLDP adjacency summary
+      debug:
+        msg: "{{ lldp_raw.stdout_lines[0] }}"
+      when:
+        - collection_failed is not defined
+        - lldp_raw is defined
+        - not lldp_raw.failed
+
+    - name: Save topology report
+      copy:
         content: |
-          === Routing Topology Report: {{ inventory_hostname }} ===
-          Generated: {{ ansible_date_time.iso8601 | default(lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ')) }}
-
-          --- BGP Summary ---
-          {{ bgp_summary_output.stdout | default('Not available') | join('\n') }}
-
-          --- OSPF Neighbors ---
-          {{ ospf_neighbor_output.stdout | default('Not available') | join('\n') }}
+          Device    : {{ inventory_hostname }}
+          Timestamp : {{ run_timestamp }}
+          ==========================================
 
           --- CDP Neighbors ---
-          {{ cdp_neighbors_output.stdout | default('Not available') | join('\n') }}
+          {{ cdp_raw.stdout[0] | default('CDP data unavailable') }}
+
+          --- CDP Interfaces ---
+          {{ cdp_raw.stdout[1] | default('N/A') }}
 
           --- LLDP Neighbors ---
-          {{ lldp_neighbors_output.stdout | default('Not available') | join('\n') }}
-
-          --- Route Table Summary ---
-          {{ route_table_output.stdout | default('Not available') | join('\n') }}
-        dest: "{{ topology_report_dir }}/{{ inventory_hostname }}_topology_{{ ansible_date_time.date | default(lookup('pipe', 'date +%Y-%m-%d')) }}.txt"
-        mode: "0640"
+          {{ lldp_raw.stdout[0] | default('LLDP data unavailable') }}
+        dest: "{{ report_dir }}/{{ inventory_hostname }}_neighbors_{{ run_timestamp }}.txt"
       delegate_to: localhost
-
-    - name: Flag hosts with no active BGP or OSPF neighbors
-      ansible.builtin.debug:
-        msg: "WARNING: {{ inventory_hostname }} — no BGP or OSPF neighbor output detected. Verify routing protocol config."
-      when:
-        - (bgp_summary_output.stdout[0] | default('')) == ''
-        - (ospf_neighbor_output.stdout[0] | default('')) == ''
+      when: collection_failed is not defined
