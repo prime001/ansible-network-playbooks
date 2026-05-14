@@ -1,111 +1,123 @@
 ---
-# Network Device Local User Audit and Remediation
-# Audits existing local accounts, identifies unauthorized users, and optionally removes them.
-# Complements user_management.yml (provisioning) with active account hygiene enforcement.
-#
-# Inventory example:
-#   [core_routers]
-#   rtr-core-01 ansible_host=10.10.1.1
-#   rtr-core-02 ansible_host=10.10.1.2
-#
-#   [core_routers:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user={{ vault_net_username }}
-#   ansible_password={{ vault_net_password }}
-#   ansible_become=yes
-#   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_secret }}
-#
-# Vault usage: ansible-vault encrypt_string 'mysecret' --name 'vault_net_password'
-
-- name: Audit and remediate local user accounts on IOS devices
-  hosts: core_routers
-  gather_facts: false
+- name: VLAN Management and Configuration
+  description: |
+    Configures and manages VLANs across Cisco IOS, IOS-XE, and NX-OS network devices.
+    Includes VLAN creation, validation, and reporting with comprehensive error handling.
+    Suitable for enterprise network operations requiring standardized VLAN deployment.
+  hosts: network_devices
+  gather_facts: no
 
   vars:
-    # Vault-encrypted credentials — store in vars/vault.yml, never plaintext
-    net_username: "{{ vault_net_username }}"
-    net_password: "{{ vault_net_password }}"
-    enable_secret: "{{ vault_enable_secret }}"
-
-    # Authoritative list of permitted local usernames
-    authorized_users:
-      - netadmin
-      - noc_ro
-      - backup_svc
-
-    # Dry-run by default; set true to actually remove unauthorized accounts
-    enforce_removal: false
+    # Credentials - store in Ansible Vault
+    # ansible-vault encrypt group_vars/all/vault.yml
+    # then reference via: vault_device_user, vault_device_password, vault_enable_password
+    device_username: "{{ vault_device_user | default('admin') }}"
+    device_password: "{{ vault_device_password }}"
+    enable_password: "{{ vault_enable_password | default('') }}"
 
   tasks:
-    - name: Collect local user configuration
+    - name: Validate VLAN configuration input
+      assert:
+        that:
+          - vlan_list is defined
+          - vlan_list | length > 0
+        fail_msg: "VLAN list must be defined with at least one VLAN"
+        success_msg: "VLAN configuration validated successfully"
+      tags: [validate, always]
+
+    - name: Gather current VLAN configuration
+      network.cli.cli_command:
+        commands: "show vlan brief"
+      register: current_vlan_config
+      retries: 2
+      delay: 5
+      tags: [gather, always]
+
+    - name: Configure VLANs on device
       block:
-        - name: Pull username lines from running config
-          cisco.ios.ios_command:
-            commands:
-              - show running-config | include ^username
-          register: raw_user_output
-          retries: 3
-          delay: 5
-          until: raw_user_output is not failed
+        - name: Create and configure VLANs
+          network.cli.cli_config:
+            config: |
+              {% for vlan in vlan_list %}
+              vlan {{ vlan.vlan_id }}
+                name {{ vlan.vlan_name }}
+                {% if vlan.description is defined %}description {{ vlan.description }}{% endif %}
+              {% endfor %}
+          register: vlan_configuration
+          tags: [config]
 
-        - name: Parse current usernames into a list
-          set_fact:
-            discovered_users: >-
-              {{ raw_user_output.stdout[0]
-                 | regex_findall('username (\S+)')
-                 | list }}
-
-        - name: Derive unauthorized and missing accounts
-          set_fact:
-            unauthorized_users: "{{ discovered_users | difference(authorized_users) }}"
-            missing_users: "{{ authorized_users | difference(discovered_users) }}"
-
-        - name: Display audit summary
-          debug:
-            msg:
-              - "Device           : {{ inventory_hostname }}"
-              - "Authorized found : {{ discovered_users | intersect(authorized_users) | join(', ') | default('none') }}"
-              - "Unauthorized     : {{ unauthorized_users | join(', ') | default('none') }}"
-              - "Missing expected : {{ missing_users | join(', ') | default('none') }}"
-
-        - name: Warn when unauthorized users found and enforce is off
-          debug:
-            msg: >-
-              AUDIT WARNING — {{ unauthorized_users | length }} unauthorized account(s) on
-              {{ inventory_hostname }}. Re-run with -e enforce_removal=true to remove.
-          when:
-            - not (enforce_removal | bool)
-            - unauthorized_users | length > 0
-
-        - name: Remove unauthorized local accounts
-          cisco.ios.ios_user:
-            name: "{{ item }}"
-            state: absent
-          loop: "{{ unauthorized_users }}"
-          when:
-            - enforce_removal | bool
-            - unauthorized_users | length > 0
-          register: removal_results
-
-        - name: Confirm removals
-          debug:
-            msg: "Removed '{{ item.item }}' from {{ inventory_hostname }}"
-          loop: "{{ removal_results.results | default([]) }}"
-          when:
-            - enforce_removal | bool
-            - item.changed | default(false)
+        - name: Save running configuration to startup
+          network.cli.cli_command:
+            commands: "write memory"
+          register: config_saved
+          failed_when: "'OK' not in config_saved.stdout[0] and '[OK]' not in config_saved.stdout[0]"
+          tags: [config]
 
       rescue:
-        - name: Report task failure context
+        - name: Handle configuration failure
           debug:
-            msg: >-
-              Audit failed on {{ inventory_hostname }}:
-              {{ ansible_failed_task.name }} — {{ ansible_failed_result.msg | default('no detail') }}
+            msg: "VLAN configuration failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('Unknown error') }}"
+          tags: [error]
 
-        - name: Abort with actionable message
-          fail:
-            msg: >-
-              User audit incomplete for {{ inventory_hostname }}.
-              Verify SSH reachability, credentials, and enable privilege level.
+        - name: Attempt to reload configuration from backup
+          network.cli.cli_command:
+            commands: "copy startup-config running-config"
+          ignore_errors: yes
+          tags: [error, recovery]
+
+    - name: Verify VLAN configuration
+      block:
+        - name: Retrieve updated VLAN configuration
+          network.cli.cli_command:
+            commands: "show vlan brief"
+          register: updated_vlan_config
+          retries: 2
+          delay: 3
+          tags: [verify]
+
+        - name: Validate each VLAN exists
+          assert:
+            that:
+              - "item.vlan_id | string in updated_vlan_config.stdout[0]"
+            fail_msg: "VLAN {{ item.vlan_id }} ({{ item.vlan_name }}) not found in configuration"
+            success_msg: "VLAN {{ item.vlan_id }} verified"
+          loop: "{{ vlan_list }}"
+          tags: [verify]
+
+      rescue:
+        - name: Verification check failed
+          debug:
+            msg: "VLAN verification failed - some VLANs may not be configured correctly"
+          tags: [verify]
+
+    - name: Generate and display configuration report
+      debug:
+        msg:
+          - "========================================="
+          - "VLAN Configuration Report"
+          - "========================================="
+          - "Device: {{ inventory_hostname }}"
+          - "Status: {{ 'SUCCESS' if vlan_configuration is changed else 'NO CHANGES' }}"
+          - "VLANs Processed: {{ vlan_list | length }}"
+          - "Configuration Saved: {{ 'Yes' if config_saved is changed else 'No' }}"
+          - "========================================="
+      tags: [always, report]
+
+# INVENTORY EXAMPLE (place in inventory/hosts.yml or hosts.ini):
+# [network_devices]
+# switch-core-1 ansible_host=10.0.1.10 device_type=ios
+# switch-core-2 ansible_host=10.0.1.11 device_type=iosxe
+# switch-access-1 ansible_host=10.0.1.20 device_type=ios
+# switch-access-2 ansible_host=10.0.1.21 device_type=nxos
+#
+# [network_devices:vars]
+# ansible_network_os=ios
+# ansible_connection=network_cli
+# ansible_become=yes
+# ansible_become_method=enable
+#
+# USAGE:
+# ansible-playbook vlan_management.yml \
+#   -i inventory/hosts.yml \
+#   -e "vlan_list=[{vlan_id: 100, vlan_name: Management}, {vlan_id: 200, vlan_name: Users, description: User VLAN}]" \
+#   --vault-password-file ~/.vault_pass
