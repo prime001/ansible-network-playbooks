@@ -1,117 +1,154 @@
-```yaml
 ---
-# Ansible Playbook: Named Extended ACL with Object-Group Deployment
-# Manages scalable inbound ACL policies using network object-groups on IOS devices.
-# Provides pre-deployment snapshot, automatic rollback on failure, and post-deploy verification.
-# Requires: ansible-galaxy collection install cisco.ios
+# qos_policy_deploy.yml
+# Deploys QoS class-maps, policy-maps, and service-policy bindings to IOS/IOS-XE devices.
+# Covers traffic classification (DSCP), bandwidth guarantees, and interface application.
+# Distinct from acl_deploy: QoS operates on traffic shaping/scheduling, not permit/deny filtering.
 #
-# Inventory example:
-#   [distribution_switches]
-#   dsw-01 ansible_host=10.0.2.1
-#   dsw-02 ansible_host=10.0.2.2
+# Inventory example (inventory/network.yml):
+# ---
+# all:
+#   children:
+#     core_switches:
+#       hosts:
+#         core-sw-01:
+#           ansible_host: 192.168.1.1
+#           ansible_network_os: ios
+#           ansible_user: "{{ vault_net_user }}"
+#           ansible_password: "{{ vault_net_pass }}"
+#           ansible_become: true
+#           ansible_become_method: enable
+#           ansible_become_pass: "{{ vault_enable_pass }}"
 #
-#   [distribution_switches:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user={{ vault_net_username }}            # ansible-vault encrypted
-#   ansible_password={{ vault_net_password }}        # ansible-vault encrypted
-#   ansible_become=true
-#   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_password }}  # ansible-vault encrypted
+# Usage:
+#   ansible-playbook qos_policy_deploy.yml -i inventory/network.yml --ask-vault-pass
+#   ansible-playbook qos_policy_deploy.yml -i inventory/network.yml --vault-password-file ~/.vault_pass
+#   ansible-playbook qos_policy_deploy.yml -i inventory/network.yml -e "target_hosts=dist_switches"
 
-- name: Deploy Named Extended ACL with Object-Groups on IOS Devices
-  hosts: distribution_switches
+- name: Deploy QoS Classification and Queuing Policies
+  hosts: "{{ target_hosts | default('core_switches') }}"
   gather_facts: false
+  connection: network_cli
+
   vars:
-    acl_name: "{{ acl_policy_name | default('CORP-INBOUND') }}"
-    trusted_group: "TRUSTED-NETS"
-    blocked_group: "BLOCKED-NETS"
-    trusted_networks:
-      - "network 10.100.0.0 0.0.255.255"
-      - "network 172.16.0.0 0.0.255.255"
-    blocked_networks:
-      - "network 10.200.99.0 0.0.0.255"
-      - "network 203.0.113.0 0.0.0.255"
-    apply_interface: "{{ target_interface | default('GigabitEthernet1/0/1') }}"
-    acl_direction: "{{ direction | default('in') }}"
+    # Credentials must be defined in an Ansible Vault-encrypted file
+    # e.g.: ansible-vault create group_vars/all/vault.yml
+    ansible_user: "{{ vault_net_user }}"
+    ansible_password: "{{ vault_net_pass }}"
+    ansible_become_pass: "{{ vault_enable_pass }}"
+
+    policy_map_name: WAN-EDGE-EGRESS
+
+    class_definitions:
+      - name: VOIP-RTP
+        match_dscp: ef
+        priority_percent: 20
+      - name: VIDEO-CONF
+        match_dscp: af41
+        bandwidth_percent: 20
+      - name: BUSINESS-DATA
+        match_dscp: af21
+        bandwidth_percent: 25
+      - name: BULK-TRANSFER
+        match_dscp: af11
+        bandwidth_percent: 10
+
+    qos_interfaces:
+      - name: GigabitEthernet0/0/1
+        direction: output
+      - name: GigabitEthernet0/0/2
+        direction: output
 
   tasks:
-    - name: Capture pre-deployment ACL and interface state
+    - name: Verify device connectivity before making changes
       cisco.ios.ios_command:
         commands:
-          - "show ip access-lists {{ acl_name }}"
-          - "show ip interface {{ apply_interface }} | include access list"
-      register: pre_state
-      failed_when: false
+          - show version
+      register: platform_info
+      retries: 3
+      delay: 5
+      until: platform_info is not failed
 
-    - name: Display pre-deployment state
+    - name: Display target platform
       ansible.builtin.debug:
-        msg: "{{ pre_state.stdout_lines }}"
+        msg: >-
+          {{ inventory_hostname }} ready |
+          {{ platform_info.stdout[0] | regex_search('Version [\\d.()A-Za-z]+') | default('version unknown') }}
 
-    - name: Deploy object-groups and ACL policy
+    - name: Apply QoS configuration
       block:
-        - name: Configure trusted-source network object-group
-          cisco.ios.ios_config:
-            lines: "{{ trusted_networks }}"
-            parents: "object-group network {{ trusted_group }}"
-
-        - name: Configure blocked-source network object-group
-          cisco.ios.ios_config:
-            lines: "{{ blocked_networks }}"
-            parents: "object-group network {{ blocked_group }}"
-
-        - name: Configure named extended ACL with object-group references
+        - name: Configure DSCP-based class-maps
           cisco.ios.ios_config:
             lines:
-              - "10 deny   ip object-group {{ blocked_group }} any log"
-              - "20 permit ip object-group {{ trusted_group }} any"
-              - "30 permit ip any any"
-            parents: "ip access-list extended {{ acl_name }}"
+              - "class-map match-all {{ item.name }}"
+              - "  match ip dscp {{ item.match_dscp }}"
+          loop: "{{ class_definitions }}"
+          loop_control:
+            label: "{{ item.name }}"
+          register: classmap_result
 
-        - name: Apply ACL to interface
+        - name: Build policy-map with per-class treatment
+          cisco.ios.ios_config:
+            lines: >-
+              {{
+                ['policy-map ' + policy_map_name,
+                 '  class ' + item.name] +
+                (['    priority percent ' + (item.priority_percent | string)]
+                  if item.priority_percent is defined else
+                  ['    bandwidth percent ' + (item.bandwidth_percent | string)])
+              }}
+          loop: "{{ class_definitions }}"
+          loop_control:
+            label: "{{ item.name }}"
+          register: policymap_result
+
+        - name: Bind service-policy to WAN interfaces
           cisco.ios.ios_config:
             lines:
-              - "ip access-group {{ acl_name }} {{ acl_direction }}"
-            parents: "interface {{ apply_interface }}"
-          register: interface_bind
-          retries: 2
-          delay: 5
-          until: interface_bind is not failed
-
-        - name: Save running configuration to startup
-          cisco.ios.ios_config:
-            save_when: changed
+              - "service-policy {{ item.direction }} {{ policy_map_name }}"
+            parents: "interface {{ item.name }}"
+          loop: "{{ qos_interfaces }}"
+          loop_control:
+            label: "{{ item.name }}"
+          register: interface_result
 
       rescue:
-        - name: Report failure and begin rollback
+        - name: Capture device state for troubleshooting
+          cisco.ios.ios_command:
+            commands:
+              - show policy-map
+              - show class-map
+          register: failure_state
+          ignore_errors: true
+
+        - name: Display failure context
           ansible.builtin.debug:
-            msg: "ACL deployment failed on {{ inventory_hostname }}. Removing interface binding."
+            msg:
+              - "QoS deployment failed on {{ inventory_hostname }}"
+              - "Failed task: {{ ansible_failed_task.name }}"
+              - "Error: {{ ansible_failed_result.msg | default('check failure_state below') }}"
+              - "{{ failure_state.stdout_lines | default([]) }}"
 
-        - name: Remove ACL interface binding to restore traffic flow
-          cisco.ios.ios_config:
-            lines:
-              - "no ip access-group {{ acl_name }} {{ acl_direction }}"
-            parents: "interface {{ apply_interface }}"
-          failed_when: false
-
-        - name: Fail task after rollback completes
+        - name: Abort with actionable message
           ansible.builtin.fail:
-            msg: "Deployment on {{ inventory_hostname }} rolled back. Review errors above."
+            msg: "Halted QoS deployment on {{ inventory_hostname }} — no partial config was saved."
 
-    - name: Verify ACL binding is active on interface
+    - name: Verify policy-map is active on interfaces
       cisco.ios.ios_command:
         commands:
-          - "show ip interface {{ apply_interface }} | include access list"
-      register: verify_bind
-      failed_when: acl_name not in verify_bind.stdout[0]
+          - "show policy-map interface {{ item.name }}"
+      loop: "{{ qos_interfaces }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: qos_verification
+      failed_when: policy_map_name not in qos_verification.stdout | join
 
-    - name: Capture post-deployment ACL hit counters
-      cisco.ios.ios_command:
-        commands:
-          - "show ip access-lists {{ acl_name }}"
-      register: post_state
-
-    - name: Display final ACL configuration and hit counters
+    - name: Display per-interface QoS statistics
       ansible.builtin.debug:
-        msg: "{{ post_state.stdout_lines }}"
-```
+        msg: "{{ item.stdout_lines }}"
+      loop: "{{ qos_verification.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: Persist configuration to NVRAM
+      cisco.ios.ios_config:
+        save_when: modified
