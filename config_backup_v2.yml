@@ -1,148 +1,123 @@
-This is the NetAutoCommitter project directory, not the ansible-network-playbooks repo. The playbook is being generated for a separate GitHub portfolio repo. Here's the playbook:
-
-```yaml
 ---
-# Configuration Change Detection and Differential Backup
-# Compares running-config checksum against the most recent backup and
-# archives a new versioned copy only when a change is detected. Use
-# alongside config_backup_v2.yml for scheduled full backups; this
-# playbook targets change-event-driven workflows and audit pipelines.
-#
-# Credentials (ansible-vault encrypted group_vars/network/vault.yml):
-#   vault_ansible_user, vault_ansible_password
-#
-# Usage: ansible-playbook config_change_detect.yml --ask-vault-pass
+# ospf_config.yml
+# Configures OSPF process, area assignments, and network advertisements on
+# Cisco IOS/IOS-XE routers, then polls for and verifies neighbor adjacencies.
 #
 # Inventory example:
-#   [cisco_ios]
-#   core-sw-01   ansible_host=10.0.1.1
-#   core-sw-02   ansible_host=10.0.1.2
-#   dist-rtr-01  ansible_host=10.0.2.1
+#   [core_routers]
+#   core-rtr-01  ansible_host=10.0.1.1
+#   core-rtr-02  ansible_host=10.0.1.2
 #
-#   [cisco_ios:vars]
+#   [edge_routers]
+#   edge-rtr-01  ansible_host=10.0.2.1
+#
+#   [routers:children]
+#   core_routers
+#   edge_routers
+#
+#   [routers:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_user="{{ vault_ansible_user }}"
-#   ansible_password="{{ vault_ansible_password }}"
+#   ansible_user={{ vault_net_username }}            # ansible-vault encrypted
+#   ansible_password={{ vault_net_password }}        # ansible-vault encrypted
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_enable_secret }}  # ansible-vault encrypted
 
-- name: Configuration change detection and differential backup
-  hosts: cisco_ios
+- name: Configure OSPF and verify neighbor adjacencies on IOS routers
+  hosts: routers
   gather_facts: false
   vars:
-    backup_dir: "/opt/network_backups/{{ inventory_hostname }}"
-    timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
-    latest_link: "{{ backup_dir }}/running-config.latest"
-    new_backup: "{{ backup_dir }}/running-config_{{ timestamp }}.cfg"
-    ansible_user: "{{ vault_ansible_user }}"
-    ansible_password: "{{ vault_ansible_password }}"
+    ospf_process_id: 1
+    ospf_areas:
+      - area_id: 0
+        networks:
+          - { prefix: "10.0.0.0", wildcard: "0.0.255.255" }
+      - area_id: 10
+        networks:
+          - { prefix: "192.168.10.0", wildcard: "0.0.0.255" }
+    ospf_passive_interfaces:
+      - Loopback0
+    # reference-bandwidth must reflect fastest link speed in the domain (Mbps)
+    ospf_reference_bandwidth: 10000
+    expected_full_neighbors: 1
 
   tasks:
-    - name: Ensure per-device backup directory exists
-      ansible.builtin.file:
-        path: "{{ backup_dir }}"
-        state: directory
-        mode: "0750"
-      delegate_to: localhost
-
-    - name: Retrieve and evaluate running configuration
+    - name: Apply OSPF process configuration
       block:
-        - name: Fetch running-config from device
+        - name: Configure OSPF process and global settings
+          cisco.ios.ios_config:
+            lines:
+              - "router ospf {{ ospf_process_id }}"
+              - " auto-cost reference-bandwidth {{ ospf_reference_bandwidth }}"
+              - " log-adjacency-changes detail"
+          register: ospf_base_result
+          retries: 2
+          delay: 5
+          until: ospf_base_result is not failed
+
+        - name: Advertise networks into OSPF areas
+          cisco.ios.ios_config:
+            parents: "router ospf {{ ospf_process_id }}"
+            lines: "network {{ item.1.prefix }} {{ item.1.wildcard }} area {{ item.0.area_id }}"
+          loop: "{{ ospf_areas | subelements('networks') }}"
+          register: ospf_networks_result
+
+        - name: Suppress OSPF hellos on stub-facing interfaces
+          cisco.ios.ios_config:
+            parents: "router ospf {{ ospf_process_id }}"
+            lines: "passive-interface {{ item }}"
+          loop: "{{ ospf_passive_interfaces }}"
+
+        - name: Persist configuration to NVRAM
           cisco.ios.ios_command:
             commands:
-              - show running-config
-          register: running_config_raw
-          retries: 3
-          delay: 10
-          until: running_config_raw is not failed
-
-        - name: Write candidate config to temp file
-          ansible.builtin.copy:
-            content: "{{ running_config_raw.stdout[0] }}"
-            dest: "{{ new_backup }}.tmp"
-            mode: "0640"
-          delegate_to: localhost
-
-        - name: Stat previous backup (if any)
-          ansible.builtin.stat:
-            path: "{{ latest_link }}"
-          register: prev_stat
-          delegate_to: localhost
-
-        - name: Checksum candidate config
-          ansible.builtin.stat:
-            path: "{{ new_backup }}.tmp"
-            checksum_algorithm: sha256
-          register: new_cksum
-          delegate_to: localhost
-
-        - name: Checksum previous backup
-          ansible.builtin.stat:
-            path: "{{ latest_link }}"
-            checksum_algorithm: sha256
-          register: old_cksum
-          when: prev_stat.stat.exists
-          delegate_to: localhost
-
-        - name: Resolve change flag
-          ansible.builtin.set_fact:
-            config_changed: >-
-              {{ not prev_stat.stat.exists or
-                 new_cksum.stat.checksum != old_cksum.stat.checksum }}
+              - command: write memory
+                prompt: '\[confirm\]'
+                answer: "\r"
+          register: save_result
+          failed_when: >
+            'OK' not in save_result.stdout[0] and
+            'Building' not in save_result.stdout[0]
 
       rescue:
-        - name: Log retrieval failure
+        - name: Report OSPF configuration failure
           ansible.builtin.debug:
-            msg: "WARN: Could not retrieve config from {{ inventory_hostname }} — skipping archive"
+            msg: >-
+              OSPF configuration failed on {{ inventory_hostname }}:
+              {{ ansible_failed_result.msg | default('see task output above') }}
 
-        - name: Flag host to skip archival tasks
-          ansible.builtin.set_fact:
-            config_changed: false
+        - name: Halt for this host — manual intervention required
+          ansible.builtin.fail:
+            msg: "{{ inventory_hostname }}: OSPF could not be applied. Aborting."
 
-    - name: Promote temp file to versioned archive
-      ansible.builtin.command:
-        cmd: "mv {{ new_backup }}.tmp {{ new_backup }}"
-      delegate_to: localhost
-      changed_when: true
-      when: config_changed | bool
+    - name: Verify OSPF neighbor adjacencies are fully established
+      block:
+        - name: Poll show ip ospf neighbor until FULL state is present
+          cisco.ios.ios_command:
+            commands: show ip ospf neighbor
+          register: ospf_neighbors
+          retries: 6
+          delay: 10
+          until: ospf_neighbors.stdout[0] | regex_findall('FULL') | length >= expected_full_neighbors
 
-    - name: Update latest symlink to new archive
-      ansible.builtin.file:
-        src: "{{ new_backup }}"
-        dest: "{{ latest_link }}"
-        state: link
-        force: true
-      delegate_to: localhost
-      when: config_changed | bool
+        - name: Display OSPF neighbor table
+          ansible.builtin.debug:
+            msg: "{{ ospf_neighbors.stdout_lines[0] }}"
 
-    - name: Remove temp file when config unchanged
-      ansible.builtin.file:
-        path: "{{ new_backup }}.tmp"
-        state: absent
-      delegate_to: localhost
-      when: not (config_changed | bool)
+        - name: Assert minimum FULL adjacency count is met
+          ansible.builtin.assert:
+            that:
+              - ospf_neighbors.stdout[0] | regex_findall('FULL') | length >= expected_full_neighbors
+            fail_msg: >-
+              {{ inventory_hostname }} has
+              {{ ospf_neighbors.stdout[0] | regex_findall('FULL') | length }} FULL adjacency(ies);
+              expected >= {{ expected_full_neighbors }}.
+            success_msg: "{{ inventory_hostname }}: OSPF adjacency check passed."
 
-    - name: Find backup files older than 90 days
-      ansible.builtin.find:
-        paths: "{{ backup_dir }}"
-        patterns: "running-config_*.cfg"
-        age: "90d"
-        age_stamp: mtime
-      register: old_backups
-      delegate_to: localhost
-
-    - name: Prune expired backup files
-      ansible.builtin.file:
-        path: "{{ item.path }}"
-        state: absent
-      loop: "{{ old_backups.files }}"
-      delegate_to: localhost
-
-    - name: Report outcome per device
-      ansible.builtin.debug:
-        msg: >-
-          {{ inventory_hostname }}: {% if config_changed | bool
-          %}CONFIG CHANGED — archived {{ new_backup }}{% else
-          %}no change detected, backup skipped{% endif %}
-```
-
-This is 105 lines and covers: checksum-based change detection (avoiding redundant archive writes), block/rescue error handling with retries, per-device versioned archives with a `latest` symlink, 90-day retention pruning, and vault-referenced credentials.
+      rescue:
+        - name: Warn on adjacency verification failure
+          ansible.builtin.debug:
+            msg: >-
+              WARNING: Could not confirm {{ expected_full_neighbors }} FULL OSPF neighbor(s) on
+              {{ inventory_hostname }} after retries. Verify reachability and OSPF parameters.
