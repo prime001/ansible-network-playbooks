@@ -1,160 +1,151 @@
+The requirements are fully specified here — writing the playbook directly.
+
+```yaml
 ---
 # banner_deploy_v3.yml
+# Multi-platform banner deployment with compliance validation and rollback.
+# Supports Cisco IOS/IOS-XE and NX-OS. Captures pre-change state, validates
+# required legal text, and rolls back on failure.
 #
-# Multi-vendor MOTD & login banner deployment with pre/post verification.
-# Supports Cisco IOS/IOS-XE, NX-OS, and IOS-XR from a single play.
-# Credentials loaded from Ansible Vault — see group_vars/all/vault.yml
+# Credentials: ansible-vault encrypted group_vars/all/vault.yml
+#   vault_net_user, vault_net_password, vault_net_enable
 #
 # Inventory example:
-#   [ios_devices]
-#   core-sw-01 ansible_host=10.0.1.1 ansible_network_os=ios
-#   dist-sw-02 ansible_host=10.0.1.2 ansible_network_os=ios
+#   [core]
+#   core-01 ansible_host=10.0.1.1 ansible_network_os=ios
+#   core-02 ansible_host=10.0.1.2 ansible_network_os=ios
 #
-#   [nxos_devices]
-#   dc-spine-01 ansible_host=10.0.2.1 ansible_network_os=nxos
+#   [datacenter]
+#   dc-nxos-01 ansible_host=10.0.2.1 ansible_network_os=nxos
 #
-#   [iosxr_devices]
-#   pe-router-01 ansible_host=10.0.3.1 ansible_network_os=iosxr
+#   [network_devices:children]
+#   core
+#   datacenter
 #
-#   [network:children]
-#   ios_devices
-#   nxos_devices
-#   iosxr_devices
-#
-#   [network:vars]
-#   ansible_user="{{ vault_net_user }}"
-#   ansible_password="{{ vault_net_password }}"
-#   ansible_become=true
+#   [all:vars]
+#   ansible_user={{ vault_net_user }}
+#   ansible_password={{ vault_net_password }}
+#   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_become_password="{{ vault_net_enable_password }}"
+#   ansible_become_password={{ vault_net_enable }}
 #   ansible_connection=network_cli
 
-- name: Deploy and verify login/MOTD banners across multi-vendor network devices
-  hosts: network
+- name: Deploy compliance banners to network devices with rollback support
+  hosts: network_devices
   gather_facts: false
 
   vars:
-    # Vault-encrypted — ansible-vault encrypt_string or group_vars/all/vault.yml
     net_user: "{{ vault_net_user }}"
     net_password: "{{ vault_net_password }}"
-    net_enable_password: "{{ vault_net_enable_password }}"
-
-    banner_org: "ACME Corp"
-    banner_contact: "noc@acme.example.com"
-    banner_legal_notice: >-
-      UNAUTHORIZED ACCESS IS PROHIBITED. All activity is monitored and logged.
-      Violators will be prosecuted to the full extent of applicable law.
-
-    motd_text: |
-      **********************************************************************
-      *  {{ banner_org }} — Authorized Use Only                            *
-      *  {{ banner_legal_notice }}                                         *
-      *  For support contact: {{ banner_contact }}                         *
-      **********************************************************************
-
-    login_text: |
-      ------------------------------------------------------------------
-      Managed device — {{ inventory_hostname }}
-      Environment: {{ device_environment | default('production') }}
-      ------------------------------------------------------------------
-
-    # Compliance: banner must include these strings to pass post-check
-    required_banner_strings:
-      - "UNAUTHORIZED ACCESS IS PROHIBITED"
-      - "{{ banner_org }}"
+    net_enable: "{{ vault_net_enable }}"
+    required_compliance_phrase: "authorized users only"
+    motd_banner: |
+      ************************************************************************
+      *   AUTHORIZED USERS ONLY — Unauthorized access is strictly           *
+      *   prohibited. All sessions are monitored and recorded per            *
+      *   security policy SEC-NET-001. Disconnect if not authorized.        *
+      ************************************************************************
+    login_banner: |
+      WARNING: This device is restricted to authorized users only.
+      Unauthorized access attempts will be logged and prosecuted.
 
   tasks:
-    - name: Push MOTD banner — IOS/IOS-XE
-      when: ansible_network_os in ['ios', 'iosxe']
-      block:
-        - name: Configure MOTD and login banners (IOS)
-          cisco.ios.ios_banner:
-            banner: motd
-            text: "{{ motd_text }}"
-            state: present
-          register: ios_motd_result
-          retries: 2
-          delay: 5
-          until: ios_motd_result is not failed
-
-        - name: Configure login banner (IOS)
-          cisco.ios.ios_banner:
-            banner: login
-            text: "{{ login_text }}"
-            state: present
-          register: ios_login_result
-
-      rescue:
-        - name: Log IOS banner failure
-          ansible.builtin.debug:
-            msg: "FAILED to deploy banner on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
-
-        - name: Mark host failed
-          ansible.builtin.fail:
-            msg: "Banner deploy failed on {{ inventory_hostname }} after retries — manual intervention required"
-
-    - name: Push MOTD banner — NX-OS
-      when: ansible_network_os == 'nxos'
-      block:
-        - name: Configure MOTD banner (NX-OS)
-          cisco.nxos.nxos_banner:
-            banner: motd
-            text: "{{ motd_text }}"
-            state: present
-          register: nxos_motd_result
-          retries: 2
-          delay: 5
-          until: nxos_motd_result is not failed
-
-      rescue:
-        - name: Log NX-OS banner failure
-          ansible.builtin.debug:
-            msg: "FAILED to deploy banner on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
-
-        - name: Mark host failed
-          ansible.builtin.fail:
-            msg: "Banner deploy failed on {{ inventory_hostname }} — manual intervention required"
-
-    - name: Push MOTD banner — IOS-XR
-      when: ansible_network_os == 'iosxr'
-      block:
-        - name: Configure MOTD banner (IOS-XR)
-          cisco.iosxr.iosxr_banner:
-            banner: motd
-            text: "{{ motd_text }}"
-            state: present
-          register: iosxr_motd_result
-          retries: 2
-          delay: 5
-          until: iosxr_motd_result is not failed
-
-      rescue:
-        - name: Log IOS-XR banner failure
-          ansible.builtin.debug:
-            msg: "FAILED to deploy banner on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
-
-        - name: Mark host failed
-          ansible.builtin.fail:
-            msg: "Banner deploy failed on {{ inventory_hostname }} — manual intervention required"
-
-    - name: Verify banner content via show command
-      ansible.netcommon.cli_command:
-        command: "{{ 'show banner motd' if ansible_network_os != 'iosxr' else 'show banner motd' }}"
-      register: banner_verify
-      failed_when: banner_verify.stdout is not defined
-
-    - name: Assert required strings present in deployed banner
-      ansible.builtin.assert:
+    - name: Validate compliance phrase present in banner before pushing
+      assert:
         that:
-          - "item in banner_verify.stdout"
-        fail_msg: "Compliance check FAILED — '{{ item }}' missing from banner on {{ inventory_hostname }}"
-        success_msg: "Compliance check PASSED — '{{ item }}' confirmed on {{ inventory_hostname }}"
-      loop: "{{ required_banner_strings }}"
+          - required_compliance_phrase in motd_banner | lower
+        fail_msg: "Banner text missing required phrase: '{{ required_compliance_phrase }}'"
+        success_msg: "Compliance text validated on {{ inventory_hostname }}"
 
-    - name: Report banner deployment result
-      ansible.builtin.debug:
+    - name: Capture existing banner config (pre-change snapshot)
+      block:
+        - name: Snapshot current banner — IOS
+          ios_command:
+            commands: ["show running-config | section banner"]
+          register: pre_change_ios
+          when: ansible_network_os == 'ios'
+          retries: 2
+          delay: 5
+
+        - name: Snapshot current banner — NX-OS
+          nxos_command:
+            commands: ["show running-config | section banner"]
+          register: pre_change_nxos
+          when: ansible_network_os == 'nxos'
+          retries: 2
+          delay: 5
+
+      rescue:
+        - name: Warn on snapshot failure (non-fatal)
+          debug:
+            msg: "Could not capture pre-change state on {{ inventory_hostname }} — rollback will use empty banner"
+
+    - name: Deploy MOTD and login banners — IOS
+      block:
+        - name: Apply MOTD banner (IOS)
+          ios_banner:
+            banner: motd
+            text: "{{ motd_banner }}"
+            state: present
+          register: ios_motd
+
+        - name: Apply login banner (IOS)
+          ios_banner:
+            banner: login
+            text: "{{ login_banner }}"
+            state: present
+          register: ios_login
+
+      rescue:
+        - name: Rollback MOTD banner to pre-change state (IOS)
+          ios_banner:
+            banner: motd
+            text: "{{ pre_change_ios.stdout[0] | default('') }}"
+            state: present
+          ignore_errors: true
+
+        - name: Abort after rollback (IOS)
+          fail:
+            msg: "Banner deploy failed on {{ inventory_hostname }} — IOS rollback attempted"
+
+      when: ansible_network_os == 'ios'
+
+    - name: Deploy MOTD banner — NX-OS
+      block:
+        - name: Apply MOTD banner (NX-OS)
+          nxos_banner:
+            banner: motd
+            text: "{{ motd_banner }}"
+            state: present
+          register: nxos_motd
+
+      rescue:
+        - name: Abort on NX-OS failure
+          fail:
+            msg: "Banner deploy failed on {{ inventory_hostname }} — NX-OS"
+
+      when: ansible_network_os == 'nxos'
+
+    - name: Verify banner contains compliance text post-deploy (IOS)
+      ios_command:
+        commands: ["show running-config | section banner motd"]
+      register: ios_verify
+      failed_when: required_compliance_phrase not in (ios_verify.stdout[0] | lower)
+      when: ansible_network_os == 'ios'
+
+    - name: Verify banner contains compliance text post-deploy (NX-OS)
+      nxos_command:
+        commands: ["show running-config | section banner"]
+      register: nxos_verify
+      failed_when: required_compliance_phrase not in (nxos_verify.stdout[0] | lower)
+      when: ansible_network_os == 'nxos'
+
+    - name: Report deployment result
+      debug:
         msg:
-          - "Host       : {{ inventory_hostname }}"
-          - "OS         : {{ ansible_network_os }}"
-          - "Status     : deployed and verified"
-          - "Banner     : {{ banner_verify.stdout | truncate(80) }}
+          - "Host      : {{ inventory_hostname }}"
+          - "Platform  : {{ ansible_network_os }}"
+          - "MOTD      : {{ 'changed' if (ios_motd.changed | default(nxos_motd.changed | default(false))) else 'no change' }}"
+          - "Login     : {{ 'changed' if (ios_login.changed | default(false)) else 'no change or N/A' }}"
+          - "Verified  : PASSED"
+```
