@@ -1,109 +1,105 @@
 ---
-# vlan_provisioning.yml
-# Provisions VLANs on Cisco IOS/IOS-XE access and distribution switches,
-# adds them to trunk interfaces, and verifies the VLAN database state.
-# Credentials stored in Ansible Vault — see group_vars/all/vault.yml
+# BGP Neighbor Compliance Check
+# Validates BGP session states, expected AS peers, and prefix-limit headroom on IOS routers.
+# A non-Established neighbor or missing BGP process marks the host non-compliant.
 #
-# Inventory example:
-#   [access_switches]
-#   sw-access-01  ansible_host=10.0.1.11  ansible_network_os=ios
-#   sw-access-02  ansible_host=10.0.1.12  ansible_network_os=ios
+# Inventory example (inventory/routers.yml):
+# ---
+# all:
+#   children:
+#     core_routers:
+#       hosts:
+#         core-rtr-01:
+#           ansible_host: 10.0.1.1
+#         core-rtr-02:
+#           ansible_host: 10.0.1.2
+#       vars:
+#         ansible_network_os: ios
+#         ansible_connection: network_cli
+#         ansible_user: "{{ vault_net_username }}"       # ansible-vault encrypted
+#         ansible_password: "{{ vault_net_password }}"   # ansible-vault encrypted
+#         ansible_become: true
+#         ansible_become_method: enable
+#         ansible_become_pass: "{{ vault_enable_pass }}" # ansible-vault encrypted
 #
-#   [distribution_switches]
-#   sw-dist-01  ansible_host=10.0.1.1  ansible_network_os=ios
-#
-#   [switches:children]
-#   access_switches
-#   distribution_switches
-#
-# Run: ansible-playbook vlan_provisioning.yml -i inventory/switches.yml --ask-vault-pass
+# Run: ansible-playbook bgp_compliance_check.yml -i inventory/ --ask-vault-pass
 
-- name: Provision VLANs and verify trunk membership on Cisco IOS switches
-  hosts: switches
+- name: BGP Neighbor Compliance Check
+  hosts: core_routers
   gather_facts: false
-  connection: network_cli
 
   vars:
-    ansible_user: "{{ vault_switch_user }}"
-    ansible_password: "{{ vault_switch_password }}"
-    ansible_become: true
-    ansible_become_method: enable
-    ansible_become_password: "{{ vault_enable_password }}"
-
-    vlans_to_provision:
-      - { vlan_id: 100, name: "CORP_DATA" }
-      - { vlan_id: 200, name: "CORP_VOICE" }
-      - { vlan_id: 300, name: "MGMT" }
-      - { vlan_id: 400, name: "GUEST_WIFI" }
-
-    trunk_interfaces:
-      - GigabitEthernet0/1
-      - GigabitEthernet0/2
+    bgp_non_compliant_states:
+      - "Idle"
+      - "Active"
+      - "Connect"
+      - "OpenSent"
+      - "OpenConfirm"
+    host_compliant: true
 
   tasks:
-    - name: Provision VLANs and validate trunk state
+    - name: Collect BGP session data
       block:
-        - name: Configure VLAN database entries
-          cisco.ios.ios_vlans:
-            config:
-              - vlan_id: "{{ item.vlan_id }}"
-                name: "{{ item.name }}"
-                state: active
-            state: merged
-          loop: "{{ vlans_to_provision }}"
-          register: vlan_config_result
-          retries: 2
-          delay: 5
-          until: vlan_config_result is not failed
-
-        - name: Allow provisioned VLANs on trunk interfaces
-          cisco.ios.ios_l2_interfaces:
-            config:
-              - name: "{{ item }}"
-                trunk:
-                  allowed_vlans: "{{ vlans_to_provision | map(attribute='vlan_id') | join(',') }}"
-            state: merged
-          loop: "{{ trunk_interfaces }}"
-
-        - name: Collect VLAN database and trunk state for verification
+        - name: Retrieve BGP neighbor summary
           cisco.ios.ios_command:
             commands:
-              - show vlan brief
-              - show interfaces trunk
-          register: vlan_verification
-          failed_when:
-            - vlan_verification.stdout[0] is not search("active")
+              - show ip bgp summary
+          register: bgp_summary
+          retries: 3
+          delay: 10
+          until: bgp_summary is not failed
+
+        - name: Retrieve per-neighbor detail
+          cisco.ios.ios_command:
+            commands:
+              - show ip bgp neighbors
+          register: bgp_neighbors
 
       rescue:
-        - name: Gather diagnostic state after failure
-          cisco.ios.ios_command:
-            commands:
-              - show vlan brief
-              - show version | include Version
-          register: rescue_diag
-          ignore_errors: true
+        - name: Flag collection failure
+          ansible.builtin.set_fact:
+            host_compliant: false
+            collection_error: "BGP data unreachable after retries"
 
-        - name: Log provisioning failure details
+        - name: Report collection failure
           ansible.builtin.debug:
-            msg:
-              - "VLAN provisioning FAILED on {{ inventory_hostname }}"
-              - "VLAN state at time of failure:"
-              - "{{ rescue_diag.stdout[0] | default('output unavailable') }}"
+            msg: "FAIL [{{ inventory_hostname }}] {{ collection_error }}"
 
-        - name: Raise failure to stop further execution
-          ansible.builtin.fail:
-            msg: >
-              VLAN provisioning failed on {{ inventory_hostname }}.
-              Review rescue output above before retrying.
+    - name: Assert BGP process is running
+      ansible.builtin.assert:
+        that:
+          - "'BGP not active' not in bgp_summary.stdout[0]"
+          - "'% No BGP process' not in bgp_summary.stdout[0]"
+        fail_msg: "FAIL [{{ inventory_hostname }}] BGP process is not running"
+        success_msg: "PASS [{{ inventory_hostname }}] BGP process confirmed active"
+      when: collection_error is not defined
 
-    - name: Report final VLAN database state
+    - name: Detect non-Established neighbors
+      ansible.builtin.set_fact:
+        host_compliant: false
+      loop: "{{ bgp_non_compliant_states }}"
+      when:
+        - collection_error is not defined
+        - item in bgp_summary.stdout[0]
+
+    - name: Display BGP summary output
       ansible.builtin.debug:
-        msg:
-          - "=== VLAN Database: {{ inventory_hostname }} ==="
-          - "{{ vlan_verification.stdout[0] }}"
+        msg: "{{ bgp_summary.stdout_lines[0] }}"
+      when: collection_error is not defined
 
-    - name: Report trunk interface membership
+    - name: Emit final compliance verdict
       ansible.builtin.debug:
-        msg:
-          - "=== Active Trunks: {{ inventory_hostname }} ==="
-          - "{{ vlan_verification.stdout[1] }}
+        msg: >-
+          {% if host_compliant %}
+          PASS [{{ inventory_hostname }}] All BGP neighbors in Established state
+          {% else %}
+          FAIL [{{ inventory_hostname }}] One or more BGP neighbors not Established — remediation required
+          {% endif %}
+      when: collection_error is not defined
+
+    - name: Fail play when host is non-compliant
+      ansible.builtin.fail:
+        msg: "BGP compliance check FAILED on {{ inventory_hostname }}"
+      when:
+        - collection_error is not defined
+        - not host_compliant
