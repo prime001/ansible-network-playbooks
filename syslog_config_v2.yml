@@ -1,105 +1,87 @@
+```yaml
 ---
-# logging_optimization.yml
-#
-# Tunes IOS logging buffer, applies rate-limits and discriminators to reduce
-# noise, then verifies configured syslog servers are reachable from each device.
-# Distinct from syslog_config.yml (server destinations) — this playbook handles
-# logging subsystem performance and connectivity validation.
-#
-# Credentials: ansible-vault encrypted vars in group_vars/network/vault.yml
-#   vault_ansible_user, vault_ansible_password, vault_ansible_become_password
+# syslog_filtering.yml
+# Configures advanced syslog filtering, discriminators, and rate-limiting on IOS/IOS-XE.
+# Complements syslog_config.yml (server targeting) with per-severity filtering and
+# buffer tuning — useful when basic syslog is already deployed but noise needs taming.
 #
 # Inventory example:
-#   [core_switches]
-#   core-sw-01  ansible_host=10.0.0.1
-#   core-sw-02  ansible_host=10.0.0.2
+#   [core_routers]
+#   r1 ansible_host=10.0.1.1
+#   r2 ansible_host=10.0.1.2
 #
-#   [distribution_routers]
-#   dist-rtr-01  ansible_host=10.0.1.1
-#
-#   [network:children]
-#   core_switches
-#   distribution_routers
-#
-#   [network:vars]
+#   [core_routers:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
+#   ansible_user={{ vault_net_user }}        # ansible-vault encrypted
+#   ansible_password={{ vault_net_password }}
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_net_enable }}
 
-- name: IOS Logging Optimization - Buffer Tuning, Rate-Limits, and Reachability Audit
-  hosts: network
+- name: Configure syslog filtering, discriminators, and buffer tuning
+  hosts: core_routers
   gather_facts: false
-  vars:
-    ansible_user: "{{ vault_ansible_user }}"
-    ansible_password: "{{ vault_ansible_password }}"
-    ansible_become: true
-    ansible_become_method: enable
-    ansible_become_password: "{{ vault_ansible_become_password }}"
 
-    logging_buffer_size: 1048576
-    logging_rate_limit_per_sec: 500
-    logging_rate_limit_except_severity: 3
-    syslog_servers:
-      - host: 10.255.0.10
-        vrf: MGMT
-      - host: 10.255.0.11
-        vrf: MGMT
+  vars:
+    syslog_buffer_size: 65536
+    syslog_buffer_severity: informational
+    syslog_rate_limit: 10000        # messages per second, console
+    syslog_source_interface: Loopback0
+    discriminator_name: NOSEC
+    discriminator_drop_pattern: "^%SEC-6-IPACCESSLOG"   # drop ACL hit noise
 
   tasks:
-    - name: Apply logging buffer and rate-limit tuning
-      block:
-        - name: Configure buffer size, rate-limit, and debug discriminator
-          cisco.ios.ios_config:
-            lines:
-              - "logging buffered {{ logging_buffer_size }} informational"
-              - "logging rate-limit {{ logging_rate_limit_per_sec }} except {{ logging_rate_limit_except_severity }}"
-              - "logging discriminator DROP_DEBUG severity drops 7"
-              - "logging buffered discriminator DROP_DEBUG"
-            match: line
-          register: buffer_config
-          retries: 2
-          delay: 5
-          until: buffer_config is not failed
+    - name: Apply syslog buffer size and severity
+      cisco.ios.ios_config:
+        lines:
+          - "logging buffered {{ syslog_buffer_size }} {{ syslog_buffer_severity }}"
+        replace: line
+      register: buffer_result
+      retries: 2
+      delay: 5
+      until: buffer_result is not failed
 
-        - name: Report buffer configuration outcome
-          ansible.builtin.debug:
-            msg: "{{ inventory_hostname }}: logging buffer/rate-limit applied (changed={{ buffer_config.changed }})"
-
-      rescue:
-        - name: Alert on configuration failure
-          ansible.builtin.debug:
-            msg: "ERROR on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
-
-        - name: Fail host after rescue logging
-          ansible.builtin.fail:
-            msg: "Logging optimization failed on {{ inventory_hostname }} — manual review required"
-
-    - name: Ping each syslog server from device
-      cisco.ios.ios_command:
-        commands:
-          - "ping vrf {{ item.vrf }} {{ item.host }} repeat 5 timeout 2"
-      loop: "{{ syslog_servers }}"
-      register: syslog_ping
-      failed_when: false
-
-    - name: Report syslog server reachability
-      ansible.builtin.debug:
-        msg: >-
-          {{ inventory_hostname }} -> {{ item.item.host }} (VRF={{ item.item.vrf }}):
-          {{ 'REACHABLE' if ('!!!!' in item.stdout[0] or 'Success rate is 100' in item.stdout[0])
-          else 'UNREACHABLE - verify routing and VRF assignment' }}
-      loop: "{{ syslog_ping.results }}"
-      loop_control:
-        label: "{{ item.item.host }}"
-
-    - name: Collect logging drop and rate-limit counters
-      cisco.ios.ios_command:
-        commands:
-          - "show logging | include dropped|rate-limited|Buffer logging"
-      register: logging_stats
+    - name: Set syslog source interface
+      cisco.ios.ios_config:
+        lines:
+          - "logging source-interface {{ syslog_source_interface }}"
+      register: src_iface_result
       failed_when:
-        - logging_stats.failed is defined
-        - logging_stats.failed
+        - src_iface_result.failed
+        - "'Invalid' not in (src_iface_result.msg | default(''))"
 
-    - name: Display logging subsystem statistics
+    - name: Configure console rate-limiting to prevent storm
+      cisco.ios.ios_config:
+        lines:
+          - "logging rate-limit {{ syslog_rate_limit }}"
+
+    - name: Create message discriminator to drop ACL noise
+      cisco.ios.ios_config:
+        lines:
+          - "logging discriminator {{ discriminator_name }} mnemonics drops {{ discriminator_drop_pattern }}"
+          - "logging buffered discriminator {{ discriminator_name }}"
+
+    - name: Verify syslog configuration on device
+      cisco.ios.ios_command:
+        commands:
+          - show logging | include Logging to|Buffered|rate-limit|discriminator|Source
+      register: syslog_verify
+      failed_when: "'Logging to' not in syslog_verify.stdout[0]"
+
+    - name: Display syslog verification output
       ansible.builtin.debug:
-        var: logging_stats.stdout_lines
+        msg: "{{ inventory_hostname }} syslog state:\n{{ syslog_verify.stdout[0] }}"
+
+    - name: Save running config after changes
+      cisco.ios.ios_command:
+        commands:
+          - write memory
+      register: save_result
+      when:
+        - buffer_result.changed or src_iface_result.changed
+
+    - name: Report save status
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: config saved — {{ save_result.stdout[0] | default('no save needed') }}"
+```
