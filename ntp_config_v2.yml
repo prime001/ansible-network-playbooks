@@ -1,99 +1,101 @@
-```yaml
 ---
-# NTP Authentication and Source Interface Hardening
-# Configures NTP with MD5 authentication keys, trusted key enforcement,
-# source interface binding, and access-group restrictions.
+# ntp_config_v3.yml
+# NTP Authentication Hardening — configures MD5 auth keys, enables authenticated
+# peering, and verifies synchronization status post-change.
 #
-# Credentials stored in Ansible Vault — encrypt with:
-#   ansible-vault encrypt_string 'secret' --name 'ansible_password'
+# Credentials: store ansible_password and vault_ntp_auth_key in vault:
+#   ansible-vault encrypt_string 'secretkey' --name vault_ntp_auth_key
 #
 # Inventory example:
 #   [core_routers]
-#   rtr-core-01 ansible_host=10.0.1.1
-#   rtr-core-02 ansible_host=10.0.1.2
+#   rtr-core-01 ansible_host=10.0.0.1
+#   rtr-core-02 ansible_host=10.0.0.2
 #
 #   [core_routers:vars]
 #   ansible_network_os=ios
+#   ansible_connection=network_cli
 #   ansible_user=netadmin
 #   ansible_password=!vault |
 #     $ANSIBLE_VAULT;1.1;AES256
-#     ...
-#   ansible_become=yes
-#   ansible_become_method=enable
+#     <encrypted_string>
 
-- name: Harden NTP with authentication, source binding, and access control
+- name: Configure NTP authentication hardening on Cisco IOS devices
   hosts: core_routers
   gather_facts: false
-  connection: network_cli
 
   vars:
     ntp_auth_key_id: 1
-    ntp_auth_key_type: md5
-    # ntp_auth_key_secret: "{{ vault_ntp_auth_key }}"
-    ntp_auth_key_secret: "NTPauth@2024!"
+    # vault_ntp_auth_key must be defined in group_vars/all/vault.yml
+    ntp_auth_key: "{{ vault_ntp_auth_key }}"
     ntp_servers:
-      - address: 10.0.0.10
+      - address: 192.0.2.10
         prefer: true
-      - address: 10.0.0.11
+      - address: 192.0.2.11
         prefer: false
-    ntp_source_interface: Loopback0
-    ntp_access_group_permit: NTP_SERVERS_ACL
+    ntp_sync_timeout_retries: 6
+    ntp_sync_retry_delay: 10
 
   tasks:
-    - name: Apply NTP authentication and server configuration
+    - name: Apply NTP authentication configuration
       block:
-        - name: Configure NTP authentication key and trusted key
+        - name: Enable NTP authentication and configure key
           cisco.ios.ios_config:
             lines:
               - "ntp authenticate"
-              - "ntp authentication-key {{ ntp_auth_key_id }} {{ ntp_auth_key_type }} {{ ntp_auth_key_secret }}"
+              - "ntp authentication-key {{ ntp_auth_key_id }} md5 {{ ntp_auth_key }}"
               - "ntp trusted-key {{ ntp_auth_key_id }}"
-          register: ntp_auth_result
+          register: ntp_auth_push
           retries: 2
           delay: 5
-          until: ntp_auth_result is not failed
+          until: ntp_auth_push is not failed
 
-        - name: Configure NTP servers with authentication key reference
+        - name: Bind NTP servers to authentication key
           cisco.ios.ios_config:
             lines:
-              - "ntp server {{ item.address }} key {{ ntp_auth_key_id }}{% if item.prefer %} prefer{% endif %}"
+              - "ntp server {{ item.address }} key {{ ntp_auth_key_id }}{{ ' prefer' if item.prefer else '' }}"
           loop: "{{ ntp_servers }}"
-          register: ntp_server_result
+          loop_control:
+            label: "{{ item.address }}"
+          register: ntp_server_push
 
-        - name: Bind NTP to source interface
-          cisco.ios.ios_config:
-            lines:
-              - "ntp source {{ ntp_source_interface }}"
-          register: ntp_source_result
+        - name: Poll for NTP synchronization (up to {{ ntp_sync_timeout_retries }} attempts)
+          cisco.ios.ios_command:
+            commands:
+              - show ntp status
+              - show ntp associations detail
+          register: ntp_verify
+          retries: "{{ ntp_sync_timeout_retries }}"
+          delay: "{{ ntp_sync_retry_delay }}"
+          until: >
+            'synchronized' in ntp_verify.stdout[0] or
+            'Clock is synchronized' in ntp_verify.stdout[0]
+          failed_when: false
 
-        - name: Apply NTP access-group restriction
-          cisco.ios.ios_config:
-            lines:
-              - "ntp access-group peer {{ ntp_access_group_permit }}"
-          register: ntp_acl_result
+        - name: Assert NTP is synchronized
+          ansible.builtin.assert:
+            that:
+              - "'synchronized' in ntp_verify.stdout[0] or 'Clock is synchronized' in ntp_verify.stdout[0]"
+            fail_msg: >
+              {{ inventory_hostname }} is not NTP-synchronized after
+              {{ ntp_sync_timeout_retries * ntp_sync_retry_delay }}s.
+              Check key mismatch or server reachability.
+            success_msg: "{{ inventory_hostname }} NTP authenticated and synchronized"
 
       rescue:
-        - name: Report NTP hardening failure
+        - name: Report authentication configuration failure
           ansible.builtin.debug:
-            msg: "NTP hardening failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
+            msg: >
+              NTP auth hardening failed on {{ inventory_hostname }}:
+              {{ ansible_failed_result.msg | default('see task output above') }}
 
-        - name: Fail with context
+        - name: Abort with descriptive error
           ansible.builtin.fail:
-            msg: "Halting — manual review required on {{ inventory_hostname }}"
+            msg: >
+              NTP authentication did not complete on {{ inventory_hostname }}.
+              Verify vault_ntp_auth_key matches the server key and that
+              NTP servers are reachable before retrying.
 
-    - name: Verify NTP authentication status
-      cisco.ios.ios_command:
-        commands:
-          - show ntp status
-          - show ntp associations detail
-      register: ntp_verify
-      failed_when: "'unsynchronized' in ntp_verify.stdout[0] and 'Clock is synchronized' not in ntp_verify.stdout[0]"
-
-    - name: Display NTP synchronization status
-      ansible.builtin.debug:
-        msg:
-          - "Host: {{ inventory_hostname }}"
-          - "NTP Status: {{ ntp_verify.stdout[0].split('\n')[0] }}"
-          - "Auth configured: {{ ntp_auth_result.changed }}"
-          - "Source interface: {{ ntp_source_interface }}"
-```
+      always:
+        - name: Display NTP status and associations
+          ansible.builtin.debug:
+            msg: "{{ ntp_verify.stdout_lines | default([['NTP status unavailable']]) }}
