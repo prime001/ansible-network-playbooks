@@ -1,154 +1,125 @@
 ---
-# qos_policy_deploy.yml
-# Deploys QoS class-maps, policy-maps, and service-policy bindings to IOS/IOS-XE devices.
-# Covers traffic classification (DSCP), bandwidth guarantees, and interface application.
-# Distinct from acl_deploy: QoS operates on traffic shaping/scheduling, not permit/deny filtering.
+# prefix_list_route_map_deploy.yml
 #
-# Inventory example (inventory/network.yml):
-# ---
-# all:
-#   children:
-#     core_switches:
-#       hosts:
-#         core-sw-01:
-#           ansible_host: 192.168.1.1
-#           ansible_network_os: ios
-#           ansible_user: "{{ vault_net_user }}"
-#           ansible_password: "{{ vault_net_pass }}"
-#           ansible_become: true
-#           ansible_become_method: enable
-#           ansible_become_pass: "{{ vault_enable_pass }}"
+# Deploys BGP prefix lists and route maps for routing policy control.
+# Distinct from traffic ACLs (acl_deploy.yml): these filters operate at the
+# routing layer to control which prefixes are accepted/advertised via BGP.
 #
-# Usage:
-#   ansible-playbook qos_policy_deploy.yml -i inventory/network.yml --ask-vault-pass
-#   ansible-playbook qos_policy_deploy.yml -i inventory/network.yml --vault-password-file ~/.vault_pass
-#   ansible-playbook qos_policy_deploy.yml -i inventory/network.yml -e "target_hosts=dist_switches"
+# Inventory example:
+#   [core_routers]
+#   rtr-core-01  ansible_host=10.0.1.1
+#   rtr-core-02  ansible_host=10.0.1.2
+#
+#   [core_routers:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user="{{ vault_net_user }}"        # ansible-vault: group_vars/all/vault.yml
+#   ansible_password="{{ vault_net_pass }}"
+#   ansible_become=true
+#   ansible_become_method=enable
+#   ansible_become_pass="{{ vault_enable_pass }}"
 
-- name: Deploy QoS Classification and Queuing Policies
-  hosts: "{{ target_hosts | default('core_switches') }}"
+- name: Deploy BGP prefix lists and route maps for routing policy
+  hosts: core_routers
   gather_facts: false
-  connection: network_cli
-
-  vars:
-    # Credentials must be defined in an Ansible Vault-encrypted file
-    # e.g.: ansible-vault create group_vars/all/vault.yml
-    ansible_user: "{{ vault_net_user }}"
-    ansible_password: "{{ vault_net_pass }}"
-    ansible_become_pass: "{{ vault_enable_pass }}"
-
-    policy_map_name: WAN-EDGE-EGRESS
-
-    class_definitions:
-      - name: VOIP-RTP
-        match_dscp: ef
-        priority_percent: 20
-      - name: VIDEO-CONF
-        match_dscp: af41
-        bandwidth_percent: 20
-      - name: BUSINESS-DATA
-        match_dscp: af21
-        bandwidth_percent: 25
-      - name: BULK-TRANSFER
-        match_dscp: af11
-        bandwidth_percent: 10
-
-    qos_interfaces:
-      - name: GigabitEthernet0/0/1
-        direction: output
-      - name: GigabitEthernet0/0/2
-        direction: output
 
   tasks:
-    - name: Verify device connectivity before making changes
-      cisco.ios.ios_command:
-        commands:
-          - show version
-      register: platform_info
-      retries: 3
-      delay: 5
-      until: platform_info is not failed
-
-    - name: Display target platform
-      ansible.builtin.debug:
-        msg: >-
-          {{ inventory_hostname }} ready |
-          {{ platform_info.stdout[0] | regex_search('Version [\\d.()A-Za-z]+') | default('version unknown') }}
-
-    - name: Apply QoS configuration
+    - name: Apply routing policy configuration
       block:
-        - name: Configure DSCP-based class-maps
+        - name: Deploy inbound customer prefix list
           cisco.ios.ios_config:
             lines:
-              - "class-map match-all {{ item.name }}"
-              - "  match ip dscp {{ item.match_dscp }}"
-          loop: "{{ class_definitions }}"
-          loop_control:
-            label: "{{ item.name }}"
-          register: classmap_result
+              - ip prefix-list PL_CUSTOMER_IN description Accepted customer inbound prefixes
+              - ip prefix-list PL_CUSTOMER_IN seq 10 permit 192.168.0.0/24 le 32
+              - ip prefix-list PL_CUSTOMER_IN seq 20 permit 10.100.0.0/16 le 24
+              - ip prefix-list PL_CUSTOMER_IN seq 100 deny 0.0.0.0/0 le 32
+          register: customer_pl_result
+          retries: 2
+          delay: 5
+          until: customer_pl_result is not failed
 
-        - name: Build policy-map with per-class treatment
-          cisco.ios.ios_config:
-            lines: >-
-              {{
-                ['policy-map ' + policy_map_name,
-                 '  class ' + item.name] +
-                (['    priority percent ' + (item.priority_percent | string)]
-                  if item.priority_percent is defined else
-                  ['    bandwidth percent ' + (item.bandwidth_percent | string)])
-              }}
-          loop: "{{ class_definitions }}"
-          loop_control:
-            label: "{{ item.name }}"
-          register: policymap_result
-
-        - name: Bind service-policy to WAN interfaces
+        - name: Deploy outbound upstream prefix list
           cisco.ios.ios_config:
             lines:
-              - "service-policy {{ item.direction }} {{ policy_map_name }}"
-            parents: "interface {{ item.name }}"
-          loop: "{{ qos_interfaces }}"
-          loop_control:
-            label: "{{ item.name }}"
-          register: interface_result
+              - ip prefix-list PL_UPSTREAM_OUT description Prefixes advertised to upstream ISP
+              - ip prefix-list PL_UPSTREAM_OUT seq 10 permit 203.0.113.0/24
+              - ip prefix-list PL_UPSTREAM_OUT seq 100 deny 0.0.0.0/0 le 32
+          register: upstream_pl_result
+          retries: 2
+          delay: 5
+          until: upstream_pl_result is not failed
 
-      rescue:
-        - name: Capture device state for troubleshooting
+        - name: Deploy inbound route map with local-preference
+          cisco.ios.ios_config:
+            parents: route-map RM_CUSTOMER_IN permit 10
+            lines:
+              - match ip address prefix-list PL_CUSTOMER_IN
+              - set local-preference 200
+          register: rm_in_result
+          retries: 2
+          delay: 5
+          until: rm_in_result is not failed
+
+        - name: Deploy outbound route map with community tagging
+          cisco.ios.ios_config:
+            parents: route-map RM_UPSTREAM_OUT permit 10
+            lines:
+              - match ip address prefix-list PL_UPSTREAM_OUT
+              - set community 65000:100 additive
+          register: rm_out_result
+          retries: 2
+          delay: 5
+          until: rm_out_result is not failed
+
+        - name: Verify prefix lists exist on device
           cisco.ios.ios_command:
             commands:
-              - show policy-map
-              - show class-map
-          register: failure_state
-          ignore_errors: true
+              - show ip prefix-list PL_CUSTOMER_IN
+              - show ip prefix-list PL_UPSTREAM_OUT
+          register: prefix_verify
+          failed_when: >
+            'PL_CUSTOMER_IN' not in prefix_verify.stdout[0] or
+            'PL_UPSTREAM_OUT' not in prefix_verify.stdout[1]
 
-        - name: Display failure context
+        - name: Verify route maps exist on device
+          cisco.ios.ios_command:
+            commands:
+              - show route-map RM_CUSTOMER_IN
+              - show route-map RM_UPSTREAM_OUT
+          register: routemap_verify
+          failed_when: >
+            'RM_CUSTOMER_IN' not in routemap_verify.stdout[0] or
+            'RM_UPSTREAM_OUT' not in routemap_verify.stdout[1]
+
+        - name: Save running configuration
+          cisco.ios.ios_command:
+            commands:
+              - write memory
+          register: save_result
+          failed_when: >
+            'OK' not in save_result.stdout[0] and
+            'Building configuration' not in save_result.stdout[0]
+
+      rescue:
+        - name: Report deployment failure
           ansible.builtin.debug:
-            msg:
-              - "QoS deployment failed on {{ inventory_hostname }}"
-              - "Failed task: {{ ansible_failed_task.name }}"
-              - "Error: {{ ansible_failed_result.msg | default('check failure_state below') }}"
-              - "{{ failure_state.stdout_lines | default([]) }}"
+            msg: >
+              Routing policy deployment failed on {{ inventory_hostname }}.
+              Task: {{ ansible_failed_task.name | default('unknown') }}.
+              Error: {{ ansible_failed_result.msg | default('check device connectivity and privilege level') }}
 
-        - name: Abort with actionable message
+        - name: Fail with actionable message
           ansible.builtin.fail:
-            msg: "Halted QoS deployment on {{ inventory_hostname }} — no partial config was saved."
+            msg: "BGP routing policy deployment failed on {{ inventory_hostname }}. Resolve errors before retrying."
 
-    - name: Verify policy-map is active on interfaces
-      cisco.ios.ios_command:
-        commands:
-          - "show policy-map interface {{ item.name }}"
-      loop: "{{ qos_interfaces }}"
-      loop_control:
-        label: "{{ item.name }}"
-      register: qos_verification
-      failed_when: policy_map_name not in qos_verification.stdout | join
-
-    - name: Display per-interface QoS statistics
+    - name: Display prefix list verification output
       ansible.builtin.debug:
-        msg: "{{ item.stdout_lines }}"
-      loop: "{{ qos_verification.results }}"
-      loop_control:
-        label: "{{ item.item.name }}"
+        var: prefix_verify.stdout_lines
 
-    - name: Persist configuration to NVRAM
-      cisco.ios.ios_config:
-        save_when: modified
+    - name: Display route map verification output
+      ansible.builtin.debug:
+        var: routemap_verify.stdout_lines
+
+    - name: Confirm successful deployment
+      ansible.builtin.debug:
+        msg: "BGP routing policy (prefix lists + route maps) deployed successfully on {{ inventory_hostname }}
