@@ -1,125 +1,112 @@
+```yaml
 ---
-# prefix_list_route_map_deploy.yml
-#
-# Deploys BGP prefix lists and route maps for routing policy control.
-# Distinct from traffic ACLs (acl_deploy.yml): these filters operate at the
-# routing layer to control which prefixes are accepted/advertised via BGP.
+# acl_deploy_v3.yml — Deploy named ACLs and bind to interfaces on Cisco IOS
+# Credentials stored in Ansible Vault: group_vars/all/vault.yml
 #
 # Inventory example:
-#   [core_routers]
-#   rtr-core-01  ansible_host=10.0.1.1
-#   rtr-core-02  ansible_host=10.0.1.2
+#   [distribution_switches]
+#   dist-sw1 ansible_host=10.10.1.1
+#   dist-sw2 ansible_host=10.10.1.2
 #
-#   [core_routers:vars]
+#   [distribution_switches:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_user="{{ vault_net_user }}"        # ansible-vault: group_vars/all/vault.yml
-#   ansible_password="{{ vault_net_pass }}"
-#   ansible_become=true
+#   ansible_user={{ vault_network_user }}
+#   ansible_password={{ vault_network_password }}
+#   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_become_pass="{{ vault_enable_pass }}"
+#   ansible_become_password={{ vault_enable_password }}
 
-- name: Deploy BGP prefix lists and route maps for routing policy
-  hosts: core_routers
+- name: Deploy named extended ACLs and apply to interfaces on Cisco IOS
+  hosts: distribution_switches
   gather_facts: false
 
+  vars:
+    acl_name: MGMT_ACCESS
+    acl_direction: in
+    acl_interface: GigabitEthernet0/1
+    mgmt_permitted_hosts:
+      - 10.100.0.10
+      - 10.100.0.11
+      - 10.100.0.20
+    mgmt_network: 10.100.0.0
+    mgmt_wildcard: 0.0.0.255
+
   tasks:
-    - name: Apply routing policy configuration
+    - name: Confirm connectivity before making changes
+      cisco.ios.ios_command:
+        commands: show clock
+      register: connectivity_check
+      retries: 3
+      delay: 5
+      until: not connectivity_check.failed
+
+    - name: Snapshot existing ACL and interface state
+      cisco.ios.ios_command:
+        commands:
+          - "show ip access-lists {{ acl_name }}"
+          - "show ip interface {{ acl_interface }}"
+      register: pre_state
+
+    - name: Deploy and bind ACL
       block:
-        - name: Deploy inbound customer prefix list
+        - name: Build named extended ACL
           cisco.ios.ios_config:
             lines:
-              - ip prefix-list PL_CUSTOMER_IN description Accepted customer inbound prefixes
-              - ip prefix-list PL_CUSTOMER_IN seq 10 permit 192.168.0.0/24 le 32
-              - ip prefix-list PL_CUSTOMER_IN seq 20 permit 10.100.0.0/16 le 24
-              - ip prefix-list PL_CUSTOMER_IN seq 100 deny 0.0.0.0/0 le 32
-          register: customer_pl_result
-          retries: 2
-          delay: 5
-          until: customer_pl_result is not failed
+              - "ip access-list extended {{ acl_name }}"
+              - " remark === Managed by Ansible — do not edit manually ==="
+              - " 10 permit tcp {{ mgmt_network }} {{ mgmt_wildcard }} any eq 22"
+              - " 20 permit tcp {{ mgmt_network }} {{ mgmt_wildcard }} any eq 443"
+              - " 30 permit icmp {{ mgmt_network }} {{ mgmt_wildcard }} any"
+              - " 100 deny ip any any log"
+            match: exact
+          register: acl_config_result
 
-        - name: Deploy outbound upstream prefix list
+        - name: Apply ACL to interface
           cisco.ios.ios_config:
+            parents: "interface {{ acl_interface }}"
             lines:
-              - ip prefix-list PL_UPSTREAM_OUT description Prefixes advertised to upstream ISP
-              - ip prefix-list PL_UPSTREAM_OUT seq 10 permit 203.0.113.0/24
-              - ip prefix-list PL_UPSTREAM_OUT seq 100 deny 0.0.0.0/0 le 32
-          register: upstream_pl_result
-          retries: 2
-          delay: 5
-          until: upstream_pl_result is not failed
-
-        - name: Deploy inbound route map with local-preference
-          cisco.ios.ios_config:
-            parents: route-map RM_CUSTOMER_IN permit 10
-            lines:
-              - match ip address prefix-list PL_CUSTOMER_IN
-              - set local-preference 200
-          register: rm_in_result
-          retries: 2
-          delay: 5
-          until: rm_in_result is not failed
-
-        - name: Deploy outbound route map with community tagging
-          cisco.ios.ios_config:
-            parents: route-map RM_UPSTREAM_OUT permit 10
-            lines:
-              - match ip address prefix-list PL_UPSTREAM_OUT
-              - set community 65000:100 additive
-          register: rm_out_result
-          retries: 2
-          delay: 5
-          until: rm_out_result is not failed
-
-        - name: Verify prefix lists exist on device
-          cisco.ios.ios_command:
-            commands:
-              - show ip prefix-list PL_CUSTOMER_IN
-              - show ip prefix-list PL_UPSTREAM_OUT
-          register: prefix_verify
-          failed_when: >
-            'PL_CUSTOMER_IN' not in prefix_verify.stdout[0] or
-            'PL_UPSTREAM_OUT' not in prefix_verify.stdout[1]
-
-        - name: Verify route maps exist on device
-          cisco.ios.ios_command:
-            commands:
-              - show route-map RM_CUSTOMER_IN
-              - show route-map RM_UPSTREAM_OUT
-          register: routemap_verify
-          failed_when: >
-            'RM_CUSTOMER_IN' not in routemap_verify.stdout[0] or
-            'RM_UPSTREAM_OUT' not in routemap_verify.stdout[1]
-
-        - name: Save running configuration
-          cisco.ios.ios_command:
-            commands:
-              - write memory
-          register: save_result
-          failed_when: >
-            'OK' not in save_result.stdout[0] and
-            'Building configuration' not in save_result.stdout[0]
+              - "ip access-group {{ acl_name }} {{ acl_direction }}"
+          register: interface_bind_result
 
       rescue:
-        - name: Report deployment failure
-          ansible.builtin.debug:
-            msg: >
-              Routing policy deployment failed on {{ inventory_hostname }}.
-              Task: {{ ansible_failed_task.name | default('unknown') }}.
-              Error: {{ ansible_failed_result.msg | default('check device connectivity and privilege level') }}
+        - name: Report failure and remove partial ACL binding
+          cisco.ios.ios_config:
+            parents: "interface {{ acl_interface }}"
+            lines:
+              - "no ip access-group {{ acl_name }} {{ acl_direction }}"
+          ignore_errors: true
 
-        - name: Fail with actionable message
+        - name: Fail with rollback notice
           ansible.builtin.fail:
-            msg: "BGP routing policy deployment failed on {{ inventory_hostname }}. Resolve errors before retrying."
+            msg: "ACL deployment failed on {{ inventory_hostname }} — interface binding removed. Review logs."
 
-    - name: Display prefix list verification output
-      ansible.builtin.debug:
-        var: prefix_verify.stdout_lines
+    - name: Verify ACL was created with correct entry count
+      cisco.ios.ios_command:
+        commands:
+          - "show ip access-lists {{ acl_name }}"
+      register: acl_verify
+      failed_when: acl_name not in acl_verify.stdout[0]
 
-    - name: Display route map verification output
-      ansible.builtin.debug:
-        var: routemap_verify.stdout_lines
+    - name: Verify ACL is bound to the target interface
+      cisco.ios.ios_command:
+        commands:
+          - "show ip interface {{ acl_interface }}"
+      register: interface_verify
+      failed_when: acl_name not in interface_verify.stdout[0]
 
-    - name: Confirm successful deployment
+    - name: Save configuration
+      cisco.ios.ios_command:
+        commands:
+          - write memory
+      when: acl_config_result.changed or interface_bind_result.changed
+      register: save_result
+
+    - name: Display final ACL state
       ansible.builtin.debug:
-        msg: "BGP routing policy (prefix lists + route maps) deployed successfully on {{ inventory_hostname }}
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "ACL deployed: {{ acl_config_result.changed }}"
+          - "Interface bound: {{ interface_bind_result.changed }}"
+          - "ACL detail: {{ acl_verify.stdout[0] }}"
+```
