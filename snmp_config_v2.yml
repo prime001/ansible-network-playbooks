@@ -1,93 +1,116 @@
+The repo described in the prompt is a GitHub portfolio repo, not on this machine. I'll output the playbook YAML directly as requested.
+
 ---
-# snmp_v3_hardening.yml
-#
-# Hardens SNMP by deploying SNMPv3 auth/priv users and removing insecure
-# SNMPv1/v2c community strings. Distinct from snmp_config.yml (community
-# string setup) — this playbook enforces USM-based security per CIS/NIST.
+
+```yaml
+---
+# Configures SNMP trap receivers, notification types, and inform reliability settings.
+# Complements snmp_config.yml (community strings, contact, location) — does not repeat those.
+# Credentials: vault_snmp_trap_community, vault_net_user, vault_net_password, vault_enable_password
+#              stored in group_vars/all/vault.yml (ansible-vault encrypted).
 #
 # Inventory example:
-#   [core_routers]
-#   rtr-core-01 ansible_host=10.0.1.1
-#   rtr-core-02 ansible_host=10.0.1.2
+#   [core_switches]
+#   sw-core-01  ansible_host=10.0.1.10  ansible_network_os=ios
+#   sw-core-02  ansible_host=10.0.1.11  ansible_network_os=ios
 #
-#   [core_routers:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
+#   [distribution]
+#   dist-sw-01  ansible_host=10.0.2.10  ansible_network_os=ios
+#
+#   [network:children]
+#   core_switches
+#   distribution
+#
+#   [network:vars]
 #   ansible_user={{ vault_net_user }}
-#   ansible_password={{ vault_net_pass }}
-#   ansible_become=true
+#   ansible_password={{ vault_net_password }}
+#   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_pass }}
-#
-# Vault: ansible-vault encrypt group_vars/all/vault.yml
+#   ansible_become_password={{ vault_enable_password }}
 
-- name: Harden SNMP — deploy SNMPv3 auth/priv and remove community strings
-  hosts: "{{ target_hosts | default('network_devices') }}"
+- name: Configure SNMP Trap Receivers and Notification Types
+  hosts: "{{ target_hosts | default('network') }}"
   gather_facts: false
+  connection: network_cli
 
   vars:
-    snmp_v3_group: NOC_MONITOR
-    snmp_v3_view: MGMT_VIEW
-    snmp_v3_user: noc_poller
-    snmp_auth_proto: sha
-    snmp_priv_proto: "aes 128"
-    # All four vars below must exist in vault — never set defaults for secrets
-    snmp_auth_pass: "{{ vault_snmp_auth_pass }}"
-    snmp_priv_pass: "{{ vault_snmp_priv_pass }}"
-    legacy_communities:
-      - public
-      - private
+    # vault_snmp_trap_community defined in group_vars/all/vault.yml
+    snmp_trap_hosts:
+      - host: "10.0.100.50"
+        version: "2c"
+        community: "{{ vault_snmp_trap_community }}"
+      - host: "10.0.100.51"
+        version: "2c"
+        community: "{{ vault_snmp_trap_community }}"
+    snmp_trap_source_iface: "Loopback0"
+    snmp_enabled_traps:
+      - "snmp authentication linkdown linkup coldstart warmstart"
+      - "config"
+      - "envmon temperature shutdown"
+      - "syslog"
+      - "ospf state-change"
+    snmp_informs_retries: 3
+    snmp_informs_timeout: 15
 
   tasks:
-    - name: Configure SNMPv3 view, group, and user
+    - name: Configure SNMP trap source interface and queue depth
       block:
-        - name: Push SNMPv3 MIB view and group
+        - name: Set trap source interface and queue length
           cisco.ios.ios_config:
             lines:
-              - "snmp-server view {{ snmp_v3_view }} iso included"
-              - "snmp-server group {{ snmp_v3_group }} v3 priv read {{ snmp_v3_view }}"
-          register: snmp_group_result
-          retries: 2
-          delay: 5
-          until: snmp_group_result is not failed
-
-        - name: Create SNMPv3 user with auth and priv
-          cisco.ios.ios_config:
-            lines:
-              - "snmp-server user {{ snmp_v3_user }} {{ snmp_v3_group }} v3 auth {{ snmp_auth_proto }} {{ snmp_auth_pass }} priv {{ snmp_priv_proto }} {{ snmp_priv_pass }}"
-          register: snmp_user_result
-          no_log: true
-
-        - name: Remove legacy SNMPv1/v2c community strings
-          cisco.ios.ios_config:
-            lines:
-              - "no snmp-server community {{ item }}"
-          loop: "{{ legacy_communities }}"
-          register: community_removal
-          ignore_errors: true
-
-        - name: Verify SNMPv3 group and user presence
-          cisco.ios.ios_command:
-            commands:
-              - show snmp group
-              - show snmp user
-          register: snmp_verify
-          failed_when: snmp_v3_group not in snmp_verify.stdout[0]
-
-        - name: Display SNMPv3 verification output
-          ansible.builtin.debug:
-            msg:
-              - "SNMP group table: {{ snmp_verify.stdout_lines[0] }}"
-              - "SNMP user table:  {{ snmp_verify.stdout_lines[1] }}"
+              - "snmp-server trap-source {{ snmp_trap_source_iface }}"
+              - "snmp-server queue-length 20"
+          register: trap_source_cfg
 
       rescue:
-        - name: Log failure details
+        - name: Report trap source configuration failure
           ansible.builtin.debug:
-            msg: >
-              SNMPv3 hardening failed on {{ inventory_hostname }}.
-              Group config result: {{ snmp_group_result | default('not reached') }}
-              Verify stdout: {{ snmp_verify.stdout | default('not reached') }}
+            msg: "Trap source config failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
 
-        - name: Fail with descriptive message
+        - name: Abort on trap source failure
           ansible.builtin.fail:
-            msg: "SNMPv3 hardening failed on {{ inventory_hostname }} — manual review required.
+            msg: "Halting: SNMP trap source could not be set on {{ inventory_hostname }}"
+
+    - name: Configure SNMP trap destination hosts
+      cisco.ios.ios_config:
+        lines:
+          - "snmp-server host {{ item.host }} version {{ item.version }} {{ item.community }}"
+      loop: "{{ snmp_trap_hosts }}"
+      register: trap_dest_result
+      retries: 2
+      delay: 5
+      until: trap_dest_result is not failed
+
+    - name: Enable SNMP notification trap types
+      cisco.ios.ios_config:
+        lines:
+          - "snmp-server enable traps {{ item }}"
+      loop: "{{ snmp_enabled_traps }}"
+
+    - name: Configure SNMP inform reliability parameters
+      cisco.ios.ios_config:
+        lines:
+          - "snmp-server informs retries {{ snmp_informs_retries }} timeout {{ snmp_informs_timeout }}"
+
+    - name: Verify SNMP trap receiver configuration
+      cisco.ios.ios_command:
+        commands:
+          - "show snmp host"
+          - "show snmp trap"
+      register: snmp_verify
+      failed_when: >
+        snmp_verify.stdout[0] | length == 0 or
+        'error' in (snmp_verify.stdout[0] | lower)
+
+    - name: Display trap host and notification type summary
+      ansible.builtin.debug:
+        msg:
+          - "=== SNMP Trap Hosts: {{ inventory_hostname }} ==="
+          - "{{ snmp_verify.stdout[0] }}"
+          - "=== Active Trap Types: {{ inventory_hostname }} ==="
+          - "{{ snmp_verify.stdout[1] }}"
+
+    - name: Persist configuration to NVRAM
+      cisco.ios.ios_config:
+        save_when: modified
+```
