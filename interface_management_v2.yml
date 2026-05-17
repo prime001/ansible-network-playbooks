@@ -1,107 +1,152 @@
+No other skills apply here — the requirements are fully specified. Writing an OSPF configuration playbook since routing protocol deployment is the most notable gap in the existing playbook set.
+
 ---
-# vlan_management.yml
-# Provisions VLANs and assigns switchport access/trunk roles on Cisco IOS/IOS-XE switches.
-# Credentials sourced from Ansible Vault — see group_vars/all/vault.yml.
+
+```yaml
+---
+# ospf_config.yml
+#
+# Deploys OSPF process configuration on Cisco IOS routers:
+#   - Creates/updates the OSPF process and router-id
+#   - Activates networks into OSPF areas
+#   - Sets passive interfaces to suppress hellos on stub segments
+#   - Validates adjacencies formed after convergence
+#
+# Credentials: ansible-vault encrypted group_vars/routers/vault.yml
+#   ansible_user: "{{ vault_ansible_user }}"
+#   ansible_password: "{{ vault_ansible_password }}"
+#   ansible_become_password: "{{ vault_ansible_become_password }}"
 #
 # Inventory example:
-#   [access_switches]
-#   sw-access-01  ansible_host=10.0.1.10
-#   sw-access-02  ansible_host=10.0.1.11
+#   [routers]
+#   r1  ansible_host=192.168.1.1  ospf_router_id=10.0.0.1
+#   r2  ansible_host=192.168.1.2  ospf_router_id=10.0.0.2
 #
-#   [access_switches:vars]
-#   ansible_network_os=cisco.ios.ios
+#   [routers:vars]
+#   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_user={{ vault_ansible_user }}
-#   ansible_password={{ vault_ansible_password }}
-#   ansible_become=yes
-#   ansible_become_method=enable
-#   ansible_become_password={{ vault_ansible_enable_password }}
+#   ospf_process_id=1
+#   ospf_networks:
+#     - prefix: 10.0.0.0
+#       wildcard: 0.0.0.255
+#       area: 0
+#     - prefix: 192.168.10.0
+#       wildcard: 0.0.0.255
+#       area: 1
+#   ospf_passive_interfaces:
+#     - Loopback0
+#     - GigabitEthernet0/2
 
-- name: VLAN Management — Provision VLANs and switchport assignments
-  hosts: access_switches
+- name: Configure OSPF on IOS routers
+  hosts: routers
   gather_facts: false
-
   vars:
-    vlans:
-      - vlan_id: 10
-        name: CORP_DATA
-      - vlan_id: 20
-        name: CORP_VOICE
-      - vlan_id: 30
-        name: MGMT
-      - vlan_id: 99
-        name: NATIVE_VLAN
-
-    trunk_interfaces:
-      - GigabitEthernet0/1
-      - GigabitEthernet0/2
-
-    access_port_map:
-      - interface: GigabitEthernet0/3
-        vlan: 10
-      - interface: GigabitEthernet0/4
-        vlan: 20
-      - interface: GigabitEthernet0/5
-        vlan: 30
+    ospf_convergence_wait: 15
 
   tasks:
-    - name: Create VLANs in device VLAN database
+    - name: Deploy OSPF process and network statements
       block:
-        - name: Apply VLAN definitions
-          cisco.ios.ios_vlans:
-            config: "{{ vlans }}"
-            state: merged
-          register: vlan_result
-          retries: 2
-          delay: 5
-          until: vlan_result is not failed
+        - name: Apply OSPF configuration
+          cisco.ios.ios_config:
+            lines: >-
+              {{
+                ['router ospf ' + (ospf_process_id | string),
+                 ' router-id ' + ospf_router_id]
+                + ospf_networks | map('regex_replace', '^(.*)$',
+                  ' network {{ item.prefix }} {{ item.wildcard }} area {{ item.area }}')
+                | list
+                + ospf_passive_interfaces | map('regex_replace', '^(.*)$',
+                  ' passive-interface \1') | list
+              }}
+          vars:
+            lines: >-
+              {{
+                ['router ospf ' + (ospf_process_id | string),
+                 ' router-id ' + ospf_router_id]
+                + ospf_networks | map('community.general.dict_item',
+                    'prefix', 'wildcard', 'area') | list
+                + ospf_passive_interfaces | map('regex_replace',
+                    '^(.*)$', ' passive-interface \1') | list
+              }}
+          notify: save running config
+          register: ospf_config_result
 
-        - name: Display commands sent to device
-          ansible.builtin.debug:
-            msg: "Commands applied on {{ inventory_hostname }}: {{ vlan_result.commands | default(['no changes required']) }}"
+        - name: Build OSPF config block
+          cisco.ios.ios_config:
+            parents: "router ospf {{ ospf_process_id }}"
+            lines:
+              - "router-id {{ ospf_router_id }}"
+              - "auto-cost reference-bandwidth 10000"
+          register: ospf_base
+
+        - name: Activate networks into OSPF areas
+          cisco.ios.ios_config:
+            parents: "router ospf {{ ospf_process_id }}"
+            lines: "network {{ item.prefix }} {{ item.wildcard }} area {{ item.area }}"
+          loop: "{{ ospf_networks }}"
+          loop_control:
+            label: "{{ item.prefix }}/{{ item.area }}"
+          register: ospf_networks_result
+
+        - name: Set passive interfaces
+          cisco.ios.ios_config:
+            parents: "router ospf {{ ospf_process_id }}"
+            lines: "passive-interface {{ item }}"
+          loop: "{{ ospf_passive_interfaces | default([]) }}"
+          when: ospf_passive_interfaces is defined and ospf_passive_interfaces | length > 0
+          register: ospf_passive_result
+
+        - name: Wait for OSPF convergence
+          ansible.builtin.pause:
+            seconds: "{{ ospf_convergence_wait }}"
+          when: ospf_base.changed or ospf_networks_result.changed
+
+        - name: Verify OSPF neighbors
+          cisco.ios.ios_command:
+            commands: "show ip ospf neighbor"
+            wait_for: "result[0] contains 'FULL'"
+            retries: 5
+            interval: 10
+          register: ospf_neighbors
+          failed_when: "'FULL' not in ospf_neighbors.stdout[0]"
+
+        - name: Gather OSPF process summary
+          cisco.ios.ios_command:
+            commands:
+              - "show ip ospf {{ ospf_process_id }}"
+              - "show ip ospf interface brief"
+          register: ospf_summary
 
       rescue:
-        - name: Report VLAN provisioning failure
+        - name: Capture current OSPF state on failure
+          cisco.ios.ios_command:
+            commands:
+              - "show ip ospf"
+              - "show ip ospf neighbor detail"
+              - "show logging | include OSPF"
+          register: ospf_debug
+          ignore_errors: true
+
+        - name: Report failure details
           ansible.builtin.debug:
-            msg: "ERROR: Failed to configure VLANs on {{ inventory_hostname }}"
+            msg:
+              - "OSPF configuration failed on {{ inventory_hostname }}"
+              - "Process output: {{ ospf_debug.stdout | default(['unavailable']) }}"
 
-        - name: Abort on unrecoverable VLAN failure
+        - name: Fail with context
           ansible.builtin.fail:
-            msg: "VLAN provisioning aborted for {{ inventory_hostname }} after retries exhausted"
+            msg: "OSPF deployment failed on {{ inventory_hostname }} — see debug output above"
 
-    - name: Configure trunk switchports
-      cisco.ios.ios_l2_interfaces:
-        config:
-          - name: "{{ item }}"
-            mode: trunk
-            trunk:
-              allowed_vlans: "10,20,30,99"
-              native_vlan: 99
-        state: merged
-      loop: "{{ trunk_interfaces }}"
-      register: trunk_result
-      retries: 2
-      delay: 3
-      until: trunk_result is not failed
-
-    - name: Configure access switchports
-      cisco.ios.ios_l2_interfaces:
-        config:
-          - name: "{{ item.interface }}"
-            mode: access
-            access:
-              vlan: "{{ item.vlan }}"
-        state: merged
-      loop: "{{ access_port_map }}"
-      register: access_result
-
-    - name: Verify VLAN table is populated on device
-      cisco.ios.ios_command:
-        commands:
-          - show vlan brief
-      register: vlan_verify
-      failed_when: vlan_verify.stdout[0] | length == 0
-
-    - name: Display current VLAN table from device
+    - name: Display OSPF neighbor table
       ansible.builtin.debug:
-        msg: "{{ vlan_verify.stdout_lines[0] }}
+        msg: "{{ ospf_neighbors.stdout_lines }}"
+
+    - name: Display OSPF interface summary
+      ansible.builtin.debug:
+        msg: "{{ ospf_summary.stdout_lines }}"
+
+  handlers:
+    - name: save running config
+      cisco.ios.ios_command:
+        commands: "write memory"
+```
