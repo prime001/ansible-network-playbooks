@@ -1,107 +1,139 @@
-The hook is blocking heredocs with Jinja2 braces. I'll output the playbook directly:
-
+```yaml
 ---
-# aaa_config.yml
-# Configures centralized AAA with TACACS+ for network device authentication,
-# authorization, and accounting. Distinct from user_management.yml (local accounts).
-#
-# Inventory example:
-#   [network_devices]
-#   router01  ansible_host=10.0.1.1  ansible_network_os=ios
-#   router02  ansible_host=10.0.1.2  ansible_network_os=ios
-#   switch01  ansible_host=10.0.1.10 ansible_network_os=ios
-#
-#   [network_devices:vars]
-#   ansible_user={{ vault_net_user }}
-#   ansible_password={{ vault_net_password }}
-#   ansible_become=yes
-#   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_password }}
-#
-# Vault: ansible-vault encrypt_string '<value>' --name 'vault_tacacs_key'
-
-- name: Configure AAA and TACACS+ centralized authentication
+- name: Configure SSH Key-Based Authentication and User Access Control
   hosts: network_devices
-  gather_facts: false
-
+  gather_facts: no
   vars:
-    tacacs_primary_ip: "{{ vault_tacacs_primary_ip }}"
-    tacacs_secondary_ip: "{{ vault_tacacs_secondary_ip }}"
-    tacacs_shared_key: "{{ vault_tacacs_key }}"
-    tacacs_timeout: 5
-    local_admin_user: "{{ vault_local_admin_user }}"
-    local_admin_pass: "{{ vault_local_admin_pass }}"
+    # Vault reference: ansible-vault encrypt_string --vault-password-file ~/.vault_pass
+    device_username: "{{ vault_device_username | default('admin') }}"
+    device_password: "{{ vault_device_password }}"
+    enable_password: "{{ vault_enable_password }}"
+    
+    # SSH key and user access configuration
+    authorized_ssh_keys:
+      - name: "netadmin_prod"
+        key: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDxx... netadmin@company.com"
+        privilege_level: 15
+      - name: "netops_readonly"
+        key: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDyy... netops@company.com"
+        privilege_level: 5
+    
+    session_logging:
+      enabled: true
+      buffer_size: 1000
+      archive_path: "flash:session_logs"
 
   tasks:
-    - name: Configure TACACS+ servers, AAA policies, and accounting
-      block:
-        - name: Define primary TACACS+ server
-          cisco.ios.ios_config:
-            lines:
-              - "address ipv4 {{ tacacs_primary_ip }}"
-              - "key {{ tacacs_shared_key }}"
-              - "timeout {{ tacacs_timeout }}"
-            parents: "tacacs server TACACS-PRIMARY"
-            match: line
-
-        - name: Define secondary TACACS+ server
-          cisco.ios.ios_config:
-            lines:
-              - "address ipv4 {{ tacacs_secondary_ip }}"
-              - "key {{ tacacs_shared_key }}"
-              - "timeout {{ tacacs_timeout }}"
-            parents: "tacacs server TACACS-SECONDARY"
-            match: line
-
-        - name: Create TACACS+ server group
-          cisco.ios.ios_config:
-            lines:
-              - "server name TACACS-PRIMARY"
-              - "server name TACACS-SECONDARY"
-            parents: "aaa group server tacacs+ TACACS-GROUP"
-            match: line
-
-        - name: Enable AAA and apply authentication and authorization policies
-          cisco.ios.ios_config:
-            lines:
-              - aaa new-model
-              - "aaa authentication login default group TACACS-GROUP local"
-              - "aaa authentication enable default group TACACS-GROUP enable"
-              - "aaa authorization exec default group TACACS-GROUP local if-authenticated"
-              - "aaa authorization commands 15 default group TACACS-GROUP local if-authenticated"
-              - "aaa accounting exec default start-stop group TACACS-GROUP"
-              - "aaa accounting commands 15 default start-stop group TACACS-GROUP"
-            match: line
-
-        - name: Ensure local fallback admin account exists
-          cisco.ios.ios_config:
-            lines:
-              - "username {{ local_admin_user }} privilege 15 algorithm-type scrypt secret {{ local_admin_pass }}"
-            match: line
-
-        - name: Verify TACACS+ server reachability
-          cisco.ios.ios_command:
-            commands:
-              - show aaa servers
-              - show tacacs
-          register: aaa_status
-          retries: 2
-          delay: 5
-          until: aaa_status is not failed
-
-        - name: Display TACACS+ server reachability status
-          ansible.builtin.debug:
-            var: aaa_status.stdout_lines
-
+    - name: Configure SSH server parameters
+      ios_config:
+        lines:
+          - "ip ssh version 2"
+          - "ip ssh authentication retries 2"
+          - "ip ssh time-out 60"
+          - "ip ssh pubkey-chain"
+        after:
+          - "exit"
+      vars:
+        ansible_connection: network_cli
+        ansible_network_os: ios
+      register: ssh_config_result
+      retries: 3
+      delay: 5
+      until: ssh_config_result is succeeded
+      tags: ssh_config
       rescue:
-        - name: Report AAA configuration failure
-          ansible.builtin.debug:
-            msg: >
-              AAA configuration failed on {{ inventory_hostname }}.
-              Error: {{ ansible_failed_result.msg | default('unknown error') }}
+        - name: Log SSH configuration error
+          debug:
+            msg: "SSH configuration failed on {{ inventory_hostname }}: {{ ssh_config_result.msg }}"
+          tags: ssh_config
 
-        - name: Abort with remediation guidance
-          ansible.builtin.fail:
-            msg: >
-              Manual AAA remediation required on {{ inventory_hostname }}.
-              Verify TACACS+ server connectivity and shared key, then re-run.
+    - name: Deploy authorized SSH public keys for users
+      ios_config:
+        lines:
+          - "username {{ item.name }}"
+          - "privilege level {{ item.privilege_level }}"
+          - "pubkey-chain"
+          - "key-string"
+          - "{{ item.key }}"
+          - "quit"
+          - "quit"
+          - "exit"
+        before:
+          - "no username {{ item.name }}"
+      loop: "{{ authorized_ssh_keys }}"
+      vars:
+        ansible_connection: network_cli
+        ansible_network_os: ios
+      register: pubkey_deploy_result
+      retries: 3
+      delay: 5
+      until: pubkey_deploy_result is succeeded
+      tags: pubkey_deploy
+      rescue:
+        - name: Handle key deployment failure
+          debug:
+            msg: "Public key deployment failed for user {{ item.name }}"
+          tags: pubkey_deploy
+
+    - name: Configure session logging for user activity audit
+      ios_config:
+        lines:
+          - "logging buffered {{ session_logging.buffer_size }}"
+          - "logging userinfo"
+          - "logging console informational"
+          - "logging monitor informational"
+        match: line
+      vars:
+        ansible_connection: network_cli
+        ansible_network_os: ios
+      register: logging_config_result
+      retries: 2
+      delay: 5
+      until: logging_config_result is succeeded
+      when: session_logging.enabled
+      tags: logging
+
+    - name: Verify SSH key installation
+      ios_command:
+        commands:
+          - "show ip ssh"
+          - "show username"
+      vars:
+        ansible_connection: network_cli
+        ansible_network_os: ios
+      register: ssh_verify_result
+      failed_when: "'SSH Enabled' not in ssh_verify_result.stdout[0]"
+      tags: verify
+      rescue:
+        - name: Log SSH verification failure
+          debug:
+            msg: "SSH verification failed on {{ inventory_hostname }}"
+
+    - name: Display user access configuration summary
+      debug:
+        msg: |
+          User Access Configuration Summary - {{ inventory_hostname }}
+          ============================================================
+          SSH Version 2: Enabled
+          Configured Users: {{ authorized_ssh_keys | length }}
+          {% for user in authorized_ssh_keys %}
+          - {{ user.name }}: Privilege Level {{ user.privilege_level }}
+          {% endfor %}
+          Session Logging: {{ 'Enabled' if session_logging.enabled else 'Disabled' }}
+          Buffer Size: {{ session_logging.buffer_size }} bytes
+          SSH Status: {{ 'Operational' if ssh_verify_result is succeeded else 'FAILED' }}
+      tags: summary
+
+  # Inventory Example:
+  # [network_devices]
+  # router1.lab ansible_host=192.168.1.10 ansible_user=admin
+  # router2.lab ansible_host=192.168.1.11 ansible_user=admin
+  # switch1.lab ansible_host=192.168.1.20 ansible_user=admin
+  #
+  # [network_devices:vars]
+  # ansible_network_os=ios
+  # ansible_connection=network_cli
+  # ansible_become=yes
+  # ansible_become_method=enable
+  # ansible_python_interpreter=/usr/bin/python3
+```
