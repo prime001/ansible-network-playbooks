@@ -1,87 +1,115 @@
-```yaml
+The user's prompt is a complete specification — all requirements, constraints, and output format are explicit. Following the user instruction ("Output ONLY the playbook YAML content") which takes precedence over the brainstorming dialog flow.
+
 ---
-# syslog_filtering.yml
-# Configures advanced syslog filtering, discriminators, and rate-limiting on IOS/IOS-XE.
-# Complements syslog_config.yml (server targeting) with per-severity filtering and
-# buffer tuning — useful when basic syslog is already deployed but noise needs taming.
+# Ansible Playbook: IOS Local Logging Buffer and Severity Configuration
+#
+# Configures local logging parameters on Cisco IOS devices:
+#   - Log buffer size and message severity threshold
+#   - Console and VTY monitor severity levels
+#   - Logging synchronous on console and VTY lines (prevents CLI interleaving)
+#   - Rate-limit guard to reduce console flooding in production
+#
+# Complements syslog_config.yml (remote server destinations) with
+# local buffer and session logging controls — does not reconfigure
+# remote syslog hosts.
+#
+# Credentials (ansible-vault encrypted in group_vars/network/vault.yml):
+#   ansible_user:            "{{ vault_net_username }}"
+#   ansible_password:        "{{ vault_net_password }}"
+#   ansible_become_password: "{{ vault_enable_password }}"
 #
 # Inventory example:
-#   [core_routers]
-#   r1 ansible_host=10.0.1.1
-#   r2 ansible_host=10.0.1.2
+# ---
+# all:
+#   children:
+#     routers:
+#       hosts:
+#         rtr-core-01:
+#           ansible_host: 10.0.1.1
+#         rtr-core-02:
+#           ansible_host: 10.0.1.2
+#       vars:
+#         ansible_network_os: ios
+#         ansible_connection: network_cli
+#         ansible_become: true
+#         ansible_become_method: enable
 #
-#   [core_routers:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user={{ vault_net_user }}        # ansible-vault encrypted
-#   ansible_password={{ vault_net_password }}
-#   ansible_become=yes
-#   ansible_become_method=enable
-#   ansible_become_password={{ vault_net_enable }}
+# Usage:
+#   ansible-playbook logging_local_config.yml -i inventory/prod.yml \
+#     --ask-vault-pass
 
-- name: Configure syslog filtering, discriminators, and buffer tuning
-  hosts: core_routers
+- name: Configure IOS local logging buffer, severity, and session settings
+  hosts: routers
   gather_facts: false
 
   vars:
-    syslog_buffer_size: 65536
-    syslog_buffer_severity: informational
-    syslog_rate_limit: 10000        # messages per second, console
-    syslog_source_interface: Loopback0
-    discriminator_name: NOSEC
-    discriminator_drop_pattern: "^%SEC-6-IPACCESSLOG"   # drop ACL hit noise
+    log_buffer_size: 51200
+    log_buffer_severity: informational
+    log_console_severity: critical
+    log_monitor_severity: warnings
+    log_rate_limit: 100
+    enable_log_sync: true
 
   tasks:
-    - name: Apply syslog buffer size and severity
-      cisco.ios.ios_config:
-        lines:
-          - "logging buffered {{ syslog_buffer_size }} {{ syslog_buffer_severity }}"
-        replace: line
-      register: buffer_result
-      retries: 2
+
+    - name: Confirm device is reachable
+      cisco.ios.ios_command:
+        commands:
+          - show version | include IOS-XE|IOS Software
+      register: ios_version
+      retries: 3
       delay: 5
-      until: buffer_result is not failed
+      until: ios_version is not failed
 
-    - name: Set syslog source interface
-      cisco.ios.ios_config:
-        lines:
-          - "logging source-interface {{ syslog_source_interface }}"
-      register: src_iface_result
-      failed_when:
-        - src_iface_result.failed
-        - "'Invalid' not in (src_iface_result.msg | default(''))"
+    - name: Apply local logging configuration
+      block:
 
-    - name: Configure console rate-limiting to prevent storm
-      cisco.ios.ios_config:
-        lines:
-          - "logging rate-limit {{ syslog_rate_limit }}"
+        - name: Set logging buffer size and severity
+          cisco.ios.ios_config:
+            lines:
+              - "logging buffered {{ log_buffer_size }} {{ log_buffer_severity }}"
+              - "logging console {{ log_console_severity }}"
+              - "logging monitor {{ log_monitor_severity }}"
+              - "logging rate-limit {{ log_rate_limit }}"
+              - "no logging on"
+              - "logging on"
+            save_when: changed
 
-    - name: Create message discriminator to drop ACL noise
-      cisco.ios.ios_config:
-        lines:
-          - "logging discriminator {{ discriminator_name }} mnemonics drops {{ discriminator_drop_pattern }}"
-          - "logging buffered discriminator {{ discriminator_name }}"
+        - name: Enable logging synchronous on console line
+          cisco.ios.ios_config:
+            parents: line con 0
+            lines:
+              - logging synchronous
+            save_when: changed
+          when: enable_log_sync | bool
 
-    - name: Verify syslog configuration on device
+        - name: Enable logging synchronous on VTY lines
+          cisco.ios.ios_config:
+            parents: line vty 0 15
+            lines:
+              - logging synchronous
+            save_when: changed
+          when: enable_log_sync | bool
+
+      rescue:
+
+        - name: Report configuration failure
+          ansible.builtin.debug:
+            msg: >
+              Configuration FAILED on {{ inventory_hostname }}:
+              {{ ansible_failed_task.name }} — {{ ansible_failed_result.msg | default('unknown error') }}
+
+        - name: Abort play after rescue
+          ansible.builtin.fail:
+            msg: "Local logging config failed on {{ inventory_hostname }}. Review and retry."
+
+    - name: Verify applied logging configuration
       cisco.ios.ios_command:
         commands:
-          - show logging | include Logging to|Buffered|rate-limit|discriminator|Source
-      register: syslog_verify
-      failed_when: "'Logging to' not in syslog_verify.stdout[0]"
+          - show logging | include Syslog|Buffer|Console|Monitor|rate
+      register: logging_status
+      failed_when: "'Syslog logging: enabled' not in logging_status.stdout[0]"
 
-    - name: Display syslog verification output
+    - name: Display logging status for each device
       ansible.builtin.debug:
-        msg: "{{ inventory_hostname }} syslog state:\n{{ syslog_verify.stdout[0] }}"
-
-    - name: Save running config after changes
-      cisco.ios.ios_command:
-        commands:
-          - write memory
-      register: save_result
-      when:
-        - buffer_result.changed or src_iface_result.changed
-
-    - name: Report save status
-      ansible.builtin.debug:
-        msg: "{{ inventory_hostname }}: config saved — {{ save_result.stdout[0] | default('no save needed') }}"
-```
+        msg: "{{ inventory_hostname }} — Logging status:\n{{ logging_status.stdout[0] }}
