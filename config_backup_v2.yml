@@ -1,115 +1,129 @@
 ---
-# bgp_peer_config.yml
-# Configures eBGP peer sessions on Cisco IOS/IOS-XE edge routers.
-# Verifies session establishment and captures neighbor state before and after.
+# config_restore.yml
 #
-# Credentials: ansible-vault encrypted variables
-#   ansible-vault encrypt_string 'mypassword' --name 'vault_net_password'
+# Restores a previously saved configuration backup to Cisco IOS devices.
+# Useful for disaster recovery, rollback after a failed change window,
+# or provisioning replacement hardware from a known-good baseline.
+#
+# Credentials must be stored in Ansible Vault:
+#   ansible-vault encrypt_string 'mypassword' --name 'ansible_password'
 #
 # Inventory example:
-#   [edge_routers]
-#   core-rtr-01 ansible_host=192.168.1.1 local_as=65100
-#   core-rtr-02 ansible_host=192.168.1.2 local_as=65100
+#   [core_routers]
+#   rtr-core-01  ansible_host=10.0.0.1
+#   rtr-core-02  ansible_host=10.0.0.2
 #
-#   [edge_routers:vars]
+#   [core_routers:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_user={{ vault_net_username }}
-#   ansible_password={{ vault_net_password }}
-#   ansible_become=yes
+#   ansible_user=netadmin
+#   ansible_password=!vault |
+#     $ANSIBLE_VAULT;1.1;AES256
+#     6234...
+#   ansible_become=true
 #   ansible_become_method=enable
-
-- name: Configure eBGP peer sessions on Cisco IOS/IOS-XE
-  hosts: edge_routers
+#   ansible_become_password=!vault |
+#     $ANSIBLE_VAULT;1.1;AES256
+#     8bc4...
+#
+# Usage:
+#   ansible-playbook config_restore.yml -i inventory/network.yml \
+#     --ask-vault-pass -e "backup_dir=/opt/backups/network confirm_restore=true"
+#
+- name: Restore network device configuration from backup
+  hosts: "{{ target_hosts | default('core_routers') }}"
   gather_facts: false
   vars:
-    net_username: "{{ vault_net_username }}"
-    net_password: "{{ vault_net_password }}"
-    bgp_peers:
-      - neighbor: "203.0.113.1"
-        remote_as: 65001
-        description: "UPSTREAM-PROVIDER-A"
-        password: "{{ vault_bgp_peer_a_password }}"
-        soft_reconfiguration: true
-        send_community: true
-      - neighbor: "198.51.100.1"
-        remote_as: 65002
-        description: "UPSTREAM-PROVIDER-B"
-        password: "{{ vault_bgp_peer_b_password }}"
-        soft_reconfiguration: true
-        send_community: true
+    backup_dir: "/opt/backups/network"
+    confirm_restore: false
+    restore_timeout: 60
 
   tasks:
-    - name: Capture pre-change BGP summary
-      cisco.ios.ios_command:
-        commands:
-          - show ip bgp summary
-          - show ip bgp neighbors | include BGP neighbor|BGP state
-      register: bgp_pre_state
-      retries: 2
-      delay: 5
+    - name: Abort unless restore explicitly confirmed
+      ansible.builtin.fail:
+        msg: "Safety gate: pass -e confirm_restore=true to proceed"
+      when: not (confirm_restore | bool)
 
-    - name: Display pre-change BGP state
-      ansible.builtin.debug:
-        msg: "{{ bgp_pre_state.stdout_lines }}"
+    - name: Locate backup files for this host
+      ansible.builtin.find:
+        paths: "{{ backup_dir }}"
+        patterns: "{{ inventory_hostname }}_*.cfg"
+      delegate_to: localhost
+      register: backup_files
 
-    - name: Configure BGP peer sessions
+    - name: Fail when no backup exists for this host
+      ansible.builtin.fail:
+        msg: "No backup found for {{ inventory_hostname }} in {{ backup_dir }}"
+      when: backup_files.files | length == 0
+
+    - name: Resolve most recent backup file
+      ansible.builtin.set_fact:
+        restore_file: "{{ (backup_files.files | sort(attribute='mtime') | last).path }}"
+
+    - name: Capture pre-restore snapshot
       block:
-        - name: Apply BGP neighbor statements
-          cisco.ios.ios_config:
-            lines:
-              - "neighbor {{ item.neighbor }} remote-as {{ item.remote_as }}"
-              - "neighbor {{ item.neighbor }} description {{ item.description }}"
-              - "neighbor {{ item.neighbor }} password {{ item.password }}"
-              - "neighbor {{ item.neighbor }} soft-reconfiguration inbound"
-              - "neighbor {{ item.neighbor }} send-community"
-            parents: "router bgp {{ local_as }}"
-          loop: "{{ bgp_peers }}"
-          register: bgp_config_result
-          notify: Save running config
+        - name: Pull running config before restore
+          cisco.ios.ios_command:
+            commands: show running-config
+          register: pre_restore_snapshot
+          retries: 3
+          delay: 5
+          until: pre_restore_snapshot is not failed
+
+        - name: Save pre-restore snapshot to controller
+          ansible.builtin.copy:
+            content: "{{ pre_restore_snapshot.stdout[0] }}"
+            dest: "{{ backup_dir }}/{{ inventory_hostname }}_pre_restore_{{ ansible_date_time.epoch }}.cfg"
+            mode: "0640"
+          delegate_to: localhost
 
       rescue:
-        - name: Log BGP configuration failure
+        - name: Warn — pre-restore snapshot failed, continuing
           ansible.builtin.debug:
-            msg: >
-              BGP configuration failed on {{ inventory_hostname }}.
-              Error: {{ ansible_failed_result.msg | default('unknown error') }}
+            msg: "WARNING: could not snapshot {{ inventory_hostname }} before restore"
 
-        - name: Abort with descriptive message
+    - name: Push backup configuration to device
+      block:
+        - name: Load backup config onto device
+          cisco.ios.ios_config:
+            src: "{{ restore_file }}"
+            save_when: never
+          register: restore_result
+          timeout: "{{ restore_timeout }}"
+
+        - name: Verify device is responsive after restore
+          cisco.ios.ios_command:
+            commands: show version
+          register: post_restore_check
+          retries: 3
+          delay: 10
+          until: post_restore_check is not failed
+          failed_when: post_restore_check.stdout[0] | length < 50
+
+        - name: Write restored config to startup
+          cisco.ios.ios_command:
+            commands: write memory
+          register: write_result
+          failed_when: >
+            'OK' not in (write_result.stdout[0] | default(''))
+            and 'Building configuration' not in (write_result.stdout[0] | default(''))
+
+      rescue:
+        - name: Log restore failure details
+          ansible.builtin.debug:
+            msg:
+              - "RESTORE FAILED on {{ inventory_hostname }}"
+              - "Source file: {{ restore_file }}"
+              - "Manual intervention required"
+
+        - name: Fail play after logging
           ansible.builtin.fail:
-            msg: "BGP peer config failed on {{ inventory_hostname }}. Manual intervention required."
+            msg: "Configuration restore failed for {{ inventory_hostname }}"
 
-    - name: Wait for BGP sessions to reach Established state
-      cisco.ios.ios_command:
-        commands:
-          - show ip bgp summary
-        wait_for:
-          - "result[0] contains 'Established'"
-      register: bgp_session_check
-      retries: 6
-      delay: 10
-      failed_when: false
-
-    - name: Capture post-change BGP neighbor state
-      cisco.ios.ios_command:
-        commands:
-          - show ip bgp summary
-          - show ip bgp neighbors | include BGP neighbor|BGP state|Up/Down|Prefixes
-      register: bgp_post_state
-
-    - name: Display post-change BGP neighbor status
+    - name: Display restore summary
       ansible.builtin.debug:
-        msg: "{{ bgp_post_state.stdout_lines }}"
-
-    - name: Assert at least one BGP session is Established
-      ansible.builtin.assert:
-        that:
-          - "'Established' in bgp_post_state.stdout[0]"
-        fail_msg: "No BGP sessions in Established state on {{ inventory_hostname }}"
-        success_msg: "BGP peers verified successfully on {{ inventory_hostname }}"
-
-  handlers:
-    - name: Save running config
-      cisco.ios.ios_command:
-        commands:
-          - write memory
+        msg:
+          - "Host         : {{ inventory_hostname }}"
+          - "Restore file : {{ restore_file }}"
+          - "Lines applied: {{ restore_result.updates | default([]) | length }}"
+          - "Startup saved: {{ 'yes' if (write_result is defined and write_result is not failed) else 'no' }}
