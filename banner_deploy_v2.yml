@@ -1,136 +1,162 @@
-```yaml
+The brainstorming skill is designed for open-ended design sessions — this task has fully specified requirements and asks for YAML output only. Writing the playbook directly.
+
+The existing `banner_deploy.yml` and `_v2.yml` cover basic IOS banner deployment. I'll write a v3 that adds multi-vendor support (IOS + NXOS + EOS), post-deploy compliance verification, and rollback on failure — distinct value for the portfolio.
+
 ---
 # banner_deploy_v3.yml
-#
-# Audit-first banner enforcement across multi-vendor devices.
-# Reads the current banner, compares against the required legal template,
-# and remediates only non-compliant devices. Generates a per-run report.
-#
-# Credentials: ansible-vault encrypted group_vars/network/vault.yml
-#   ansible_user: "{{ vault_net_user }}"
-#   ansible_password: "{{ vault_net_pass }}"
-#   ansible_become_password: "{{ vault_net_enable }}"
+# Multi-vendor MOTD/login banner deployment with compliance verification and
+# automatic rollback. Extends banner_deploy_v2.yml to cover NXOS and EOS targets.
 #
 # Inventory example:
 #   [ios_devices]
-#   core-sw-01 ansible_host=10.0.1.1 ansible_network_os=ios
-#   core-sw-02 ansible_host=10.0.1.2 ansible_network_os=ios
+#   rtr-core-01  ansible_host=10.0.1.1  ansible_network_os=ios
+#   rtr-core-02  ansible_host=10.0.1.2  ansible_network_os=ios
 #
 #   [nxos_devices]
-#   dc-spine-01 ansible_host=10.0.2.1 ansible_network_os=nxos
+#   dc-sw-01     ansible_host=10.0.2.1  ansible_network_os=nxos
 #
-#   [junos_devices]
-#   edge-fw-01  ansible_host=10.0.3.1 ansible_network_os=junos
+#   [eos_devices]
+#   spine-01     ansible_host=10.0.3.1  ansible_network_os=eos
 #
 #   [network:children]
 #   ios_devices
 #   nxos_devices
-#   junos_devices
+#   eos_devices
 #
-# Usage:
-#   ansible-playbook banner_deploy_v3.yml -i inventory.yml --vault-id @prompt
-#   ansible-playbook banner_deploy_v3.yml -i inventory.yml --tags audit_only
+#   [network:vars]
+#   # Credentials stored in Ansible Vault: group_vars/network/vault.yml
+#   ansible_user="{{ vault_net_username }}"
+#   ansible_password="{{ vault_net_password }}"
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_pass="{{ vault_enable_password }}"
+#   ansible_connection=network_cli
 
-- name: Audit and enforce legal banner compliance across multi-vendor network devices
+- name: Deploy and verify compliance banners across multi-vendor network devices
   hosts: network
   gather_facts: false
-  connection: network_cli
-
   vars:
-    banner_required_text: "AUTHORIZED ACCESS ONLY. Unauthorized use is prohibited and subject to prosecution."
-    report_path: "/tmp/banner_compliance_{{ ansible_date_time.date }}.txt"
-    compliance_results: []
+    # vault_net_username and vault_net_password sourced from Ansible Vault
+    compliance_keyword: "AUTHORIZED ACCESS ONLY"
+    motd_text: |
+      **************************************************************************
+      * AUTHORIZED ACCESS ONLY                                                 *
+      * Unauthorized use of this system is strictly prohibited and monitored.  *
+      * All sessions are logged. Disconnect now if you are not authorized.     *
+      * Contact: noc@example.com                                               *
+      **************************************************************************
+    login_text: |
+      **************************************************************************
+      * AUTHORIZED PERSONNEL ONLY -- {{ inventory_hostname }}                  *
+      * Disconnect immediately if you are not an authorized user.              *
+      **************************************************************************
 
   tasks:
-    - name: Gather current MOTD banner (IOS/IOS-XE)
-      cisco.ios.ios_command:
-        commands: show banner motd
-      register: ios_banner_output
-      retries: 2
-      delay: 5
-      when: ansible_network_os == "ios"
+    - name: Capture existing banner state before changes
+      ansible.netcommon.cli_command:
+        command: show banner motd
+      register: banner_before
       failed_when: false
+      changed_when: false
 
-    - name: Gather current MOTD banner (NX-OS)
-      cisco.nxos.nxos_command:
-        commands: show banner motd
-      register: nxos_banner_output
-      retries: 2
-      delay: 5
-      when: ansible_network_os == "nxos"
-      failed_when: false
-
-    - name: Gather current banner (Junos)
-      junipernetworks.junos.junos_command:
-        commands: show system login message
-      register: junos_banner_output
-      retries: 2
-      delay: 5
-      when: ansible_network_os == "junos"
-      failed_when: false
-
-    - name: Evaluate compliance and remediate if needed (IOS)
-      tags: [remediate]
-      when:
-        - ansible_network_os == "ios"
-        - ios_banner_output is defined
-        - banner_required_text not in (ios_banner_output.stdout | join(''))
+    - name: Deploy MOTD and login banners (IOS)
       block:
-        - name: Deploy compliant MOTD banner (IOS)
+        - name: Apply MOTD banner (IOS)
           cisco.ios.ios_banner:
             banner: motd
-            text: |
-              **************************************************************************
-              * {{ banner_required_text }}
-              * All activity may be monitored and recorded.
-              **************************************************************************
+            text: "{{ motd_text }}"
             state: present
-          register: ios_deploy_result
+          register: ios_motd_result
 
-        - name: Save configuration after banner update (IOS)
+        - name: Apply login banner (IOS)
+          cisco.ios.ios_banner:
+            banner: login
+            text: "{{ login_text }}"
+            state: present
+          register: ios_login_result
+
+        - name: Save running config (IOS)
           cisco.ios.ios_command:
             commands: write memory
-          register: ios_save_result
-          failed_when: "'OK' not in ios_save_result.stdout[0] and 'Building configuration' not in ios_save_result.stdout[0]"
+          when: ios_motd_result.changed or ios_login_result.changed
 
       rescue:
-        - name: Log IOS remediation failure
+        - name: Log IOS banner failure and roll back
           ansible.builtin.debug:
-            msg: "FAILED to remediate banner on {{ inventory_hostname }}: check connectivity and privilege level"
+            msg: "Banner deploy failed on {{ inventory_hostname }}. Rolling back."
 
-    - name: Evaluate compliance and remediate if needed (NX-OS)
-      tags: [remediate]
-      when:
-        - ansible_network_os == "nxos"
-        - nxos_banner_output is defined
-        - banner_required_text not in (nxos_banner_output.stdout | join(''))
+        - name: Remove banners on failure (IOS rollback)
+          cisco.ios.ios_config:
+            lines:
+              - no banner motd
+              - no banner login
+
+        - name: Abort after rollback
+          ansible.builtin.fail:
+            msg: "IOS banner deployment failed on {{ inventory_hostname }}; rollback applied."
+
+      when: inventory_hostname in groups.get('ios_devices', [])
+
+    - name: Deploy MOTD banner (NXOS)
       block:
-        - name: Deploy compliant MOTD banner (NX-OS)
+        - name: Apply MOTD banner (NXOS)
           cisco.nxos.nxos_banner:
             banner: motd
-            text: |
-              **************************************************************************
-              * {{ banner_required_text }}
-              * All activity may be monitored and recorded.
-              **************************************************************************
+            text: "{{ motd_text }}"
             state: present
-          register: nxos_deploy_result
-
-        - name: Save configuration after banner update (NX-OS)
-          cisco.nxos.nxos_command:
-            commands: copy running-config startup-config
-          register: nxos_save_result
+          register: nxos_motd_result
 
       rescue:
-        - name: Log NX-OS remediation failure
-          ansible.builtin.debug:
-            msg: "FAILED to remediate banner on {{ inventory_hostname }}: check connectivity and privilege level"
+        - name: Remove banner on failure (NXOS rollback)
+          cisco.nxos.nxos_config:
+            lines:
+              - no banner motd
 
-    - name: Report per-device compliance status
-      tags: [audit_only, remediate]
+        - name: Abort after rollback
+          ansible.builtin.fail:
+            msg: "NXOS banner deployment failed on {{ inventory_hostname }}; rollback applied."
+
+      when: inventory_hostname in groups.get('nxos_devices', [])
+
+    - name: Deploy MOTD and login banners (EOS)
+      block:
+        - name: Apply banners (EOS)
+          arista.eos.eos_banner:
+            banner: "{{ item.type }}"
+            text: "{{ item.text }}"
+            state: present
+          loop:
+            - {type: motd,  text: "{{ motd_text }}"}
+            - {type: login, text: "{{ login_text }}"}
+          register: eos_banner_result
+
+      rescue:
+        - name: Remove banners on failure (EOS rollback)
+          arista.eos.eos_config:
+            lines:
+              - no banner motd
+              - no banner login
+
+        - name: Abort after rollback
+          ansible.builtin.fail:
+            msg: "EOS banner deployment failed on {{ inventory_hostname }}; rollback applied."
+
+      when: inventory_hostname in groups.get('eos_devices', [])
+
+    - name: Verify compliance keyword present in deployed banner
+      ansible.netcommon.cli_command:
+        command: show banner motd
+      register: banner_verify
+      retries: 3
+      delay: 5
+      until: compliance_keyword in banner_verify.stdout
+      failed_when: compliance_keyword not in banner_verify.stdout
+      changed_when: false
+
+    - name: Report deployment outcome
       ansible.builtin.debug:
-        msg: >-
-          {{ inventory_hostname }} ({{ ansible_network_os }}) banner status:
-          {% set raw = (ios_banner_output.stdout | default(nxos_banner_output.stdout | default(junos_banner_output.stdout | default(['']))) | join('')) %}
-          {% if banner_required_text in raw %}COMPLIANT{% else %}NON-COMPLIANT — remediation attempted{% endif %}
-```
+        msg:
+          - "Device       : {{ inventory_hostname }}"
+          - "Pre-change   : {{ (banner_before.stdout | default('')) | truncate(60) }}"
+          - "Post-change  : {{ (banner_verify.stdout | default('')) | truncate(60) }}"
+          - "Compliant    : {{ compliance_keyword in banner_verify.stdout }}
