@@ -1,123 +1,97 @@
-```yaml
 ---
-# cdp_lldp_neighbors.yml
+# bgp_neighbor_collection.yml
 #
-# Discovers CDP and LLDP neighbors from IOS/IOS-XE devices for topology
-# documentation. Saves per-device neighbor reports to the control node.
-#
-# Credentials: ansible-vault encrypted group_vars/all/vault.yml
-#   vault_ansible_user: <username>
-#   vault_ansible_password: <password>
-#   vault_ansible_become_password: <enable_password>
+# Collects BGP IPv4 unicast neighbor state, prefix counts, and session uptime
+# from IOS/IOS-XE routers. Saves per-device text reports locally and surfaces
+# any sessions not in Established state.
 #
 # Inventory example:
-#   [core_switches]
-#   core-sw-01 ansible_host=10.0.1.1
-#   core-sw-02 ansible_host=10.0.1.2
+#   [routers]
+#   rtr-core-01  ansible_host=10.0.1.1
+#   rtr-core-02  ansible_host=10.0.1.2
+#   rtr-edge-01  ansible_host=10.0.2.1
 #
-#   [distribution_switches]
-#   dist-sw-01 ansible_host=10.0.2.1
-#
-#   [network_devices:children]
-#   core_switches
-#   distribution_switches
-#
-#   [network_devices:vars]
+#   [routers:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_user={{ vault_ansible_user }}
-#   ansible_password={{ vault_ansible_password }}
+#   ansible_user={{ vault_net_user }}               # ansible-vault encrypted
+#   ansible_password={{ vault_net_password }}       # ansible-vault encrypted
 #   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_become_password={{ vault_ansible_become_password }}
+#   ansible_become_password={{ vault_enable_pass }} # ansible-vault encrypted
 
-- name: Discover CDP and LLDP neighbors across network devices
-  hosts: network_devices
+- name: Collect BGP neighbor state and prefix statistics
+  hosts: routers
   gather_facts: false
-  vars:
-    output_dir: "{{ playbook_dir }}/neighbor_reports"
-    timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
 
-  tasks:
-    - name: Ensure local report directory exists
+  vars:
+    output_dir: "/tmp/bgp_reports"
+    ts: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+
+  pre_tasks:
+    - name: Create local output directory
       ansible.builtin.file:
         path: "{{ output_dir }}"
         state: directory
-        mode: '0755'
+        mode: "0755"
       delegate_to: localhost
       run_once: true
 
-    - name: Collect neighbor tables
+  tasks:
+    - name: Collect BGP neighbor data
       block:
-        - name: Run show cdp neighbors detail
+        - name: Run BGP show commands
           cisco.ios.ios_command:
             commands:
-              - show cdp neighbors detail
-          register: cdp_output
+              - show bgp ipv4 unicast summary
+              - show bgp ipv4 unicast neighbors | include BGP neighbor|BGP state|Prefixes Current
+          register: bgp_raw
           retries: 2
           delay: 5
-          until: cdp_output is not failed
-
-        - name: Run show lldp neighbors detail
-          cisco.ios.ios_command:
-            commands:
-              - show lldp neighbors detail
-          register: lldp_output
-          retries: 2
-          delay: 5
-          until: lldp_output is not failed
-          # LLDP may be disabled on some devices — treat that as non-fatal
+          until: bgp_raw is not failed
           failed_when: >
-            lldp_output.failed and
-            'LLDP is not enabled' not in (lldp_output.stdout | join(''))
+            bgp_raw.failed or
+            'Invalid input' in bgp_raw.stdout[0]
+
+        - name: Verify BGP process is active
+          ansible.builtin.assert:
+            that: "'BGP' in bgp_raw.stdout[0]"
+            fail_msg: "No active BGP process found on {{ inventory_hostname }}"
+
+        - name: Alert on non-Established BGP sessions
+          ansible.builtin.debug:
+            msg: "ALERT: Non-Established BGP peers present on {{ inventory_hostname }} — review the saved report"
+          when: bgp_raw.stdout[0] | regex_search('(Idle|Active|Connect|OpenSent|OpenConfirm)')
+
+        - name: Display BGP summary table
+          ansible.builtin.debug:
+            msg: "{{ bgp_raw.stdout[0].splitlines() }}"
+
+        - name: Save BGP report to disk
+          ansible.builtin.copy:
+            content: |
+              ============================================================
+              BGP Neighbor Report  |  Host: {{ inventory_hostname }}
+              Collected: {{ ts }}
+              ============================================================
+
+              BGP IPv4 Unicast Summary:
+              {{ bgp_raw.stdout[0] }}
+
+              Neighbor State / Prefix Detail (filtered):
+              {{ bgp_raw.stdout[1] if bgp_raw.stdout[1] else '  (filter returned empty — no neighbors or unsupported syntax)' }}
+            dest: "{{ output_dir }}/{{ inventory_hostname }}_bgp_{{ ts }}.txt"
+            mode: "0644"
+          delegate_to: localhost
 
       rescue:
         - name: Log collection failure
           ansible.builtin.debug:
-            msg: "Failed to collect neighbor data from {{ inventory_hostname }}: {{ ansible_failed_result.msg }}"
+            msg: "FAILED to collect BGP data from {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
 
-        - name: Abort for this host
-          ansible.builtin.fail:
-            msg: "Neighbor collection aborted for {{ inventory_hostname }}"
-
-    - name: Display CDP neighbors
-      ansible.builtin.debug:
-        msg: "{{ inventory_hostname }} CDP neighbors:\n{{ cdp_output.stdout[0] }}"
-      when:
-        - cdp_output is defined
-        - cdp_output.stdout[0] | length > 0
-
-    - name: Display LLDP neighbors
-      ansible.builtin.debug:
-        msg: "{{ inventory_hostname }} LLDP neighbors:\n{{ lldp_output.stdout[0] }}"
-      when:
-        - lldp_output is defined
-        - not lldp_output.failed
-        - lldp_output.stdout[0] | length > 0
-
-    - name: Save neighbor report to control node
-      ansible.builtin.copy:
-        content: |
-          === Neighbor Discovery Report ===
-          Device    : {{ inventory_hostname }}
-          Timestamp : {{ timestamp }}
-
-          --- CDP Neighbors ---
-          {{ cdp_output.stdout[0] | default('No CDP data collected') }}
-
-          --- LLDP Neighbors ---
-          {{ lldp_output.stdout[0] | default('LLDP not enabled or no data collected') }}
-        dest: "{{ output_dir }}/{{ inventory_hostname }}_neighbors_{{ timestamp }}.txt"
-        mode: '0644'
-      delegate_to: localhost
-      when: cdp_output is defined
-
-    - name: Summarize results
-      ansible.builtin.debug:
-        msg: >-
-          {{ inventory_hostname }}:
-          CDP neighbors found={{ 'Device ID' in (cdp_output.stdout[0] | default('')) }},
-          LLDP collected={{ not (lldp_output.failed | default(true)) }},
-          report={{ output_dir }}/{{ inventory_hostname }}_neighbors_{{ timestamp }}.txt
-      when: cdp_output is defined
-```
+        - name: Write failure marker file
+          ansible.builtin.copy:
+            content: "COLLECTION FAILED on {{ ts }}\nError: {{ ansible_failed_result.msg | default('unknown') }}\n"
+            dest: "{{ output_dir }}/{{ inventory_hostname }}_bgp_FAILED_{{ ts }}.txt"
+            mode: "0644"
+          delegate_to: localhost
