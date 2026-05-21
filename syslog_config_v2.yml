@@ -1,115 +1,139 @@
-The user's prompt is a complete specification — all requirements, constraints, and output format are explicit. Following the user instruction ("Output ONLY the playbook YAML content") which takes precedence over the brainstorming dialog flow.
-
+```yaml
 ---
-# Ansible Playbook: IOS Local Logging Buffer and Severity Configuration
-#
-# Configures local logging parameters on Cisco IOS devices:
-#   - Log buffer size and message severity threshold
-#   - Console and VTY monitor severity levels
-#   - Logging synchronous on console and VTY lines (prevents CLI interleaving)
-#   - Rate-limit guard to reduce console flooding in production
-#
-# Complements syslog_config.yml (remote server destinations) with
-# local buffer and session logging controls — does not reconfigure
-# remote syslog hosts.
-#
-# Credentials (ansible-vault encrypted in group_vars/network/vault.yml):
-#   ansible_user:            "{{ vault_net_username }}"
-#   ansible_password:        "{{ vault_net_password }}"
-#   ansible_become_password: "{{ vault_enable_password }}"
+# ospf_config.yml
+# Configures OSPF routing protocol on Cisco IOS devices
+# Supports single/multi-area deployments with MD5 authentication and
+# post-convergence neighbor verification.
 #
 # Inventory example:
-# ---
-# all:
-#   children:
-#     routers:
-#       hosts:
-#         rtr-core-01:
-#           ansible_host: 10.0.1.1
-#         rtr-core-02:
-#           ansible_host: 10.0.1.2
-#       vars:
-#         ansible_network_os: ios
-#         ansible_connection: network_cli
-#         ansible_become: true
-#         ansible_become_method: enable
+#   [core_routers]
+#   r1 ansible_host=10.0.0.1
+#   r2 ansible_host=10.0.0.2
 #
-# Usage:
-#   ansible-playbook logging_local_config.yml -i inventory/prod.yml \
-#     --ask-vault-pass
+#   [core_routers:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_net_username }}         # ansible-vault encrypted
+#   ansible_password={{ vault_net_password }}     # ansible-vault encrypted
+#   ansible_become=true
+#   ansible_become_method=enable
+#   ansible_become_pass={{ vault_enable_password }}
 
-- name: Configure IOS local logging buffer, severity, and session settings
-  hosts: routers
+- name: Configure OSPF routing on Cisco IOS devices
+  hosts: core_routers
   gather_facts: false
 
   vars:
-    log_buffer_size: 51200
-    log_buffer_severity: informational
-    log_console_severity: critical
-    log_monitor_severity: warnings
-    log_rate_limit: 100
-    enable_log_sync: true
+    ospf_process_id: 1
+    ospf_router_id: "{{ ansible_host }}"
+    ospf_reference_bandwidth_mbps: 10000
+    ospf_area_auth_enabled: true
+    ospf_auth_key: "{{ vault_ospf_md5_key }}"    # ansible-vault encrypted
+    ospf_networks:
+      - prefix: "10.0.0.0"
+        wildcard: "0.0.0.255"
+        area: 0
+      - prefix: "192.168.100.0"
+        wildcard: "0.0.0.255"
+        area: 1
+    ospf_active_interfaces:
+      - GigabitEthernet0/0
+      - GigabitEthernet0/1
 
   tasks:
-
-    - name: Confirm device is reachable
+    - name: Capture pre-change OSPF state
       cisco.ios.ios_command:
         commands:
-          - show version | include IOS-XE|IOS Software
-      register: ios_version
-      retries: 3
-      delay: 5
-      until: ios_version is not failed
+          - show ip ospf
+          - show ip ospf neighbor
+          - show ip route ospf summary
+      register: ospf_prechange
+      failed_when: false
 
-    - name: Apply local logging configuration
+    - name: Display pre-change OSPF state
+      ansible.builtin.debug:
+        var: ospf_prechange.stdout_lines
+
+    - name: Apply OSPF configuration
       block:
-
-        - name: Set logging buffer size and severity
+        - name: Configure OSPF process, router-id, and reference bandwidth
           cisco.ios.ios_config:
             lines:
-              - "logging buffered {{ log_buffer_size }} {{ log_buffer_severity }}"
-              - "logging console {{ log_console_severity }}"
-              - "logging monitor {{ log_monitor_severity }}"
-              - "logging rate-limit {{ log_rate_limit }}"
-              - "no logging on"
-              - "logging on"
-            save_when: changed
+              - "router-id {{ ospf_router_id }}"
+              - "auto-cost reference-bandwidth {{ ospf_reference_bandwidth_mbps }}"
+              - "passive-interface default"
+              - "log-adjacency-changes detail"
+            parents: "router ospf {{ ospf_process_id }}"
 
-        - name: Enable logging synchronous on console line
+        - name: Activate OSPF on routed interfaces
           cisco.ios.ios_config:
-            parents: line con 0
             lines:
-              - logging synchronous
-            save_when: changed
-          when: enable_log_sync | bool
+              - "no passive-interface {{ item }}"
+            parents: "router ospf {{ ospf_process_id }}"
+          loop: "{{ ospf_active_interfaces }}"
 
-        - name: Enable logging synchronous on VTY lines
+        - name: Advertise networks into OSPF
           cisco.ios.ios_config:
-            parents: line vty 0 15
             lines:
-              - logging synchronous
-            save_when: changed
-          when: enable_log_sync | bool
+              - "network {{ item.prefix }} {{ item.wildcard }} area {{ item.area }}"
+            parents: "router ospf {{ ospf_process_id }}"
+          loop: "{{ ospf_networks }}"
+
+        - name: Enable MD5 authentication on backbone area
+          cisco.ios.ios_config:
+            lines:
+              - "area 0 authentication message-digest"
+            parents: "router ospf {{ ospf_process_id }}"
+          when: ospf_area_auth_enabled | bool
+
+        - name: Set MD5 key on active interfaces
+          cisco.ios.ios_config:
+            lines:
+              - "ip ospf message-digest-key 1 md5 {{ ospf_auth_key }}"
+              - "ip ospf network point-to-point"
+            parents: "interface {{ item }}"
+          loop: "{{ ospf_active_interfaces }}"
+          when: ospf_area_auth_enabled | bool
+          no_log: true
 
       rescue:
-
         - name: Report configuration failure
           ansible.builtin.debug:
             msg: >
-              Configuration FAILED on {{ inventory_hostname }}:
-              {{ ansible_failed_task.name }} — {{ ansible_failed_result.msg | default('unknown error') }}
+              OSPF config failed on {{ inventory_hostname }}:
+              {{ ansible_failed_result.msg | default('check device logs') }}
 
-        - name: Abort play after rescue
+        - name: Abort with failure
           ansible.builtin.fail:
-            msg: "Local logging config failed on {{ inventory_hostname }}. Review and retry."
+            msg: "OSPF configuration did not apply cleanly on {{ inventory_hostname }}"
 
-    - name: Verify applied logging configuration
+    - name: Persist configuration
+      cisco.ios.ios_config:
+        save_when: modified
+
+    - name: Wait for OSPF adjacencies to form
       cisco.ios.ios_command:
         commands:
-          - show logging | include Syslog|Buffer|Console|Monitor|rate
-      register: logging_status
-      failed_when: "'Syslog logging: enabled' not in logging_status.stdout[0]"
+          - show ip ospf neighbor
+      register: ospf_neighbors
+      retries: 4
+      delay: 15
+      until: "'FULL' in ospf_neighbors.stdout[0]"
+      failed_when: false
 
-    - name: Display logging status for each device
+    - name: Verify OSPF routes installed
+      cisco.ios.ios_command:
+        commands:
+          - show ip route ospf
+      register: ospf_routes
+      failed_when: >
+        ospf_routes.stdout[0] is defined and
+        ospf_routes.stdout[0] | length == 0 and
+        ospf_networks | length > 1
+
+    - name: Display post-change neighbor and route state
       ansible.builtin.debug:
-        msg: "{{ inventory_hostname }} — Logging status:\n{{ logging_status.stdout[0] }}
+        msg:
+          - "Neighbors: {{ ospf_neighbors.stdout_lines }}"
+          - "OSPF routes: {{ ospf_routes.stdout_lines }}"
+```
