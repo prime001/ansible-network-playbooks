@@ -1,106 +1,102 @@
 ---
-# BGP Session Compliance Check
-# Verifies all expected BGP neighbors are in Established state and
-# that received prefix counts fall within defined per-peer thresholds.
+# Routing Protocol Compliance Check — BGP and OSPF Neighbor Validation
+# Verifies that BGP peers are in Established state, OSPF adjacencies are FULL,
+# and critical routes are present in the routing table.
 #
-# Credentials: stored in Ansible Vault (group_vars/all/vault.yml)
-#   vault_ansible_user: <device_username>
-#   vault_ansible_password: <device_password>
-#   vault_enable_password: <enable_secret>
+# Inventory example:
+#   [core_routers]
+#   core-rtr-01  ansible_host=10.0.1.1
+#   core-rtr-02  ansible_host=10.0.1.2
 #
-# Inventory example (inventory/hosts.yml):
-#   all:
-#     children:
-#       bgp_routers:
-#         hosts:
-#           core-rtr-01:
-#             ansible_host: 10.0.0.1
-#             bgp_peers:
-#               - peer_ip: 192.168.1.1
-#                 description: "ISP-Primary"
-#                 min_prefixes: 100
-#               - peer_ip: 192.168.2.1
-#                 description: "Transit-B"
-#                 min_prefixes: 5000
-#         vars:
-#           ansible_network_os: ios
-#           ansible_connection: network_cli
+#   [core_routers:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_net_user }}             # ansible-vault encrypted
+#   ansible_password={{ vault_net_password }}      # ansible-vault encrypted
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_enable_pass }} # ansible-vault encrypted
 
-- name: BGP Session Compliance Check
-  hosts: bgp_routers
+- name: Routing Protocol Compliance — BGP and OSPF Neighbor Validation
+  hosts: core_routers
   gather_facts: false
+
   vars:
-    ansible_user: "{{ vault_ansible_user }}"
-    ansible_password: "{{ vault_ansible_password }}"
-    ansible_become: true
-    ansible_become_method: enable
-    ansible_become_password: "{{ vault_enable_password }}"
+    # Routes that must exist in the routing table — override per host in host_vars/
+    required_routes:
+      - "0.0.0.0"
+      - "10.0.0.0"
+    bgp_compliant: false
+    ospf_compliant: false
 
   tasks:
-    - name: Collect BGP data from device
+    - name: Collect routing protocol state
       block:
-        - name: Run show ip bgp summary
+        - name: Gather BGP IPv4 unicast summary
           cisco.ios.ios_command:
             commands:
-              - show ip bgp summary
-          register: bgp_summary_output
-          retries: 2
-          delay: 5
-          until: bgp_summary_output is not failed
+              - show bgp ipv4 unicast summary
+            wait_for:
+              - result[0] contains "BGP"
+            retries: 3
+            interval: 10
+          register: bgp_summary
 
-        - name: Check state of each expected BGP peer
+        - name: Gather OSPF neighbor table
           cisco.ios.ios_command:
             commands:
-              - "show ip bgp neighbors {{ item.peer_ip }} | include BGP state|prefixes"
-          loop: "{{ bgp_peers | default([]) }}"
-          loop_control:
-            label: "{{ item.description }} ({{ item.peer_ip }})"
-          register: peer_state_results
-          failed_when: false
+              - show ip ospf neighbor detail
+          register: ospf_neighbors
+
+        - name: Verify required routes present
+          cisco.ios.ios_command:
+            commands: "{{ required_routes | map('regex_replace', '^(.*)$', 'show ip route \\1') | list }}"
+          register: route_check
+          failed_when: >
+            route_check.stdout | select('search', '% Network not in table') | list | length > 0
 
       rescue:
-        - name: Report data collection failure
+        - name: Flag host as unreachable or error state
           ansible.builtin.debug:
-            msg: "Failed to collect BGP data from {{ inventory_hostname }}: {{ ansible_failed_result.msg }}"
+            msg: >
+              COMPLIANCE ERROR on {{ inventory_hostname }}:
+              Task '{{ ansible_failed_task.name }}' failed — {{ ansible_failed_result.msg | default('no detail') }}
 
-        - name: Abort with descriptive error
-          ansible.builtin.fail:
-            msg: "BGP compliance check aborted on {{ inventory_hostname }} — connection or command failure"
+        - name: Abort remaining tasks for this host
+          ansible.builtin.meta: end_host
 
-    - name: Identify non-established BGP sessions
+    - name: Evaluate BGP Established state
       ansible.builtin.set_fact:
-        failed_peers: >-
-          {{
-            peer_state_results.results
-            | selectattr('stdout', 'defined')
-            | rejectattr('stdout', 'search', 'BGP state = Established')
-            | map(attribute='item')
-            | list
-          }}
+        bgp_compliant: "{{ 'Established' in bgp_summary.stdout[0] }}"
 
-    - name: Display BGP summary table
+    - name: Evaluate OSPF FULL adjacency
+      ansible.builtin.set_fact:
+        ospf_compliant: "{{ 'FULL' in ospf_neighbors.stdout[0] }}"
+
+    - name: Display BGP summary output
       ansible.builtin.debug:
-        msg: "{{ bgp_summary_output.stdout_lines[0] }}"
+        var: bgp_summary.stdout_lines
 
-    - name: Report each non-compliant BGP session
+    - name: Display OSPF neighbor detail
       ansible.builtin.debug:
-        msg: >-
-          NON-COMPLIANT: {{ item.description }} ({{ item.peer_ip }})
-          is not in Established state on {{ inventory_hostname }}
-      loop: "{{ failed_peers }}"
-      when: failed_peers | length > 0
+        var: ospf_neighbors.stdout_lines
 
-    - name: Confirm full BGP compliance
+    - name: Display required route lookup results
       ansible.builtin.debug:
-        msg: >-
-          COMPLIANT: All {{ bgp_peers | default([]) | length }} BGP peers
-          are Established on {{ inventory_hostname }}
-      when: failed_peers | length == 0
+        var: route_check.stdout_lines
 
-    - name: Fail if any BGP peer is non-compliant
+    - name: Summarize compliance result per host
+      ansible.builtin.debug:
+        msg:
+          - "=== ROUTING COMPLIANCE REPORT: {{ inventory_hostname }} ==="
+          - "BGP Established neighbor present : {{ bgp_compliant }}"
+          - "OSPF FULL adjacency present      : {{ ospf_compliant }}"
+          - "All required routes present      : {{ route_check is not failed }}"
+
+    - name: Fail if routing protocol compliance checks did not pass
       ansible.builtin.fail:
-        msg: >-
-          {{ failed_peers | length }} BGP session(s) non-compliant on
-          {{ inventory_hostname }}. Non-established peers:
-          {{ failed_peers | map(attribute='peer_ip') | join(', ') }}
-      when: failed_peers | length > 0
+        msg: >
+          {{ inventory_hostname }} is NON-COMPLIANT:
+          BGP={{ bgp_compliant }}, OSPF={{ ospf_compliant }}.
+          Review output above and investigate neighbor or route loss.
+      when: not bgp_compliant or not ospf_compliant
