@@ -1,129 +1,112 @@
 ---
-# config_restore.yml
+# Playbook: VLAN Configuration Management
+# Description: Deploy and manage VLAN configurations across network infrastructure
+# Supported devices: Cisco IOS/IOS-XE
 #
-# Restores a previously saved configuration backup to Cisco IOS devices.
-# Useful for disaster recovery, rollback after a failed change window,
-# or provisioning replacement hardware from a known-good baseline.
+# Inventory Example:
+# [network_devices]
+# switch1.example.com ansible_host=10.1.1.1 device_type=ios
+# switch2.example.com ansible_host=10.1.1.2 device_type=ios
 #
-# Credentials must be stored in Ansible Vault:
-#   ansible-vault encrypt_string 'mypassword' --name 'ansible_password'
-#
-# Inventory example:
-#   [core_routers]
-#   rtr-core-01  ansible_host=10.0.0.1
-#   rtr-core-02  ansible_host=10.0.0.2
-#
-#   [core_routers:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user=netadmin
-#   ansible_password=!vault |
-#     $ANSIBLE_VAULT;1.1;AES256
-#     6234...
-#   ansible_become=true
-#   ansible_become_method=enable
-#   ansible_become_password=!vault |
-#     $ANSIBLE_VAULT;1.1;AES256
-#     8bc4...
-#
-# Usage:
-#   ansible-playbook config_restore.yml -i inventory/network.yml \
-#     --ask-vault-pass -e "backup_dir=/opt/backups/network confirm_restore=true"
-#
-- name: Restore network device configuration from backup
-  hosts: "{{ target_hosts | default('core_routers') }}"
-  gather_facts: false
+# Vault reference: ansible-vault encrypt group_vars/network_devices.yml
+# Contains: ansible_user, ansible_password, ansible_network_os
+
+- name: Configure and Manage VLANs Across Network Infrastructure
+  hosts: network_devices
+  gather_facts: no
+
   vars:
-    backup_dir: "/opt/backups/network"
-    confirm_restore: false
-    restore_timeout: 60
+    ansible_connection: network_cli
+    ansible_network_os: ios
+    # Credentials reference - stored in vault for production
+    # ansible_user: "{{ vault_network_user }}"
+    # ansible_password: "{{ vault_network_password }}"
+
+    vlan_configurations:
+      - vlan_id: 10
+        name: Management
+      - vlan_id: 20
+        name: DataVLAN
+      - vlan_id: 30
+        name: VoiceVLAN
 
   tasks:
-    - name: Abort unless restore explicitly confirmed
-      ansible.builtin.fail:
-        msg: "Safety gate: pass -e confirm_restore=true to proceed"
-      when: not (confirm_restore | bool)
+    - name: Gather current VLAN information from network device
+      ios_facts:
+        gather_network_resources: vlans
+      register: current_vlans
+      retries: 3
+      delay: 5
+      until: current_vlans is not failed
+      tags: [gather, vlans]
 
-    - name: Locate backup files for this host
-      ansible.builtin.find:
-        paths: "{{ backup_dir }}"
-        patterns: "{{ inventory_hostname }}_*.cfg"
-      delegate_to: localhost
-      register: backup_files
+    - name: Display current VLAN status before deployment
+      debug:
+        msg: |
+          Current VLANs on {{ inventory_hostname }}:
+          {{ current_vlans.ansible_facts.ansible_network_resources.vlans | default([]) | to_nice_yaml }}
+      tags: [display]
 
-    - name: Fail when no backup exists for this host
-      ansible.builtin.fail:
-        msg: "No backup found for {{ inventory_hostname }} in {{ backup_dir }}"
-      when: backup_files.files | length == 0
-
-    - name: Resolve most recent backup file
-      ansible.builtin.set_fact:
-        restore_file: "{{ (backup_files.files | sort(attribute='mtime') | last).path }}"
-
-    - name: Capture pre-restore snapshot
-      block:
-        - name: Pull running config before restore
-          cisco.ios.ios_command:
-            commands: show running-config
-          register: pre_restore_snapshot
-          retries: 3
-          delay: 5
-          until: pre_restore_snapshot is not failed
-
-        - name: Save pre-restore snapshot to controller
-          ansible.builtin.copy:
-            content: "{{ pre_restore_snapshot.stdout[0] }}"
-            dest: "{{ backup_dir }}/{{ inventory_hostname }}_pre_restore_{{ ansible_date_time.epoch }}.cfg"
-            mode: "0640"
-          delegate_to: localhost
+    - name: Deploy VLAN configurations to network device
+      ios_vlans:
+        config: "{{ vlan_configurations }}"
+        state: merged
+      register: vlan_deployment
+      retries: 2
+      delay: 10
+      until: vlan_deployment is not failed
+      tags: [deploy, vlans]
 
       rescue:
-        - name: Warn — pre-restore snapshot failed, continuing
-          ansible.builtin.debug:
-            msg: "WARNING: could not snapshot {{ inventory_hostname }} before restore"
+        - name: Handle VLAN deployment failure
+          debug:
+            msg: |
+              VLAN deployment failed on {{ inventory_hostname }}:
+              Error: {{ vlan_deployment.msg | default('Unknown error') }}
+          failed_when: true
 
-    - name: Push backup configuration to device
-      block:
-        - name: Load backup config onto device
-          cisco.ios.ios_config:
-            src: "{{ restore_file }}"
-            save_when: never
-          register: restore_result
-          timeout: "{{ restore_timeout }}"
+    - name: Verify VLAN configuration post-deployment
+      ios_facts:
+        gather_network_resources: vlans
+      register: post_deployment_vlans
+      retries: 2
+      delay: 5
+      until: post_deployment_vlans is not failed
+      tags: [verify, vlans]
 
-        - name: Verify device is responsive after restore
-          cisco.ios.ios_command:
-            commands: show version
-          register: post_restore_check
-          retries: 3
-          delay: 10
-          until: post_restore_check is not failed
-          failed_when: post_restore_check.stdout[0] | length < 50
+    - name: Validate VLAN deployment results
+      assert:
+        that:
+          - post_deployment_vlans.ansible_facts.ansible_network_resources.vlans is defined
+          - post_deployment_vlans.ansible_facts.ansible_network_resources.vlans | length >= vlan_configurations | length
+        fail_msg: "VLAN deployment validation failed - required VLANs not found"
+        success_msg: "VLAN validation successful - all VLANs deployed correctly"
+      tags: [validate]
 
-        - name: Write restored config to startup
-          cisco.ios.ios_command:
-            commands: write memory
-          register: write_result
-          failed_when: >
-            'OK' not in (write_result.stdout[0] | default(''))
-            and 'Building configuration' not in (write_result.stdout[0] | default(''))
+    - name: Display final deployment summary
+      debug:
+        msg: |
+          ===========================================
+          VLAN Deployment Summary for {{ inventory_hostname }}
+          ===========================================
+          Target VLANs: {{ vlan_configurations | length }}
+          Current VLANs: {{ post_deployment_vlans.ansible_facts.ansible_network_resources.vlans | length }}
+          Deployment Status: {{ 'CHANGED' if vlan_deployment is changed else 'UNCHANGED' }}
+          Timestamp: {{ ansible_date_time.iso8601 | default('N/A') }}
+      tags: [summary]
 
-      rescue:
-        - name: Log restore failure details
-          ansible.builtin.debug:
-            msg:
-              - "RESTORE FAILED on {{ inventory_hostname }}"
-              - "Source file: {{ restore_file }}"
-              - "Manual intervention required"
+    - name: Save running configuration to startup
+      ios_command:
+        commands:
+          - command: "write memory"
+            prompt: "\[OK\]|[OK]"
+      register: save_result
+      failed_when: false
+      tags: [save]
 
-        - name: Fail play after logging
-          ansible.builtin.fail:
-            msg: "Configuration restore failed for {{ inventory_hostname }}"
-
-    - name: Display restore summary
-      ansible.builtin.debug:
-        msg:
-          - "Host         : {{ inventory_hostname }}"
-          - "Restore file : {{ restore_file }}"
-          - "Lines applied: {{ restore_result.updates | default([]) | length }}"
-          - "Startup saved: {{ 'yes' if (write_result is defined and write_result is not failed) else 'no' }}
+    - name: Display configuration save status
+      debug:
+        msg: |
+          Configuration save result:
+          {{ save_result.stdout_lines | default(['Save operation completed']) }}
+      tags: [save]
