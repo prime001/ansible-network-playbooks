@@ -1,151 +1,108 @@
+The ansible-network-playbooks repo is a separate GitHub portfolio — I just need to output the YAML directly.
+
 ---
-# bgp_neighbor_config.yml
-#
-# Configure eBGP/iBGP neighbor relationships on Cisco IOS/IOS-XE devices.
-# Verifies peer session state after applying config and asserts all neighbors
-# reach Established within the convergence window.
+# ntp_auth_config.yml
+# Hardens NTP by enabling MD5 peer authentication on Cisco IOS devices.
+# Complements basic NTP server config (ntp_config.yml / ntp_config_v2.yml) by
+# adding cryptographic key binding, trusted-key enforcement, and sync validation.
 #
 # Usage:
-#   ansible-playbook bgp_neighbor_config.yml -i inventory/routers.ini \
-#     --ask-vault-pass
+#   ansible-playbook ntp_auth_config.yml -i inventory/production --ask-vault-pass
 #
 # Inventory example:
-#   [routers]
-#   core-rtr-01  ansible_host=10.0.1.1
-#   core-rtr-02  ansible_host=10.0.1.2
+#   [distribution_switches]
+#   sw-dist-01 ansible_host=10.10.1.10
+#   sw-dist-02 ansible_host=10.10.1.11
 #
-#   [routers:vars]
+#   [distribution_switches:vars]
+#   ansible_user=netadmin
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_user={{ vault_net_user }}
-#   ansible_password={{ vault_net_password }}
-#   ansible_become=yes
+#   ansible_become=true
 #   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_password }}
+#   ansible_password=!vault |
+#     $ANSIBLE_VAULT;1.1;AES256
+#     636661643530336566653939...
+#   vault_ntp_auth_key=!vault |
+#     $ANSIBLE_VAULT;1.1;AES256
+#     346237613263396664653939...
 
-- name: Configure BGP Neighbor Relationships and Verify Peering State
-  hosts: routers
+- name: Configure NTP MD5 Authentication on Cisco IOS Distribution Layer
+  hosts: distribution_switches
   gather_facts: false
   vars:
-    bgp_asn: 65001
-    bgp_router_id: "{{ ansible_host }}"
-    bgp_keepalive: 10
-    bgp_holdtime: 30
-    bgp_convergence_wait: 45
-    bgp_neighbors:
-      - peer_ip: 10.0.1.2
-        peer_asn: 65002
-        description: eBGP-to-core-rtr-02
-        auth_key: "{{ vault_bgp_peer1_key }}"   # ansible-vault encrypted
-        ebgp_multihop: 2
-        update_source: Loopback0
-      - peer_ip: 192.168.100.1
-        peer_asn: 65001
-        description: iBGP-to-distribution
-        auth_key: "{{ vault_bgp_peer2_key }}"   # ansible-vault encrypted
-        update_source: Loopback0
-    bgp_networks:
-      - prefix: 10.10.0.0
-        mask: 255.255.0.0
+    ntp_auth_key_id: 10
+    ntp_auth_key: "{{ vault_ntp_auth_key }}"   # ansible-vault encrypt_string
+    ntp_servers:
+      - { address: "10.0.0.1", prefer: true }
+      - { address: "10.0.0.2", prefer: false }
+    ntp_sync_timeout_seconds: 60
 
   tasks:
-    - name: Apply BGP configuration
+    - name: Apply NTP authentication configuration
       block:
-        - name: Set BGP router-id and enable neighbor-change logging
+        - name: Enable NTP auth global flag and register trusted key
           cisco.ios.ios_config:
             lines:
-              - "bgp router-id {{ bgp_router_id }}"
-              - bgp log-neighbor-changes
-            parents: "router bgp {{ bgp_asn }}"
-
-        - name: Configure neighbor base parameters
-          cisco.ios.ios_config:
-            lines:
-              - "neighbor {{ item.peer_ip }} remote-as {{ item.peer_asn }}"
-              - "neighbor {{ item.peer_ip }} description {{ item.description }}"
-              - "neighbor {{ item.peer_ip }} password {{ item.auth_key }}"
-              - "neighbor {{ item.peer_ip }} timers {{ bgp_keepalive }} {{ bgp_holdtime }}"
-              - "neighbor {{ item.peer_ip }} update-source {{ item.update_source | default('Loopback0') }}"
-              - "neighbor {{ item.peer_ip }} soft-reconfiguration inbound"
-            parents: "router bgp {{ bgp_asn }}"
-          loop: "{{ bgp_neighbors }}"
-          loop_control:
-            label: "{{ item.peer_ip }} (AS{{ item.peer_asn }})"
-
-        - name: Enable eBGP multihop for non-directly-connected peers
-          cisco.ios.ios_config:
-            lines:
-              - "neighbor {{ item.peer_ip }} ebgp-multihop {{ item.ebgp_multihop }}"
-            parents: "router bgp {{ bgp_asn }}"
-          loop: "{{ bgp_neighbors }}"
-          loop_control:
-            label: "{{ item.peer_ip }}"
-          when: item.ebgp_multihop is defined
-
-        - name: Advertise networks into BGP
-          cisco.ios.ios_config:
-            lines:
-              - "network {{ item.prefix }} mask {{ item.mask }}"
-            parents: "router bgp {{ bgp_asn }}"
-          loop: "{{ bgp_networks }}"
-          loop_control:
-            label: "{{ item.prefix }}"
-
-        - name: Write configuration to NVRAM
-          cisco.ios.ios_command:
-            commands: write memory
+              - ntp authenticate
+              - "ntp authentication-key {{ ntp_auth_key_id }} md5 {{ ntp_auth_key }}"
+              - "ntp trusted-key {{ ntp_auth_key_id }}"
+            save_when: changed
+          register: ntp_auth_config
           retries: 2
           delay: 5
+          until: ntp_auth_config is not failed
+
+        - name: Bind NTP servers to authentication key
+          cisco.ios.ios_config:
+            lines:
+              - "ntp server {{ item.address }} key {{ ntp_auth_key_id }}{{ ' prefer' if item.prefer else '' }}"
+            save_when: changed
+          loop: "{{ ntp_servers }}"
+          register: ntp_server_config
+          retries: 2
+          delay: 5
+          until: ntp_server_config is not failed
+
+        - name: Poll NTP status — allow time for synchronization
+          cisco.ios.ios_command:
+            commands:
+              - show ntp status
+              - show ntp associations
+          register: ntp_status
+          retries: 4
+          delay: "{{ (ntp_sync_timeout_seconds / 4) | int }}"
+          until: "'synchronized' in ntp_status.stdout[0] | lower"
+          failed_when: false
+
+        - name: Assert at least one peer was selected
+          ansible.builtin.assert:
+            that: "'*' in ntp_status.stdout[1]"
+            fail_msg: "No NTP peer selected on {{ inventory_hostname }} — check reachability and key mismatch"
+            success_msg: "NTP peer selected on {{ inventory_hostname }}"
+
+        - name: Display NTP synchronization summary
+          ansible.builtin.debug:
+            msg:
+              - "Device      : {{ inventory_hostname }}"
+              - "Synchronized: {{ 'YES' if 'synchronized' in ntp_status.stdout[0] | lower else 'PENDING' }}"
+              - "Status line : {{ ntp_status.stdout[0].splitlines()[0] }}"
+              - "Associations: {{ ntp_status.stdout[1] }}"
 
       rescue:
-        - name: Report configuration failure
+        - name: Collect current NTP running config for diagnostics
+          cisco.ios.ios_command:
+            commands: show running-config | section ntp
+          register: ntp_running
+          ignore_errors: true
+
+        - name: Display NTP running config
           ansible.builtin.debug:
-            msg: "BGP config failed on {{ inventory_hostname }} — check partial state: show run | section router bgp"
+            var: ntp_running.stdout_lines
 
-        - name: Abort play for this host
+        - name: Fail with actionable message
           ansible.builtin.fail:
-            msg: "Halting BGP deployment on {{ inventory_hostname }} due to configuration error"
-
-    - name: Wait for BGP sessions to converge
-      ansible.builtin.pause:
-        seconds: "{{ bgp_convergence_wait }}"
-        prompt: "Waiting {{ bgp_convergence_wait }}s for BGP sessions to establish..."
-
-    - name: Poll each BGP neighbor until Established state or retry exhausted
-      cisco.ios.ios_command:
-        commands:
-          - "show bgp neighbors {{ item.peer_ip }} | include BGP state"
-      loop: "{{ bgp_neighbors }}"
-      loop_control:
-        label: "{{ item.peer_ip }}"
-      register: bgp_state
-      retries: 4
-      delay: 15
-      until: "'Established' in bgp_state.stdout[0]"
-      failed_when: false
-
-    - name: Display BGP neighbor state per peer
-      ansible.builtin.debug:
-        msg: "{{ item.item.peer_ip }}: {{ item.stdout[0] }}"
-      loop: "{{ bgp_state.results }}"
-      loop_control:
-        label: "{{ item.item.peer_ip }}"
-
-    - name: Collect BGP summary table
-      cisco.ios.ios_command:
-        commands: show bgp summary
-      register: bgp_summary
-
-    - name: Print BGP summary output
-      ansible.builtin.debug:
-        var: bgp_summary.stdout_lines
-
-    - name: Assert all BGP peers reached Established state
-      ansible.builtin.assert:
-        that:
-          - "'Established' in item.stdout | join(' ')"
-        fail_msg: "FAIL — BGP peer {{ item.item.peer_ip }} is not Established on {{ inventory_hostname }}"
-        success_msg: "OK — BGP peer {{ item.item.peer_ip }} is Established on {{ inventory_hostname }}"
-      loop: "{{ bgp_state.results }}"
-      loop_control:
-        label: "{{ item.item.peer_ip }}
+            msg: >
+              NTP authentication setup failed on {{ inventory_hostname }}.
+              Verify: (1) key ID matches NTP server config, (2) MD5 key value matches,
+              (3) IOS version supports 'ntp authenticate', (4) vault decryption succeeded.
