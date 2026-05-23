@@ -1,97 +1,127 @@
 ---
-# bgp_neighbor_collection.yml
+# hardware_inventory.yml
 #
-# Collects BGP IPv4 unicast neighbor state, prefix counts, and session uptime
-# from IOS/IOS-XE routers. Saves per-device text reports locally and surfaces
-# any sessions not in Established state.
+# Collects chassis hardware details, module inventory, serial numbers,
+# software version, CPU utilization, and memory stats from Cisco IOS
+# and NX-OS devices. Saves a per-device report under reports/hardware_inventory/.
+# Distinct from facts_gathering.yml (Ansible network facts) — this targets
+# operational telemetry and physical asset tracking.
 #
 # Inventory example:
-#   [routers]
-#   rtr-core-01  ansible_host=10.0.1.1
-#   rtr-core-02  ansible_host=10.0.1.2
-#   rtr-edge-01  ansible_host=10.0.2.1
+#   [core_switches]
+#   core-sw-01  ansible_host=10.0.1.1  ansible_network_os=ios
+#   core-sw-02  ansible_host=10.0.1.2  ansible_network_os=ios
 #
-#   [routers:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user={{ vault_net_user }}               # ansible-vault encrypted
-#   ansible_password={{ vault_net_password }}       # ansible-vault encrypted
+#   [distribution]
+#   dist-sw-01  ansible_host=10.0.2.1  ansible_network_os=nxos
+#
+#   [network_devices:children]
+#   core_switches
+#   distribution
+#
+#   [network_devices:vars]
+#   ansible_user="{{ vault_net_username }}"      # ansible-vault encrypted
+#   ansible_password="{{ vault_net_password }}"  # ansible-vault encrypted
 #   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_pass }} # ansible-vault encrypted
+#   ansible_connection=network_cli
 
-- name: Collect BGP neighbor state and prefix statistics
-  hosts: routers
+- name: Hardware inventory and environmental telemetry collection
+  hosts: network_devices
   gather_facts: false
 
   vars:
-    output_dir: "/tmp/bgp_reports"
-    ts: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+    report_dir: "{{ playbook_dir }}/reports/hardware_inventory"
 
-  pre_tasks:
-    - name: Create local output directory
+  tasks:
+
+    - name: Create local report directory
       ansible.builtin.file:
-        path: "{{ output_dir }}"
+        path: "{{ report_dir }}"
         state: directory
         mode: "0755"
       delegate_to: localhost
       run_once: true
 
-  tasks:
-    - name: Collect BGP neighbor data
+    - name: Gather IOS hardware and environmental data
       block:
-        - name: Run BGP show commands
+        - name: Execute IOS show commands
           cisco.ios.ios_command:
             commands:
-              - show bgp ipv4 unicast summary
-              - show bgp ipv4 unicast neighbors | include BGP neighbor|BGP state|Prefixes Current
-          register: bgp_raw
-          retries: 2
+              - show version
+              - show inventory
+              - show environment all
+              - show processes cpu sorted | head 10
+              - show processes memory sorted | head 10
+          register: ios_facts
+          retries: 3
           delay: 5
-          until: bgp_raw is not failed
-          failed_when: >
-            bgp_raw.failed or
-            'Invalid input' in bgp_raw.stdout[0]
-
-        - name: Verify BGP process is active
-          ansible.builtin.assert:
-            that: "'BGP' in bgp_raw.stdout[0]"
-            fail_msg: "No active BGP process found on {{ inventory_hostname }}"
-
-        - name: Alert on non-Established BGP sessions
-          ansible.builtin.debug:
-            msg: "ALERT: Non-Established BGP peers present on {{ inventory_hostname }} — review the saved report"
-          when: bgp_raw.stdout[0] | regex_search('(Idle|Active|Connect|OpenSent|OpenConfirm)')
-
-        - name: Display BGP summary table
-          ansible.builtin.debug:
-            msg: "{{ bgp_raw.stdout[0].splitlines() }}"
-
-        - name: Save BGP report to disk
-          ansible.builtin.copy:
-            content: |
-              ============================================================
-              BGP Neighbor Report  |  Host: {{ inventory_hostname }}
-              Collected: {{ ts }}
-              ============================================================
-
-              BGP IPv4 Unicast Summary:
-              {{ bgp_raw.stdout[0] }}
-
-              Neighbor State / Prefix Detail (filtered):
-              {{ bgp_raw.stdout[1] if bgp_raw.stdout[1] else '  (filter returned empty — no neighbors or unsupported syntax)' }}
-            dest: "{{ output_dir }}/{{ inventory_hostname }}_bgp_{{ ts }}.txt"
-            mode: "0644"
-          delegate_to: localhost
-
+          until: ios_facts is not failed
       rescue:
-        - name: Log collection failure
+        - name: Report IOS collection error
           ansible.builtin.debug:
-            msg: "FAILED to collect BGP data from {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
+            msg: "Failed collecting hardware facts from {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
+        - ansible.builtin.fail:
+            msg: "Hardware inventory aborted for {{ inventory_hostname }}"
+      when: ansible_network_os == 'ios'
 
-        - name: Write failure marker file
-          ansible.builtin.copy:
-            content: "COLLECTION FAILED on {{ ts }}\nError: {{ ansible_failed_result.msg | default('unknown') }}\n"
-            dest: "{{ output_dir }}/{{ inventory_hostname }}_bgp_FAILED_{{ ts }}.txt"
-            mode: "0644"
-          delegate_to: localhost
+    - name: Gather NX-OS hardware and environmental data
+      block:
+        - name: Execute NX-OS show commands
+          cisco.nxos.nxos_command:
+            commands:
+              - show version
+              - show inventory
+              - show environment
+              - show processes cpu sort | head 10
+              - show processes memory sort | head 10
+          register: nxos_facts
+          retries: 3
+          delay: 5
+          until: nxos_facts is not failed
+      rescue:
+        - name: Report NX-OS collection error
+          ansible.builtin.debug:
+            msg: "Failed collecting hardware facts from {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
+        - ansible.builtin.fail:
+            msg: "Hardware inventory aborted for {{ inventory_hostname }}"
+      when: ansible_network_os == 'nxos'
+
+    - name: Set unified device data fact
+      ansible.builtin.set_fact:
+        device_data: "{{ ios_facts if (ios_facts is defined and ios_facts.stdout is defined) else nxos_facts }}"
+      when: (ios_facts is defined and ios_facts.stdout is defined) or
+            (nxos_facts is defined and nxos_facts.stdout is defined)
+
+    - name: Display inventory collection summary
+      ansible.builtin.debug:
+        msg:
+          - "=== {{ inventory_hostname }} ({{ ansible_network_os }}) ==="
+          - "Sections collected: version, inventory, environment, cpu-top10, memory-top10"
+      when: device_data is defined
+
+    - name: Write hardware inventory report
+      ansible.builtin.copy:
+        content: |
+          ================================================================
+          Hardware Inventory — {{ inventory_hostname }} | {{ ansible_network_os | upper }}
+          ================================================================
+
+          --- SHOW VERSION ---
+          {{ device_data.stdout[0] }}
+
+          --- SHOW INVENTORY ---
+          {{ device_data.stdout[1] }}
+
+          --- ENVIRONMENT ---
+          {{ device_data.stdout[2] }}
+
+          --- CPU TOP-10 PROCESSES ---
+          {{ device_data.stdout[3] }}
+
+          --- MEMORY TOP-10 PROCESSES ---
+          {{ device_data.stdout[4] }}
+        dest: "{{ report_dir }}/{{ inventory_hostname }}_hardware.txt"
+        mode: "0644"
+      delegate_to: localhost
+      when: device_data is defined
