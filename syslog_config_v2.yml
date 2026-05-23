@@ -1,139 +1,105 @@
-```yaml
 ---
-# ospf_config.yml
-# Configures OSPF routing protocol on Cisco IOS devices
-# Supports single/multi-area deployments with MD5 authentication and
-# post-convergence neighbor verification.
+# ip_sla_config.yml
+# Configures IP SLA probes (ICMP echo and UDP jitter) for end-to-end path monitoring.
+# Schedules probes, verifies operational status, and reports RTT/jitter baselines.
+#
+# Credentials sourced from Ansible Vault — see group_vars/all/vault.yml:
+#   vault_net_user, vault_net_password, vault_net_enable
 #
 # Inventory example:
-#   [core_routers]
-#   r1 ansible_host=10.0.0.1
-#   r2 ansible_host=10.0.0.2
+#   [wan_routers]
+#   rtr-wan-01  ansible_host=10.0.1.1
+#   rtr-wan-02  ansible_host=10.0.1.2
 #
-#   [core_routers:vars]
+#   [wan_routers:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_user={{ vault_net_username }}         # ansible-vault encrypted
-#   ansible_password={{ vault_net_password }}     # ansible-vault encrypted
-#   ansible_become=true
+#   ansible_user="{{ vault_net_user }}"
+#   ansible_password="{{ vault_net_password }}"
+#   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_become_pass={{ vault_enable_password }}
+#   ansible_become_password="{{ vault_net_enable }}"
 
-- name: Configure OSPF routing on Cisco IOS devices
-  hosts: core_routers
+- name: Deploy and verify IP SLA probes on IOS/IOS-XE WAN routers
+  hosts: wan_routers
   gather_facts: false
 
   vars:
-    ospf_process_id: 1
-    ospf_router_id: "{{ ansible_host }}"
-    ospf_reference_bandwidth_mbps: 10000
-    ospf_area_auth_enabled: true
-    ospf_auth_key: "{{ vault_ospf_md5_key }}"    # ansible-vault encrypted
-    ospf_networks:
-      - prefix: "10.0.0.0"
-        wildcard: "0.0.0.255"
-        area: 0
-      - prefix: "192.168.100.0"
-        wildcard: "0.0.0.255"
-        area: 1
-    ospf_active_interfaces:
-      - GigabitEthernet0/0
-      - GigabitEthernet0/1
+    sla_icmp_id: 10
+    sla_jitter_id: 20
+    sla_icmp_target: "8.8.8.8"
+    sla_jitter_target: "10.0.255.1"
+    sla_jitter_port: 5000
+    sla_frequency: 60
+    sla_threshold: 500
+    sla_owner: "ansible-noc"
 
   tasks:
-    - name: Capture pre-change OSPF state
-      cisco.ios.ios_command:
-        commands:
-          - show ip ospf
-          - show ip ospf neighbor
-          - show ip route ospf summary
-      register: ospf_prechange
-      failed_when: false
-
-    - name: Display pre-change OSPF state
-      ansible.builtin.debug:
-        var: ospf_prechange.stdout_lines
-
-    - name: Apply OSPF configuration
+    - name: Configure IP SLA probes
       block:
-        - name: Configure OSPF process, router-id, and reference bandwidth
+        - name: Apply ICMP echo and UDP jitter SLA probes
           cisco.ios.ios_config:
             lines:
-              - "router-id {{ ospf_router_id }}"
-              - "auto-cost reference-bandwidth {{ ospf_reference_bandwidth_mbps }}"
-              - "passive-interface default"
-              - "log-adjacency-changes detail"
-            parents: "router ospf {{ ospf_process_id }}"
-
-        - name: Activate OSPF on routed interfaces
-          cisco.ios.ios_config:
-            lines:
-              - "no passive-interface {{ item }}"
-            parents: "router ospf {{ ospf_process_id }}"
-          loop: "{{ ospf_active_interfaces }}"
-
-        - name: Advertise networks into OSPF
-          cisco.ios.ios_config:
-            lines:
-              - "network {{ item.prefix }} {{ item.wildcard }} area {{ item.area }}"
-            parents: "router ospf {{ ospf_process_id }}"
-          loop: "{{ ospf_networks }}"
-
-        - name: Enable MD5 authentication on backbone area
-          cisco.ios.ios_config:
-            lines:
-              - "area 0 authentication message-digest"
-            parents: "router ospf {{ ospf_process_id }}"
-          when: ospf_area_auth_enabled | bool
-
-        - name: Set MD5 key on active interfaces
-          cisco.ios.ios_config:
-            lines:
-              - "ip ospf message-digest-key 1 md5 {{ ospf_auth_key }}"
-              - "ip ospf network point-to-point"
-            parents: "interface {{ item }}"
-          loop: "{{ ospf_active_interfaces }}"
-          when: ospf_area_auth_enabled | bool
-          no_log: true
+              - "ip sla {{ sla_icmp_id }}"
+              - " icmp-echo {{ sla_icmp_target }}"
+              - " frequency {{ sla_frequency }}"
+              - " threshold {{ sla_threshold }}"
+              - " owner {{ sla_owner }}"
+              - "ip sla schedule {{ sla_icmp_id }} life forever start-time now"
+              - "ip sla {{ sla_jitter_id }}"
+              - " udp-jitter {{ sla_jitter_target }} {{ sla_jitter_port }}"
+              - " frequency {{ sla_frequency }}"
+              - " threshold {{ sla_threshold }}"
+              - " owner {{ sla_owner }}"
+              - "ip sla schedule {{ sla_jitter_id }} life forever start-time now"
+          register: sla_config_result
+          retries: 2
+          delay: 5
+          until: sla_config_result is not failed
 
       rescue:
-        - name: Report configuration failure
+        - name: Report SLA configuration failure
           ansible.builtin.debug:
-            msg: >
-              OSPF config failed on {{ inventory_hostname }}:
-              {{ ansible_failed_result.msg | default('check device logs') }}
+            msg: "IP SLA config failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
 
-        - name: Abort with failure
+        - name: Abort play for failed host
           ansible.builtin.fail:
-            msg: "OSPF configuration did not apply cleanly on {{ inventory_hostname }}"
+            msg: "IP SLA deployment failed on {{ inventory_hostname }}. Manual review required."
 
-    - name: Persist configuration
-      cisco.ios.ios_config:
-        save_when: modified
+    - name: Pause to allow initial probe cycles to complete
+      ansible.builtin.pause:
+        seconds: 10
 
-    - name: Wait for OSPF adjacencies to form
+    - name: Collect IP SLA operational statistics
       cisco.ios.ios_command:
         commands:
-          - show ip ospf neighbor
-      register: ospf_neighbors
-      retries: 4
-      delay: 15
-      until: "'FULL' in ospf_neighbors.stdout[0]"
-      failed_when: false
-
-    - name: Verify OSPF routes installed
-      cisco.ios.ios_command:
-        commands:
-          - show ip route ospf
-      register: ospf_routes
+          - "show ip sla statistics {{ sla_icmp_id }}"
+          - "show ip sla statistics {{ sla_jitter_id }}"
+          - "show ip sla summary"
+      register: sla_stats
       failed_when: >
-        ospf_routes.stdout[0] is defined and
-        ospf_routes.stdout[0] | length == 0 and
-        ospf_networks | length > 1
+        'Latest RTT' not in sla_stats.stdout[0] or
+        'No Such Entry' in sla_stats.stdout[0]
 
-    - name: Display post-change neighbor and route state
+    - name: Display ICMP echo probe results
       ansible.builtin.debug:
         msg:
-          - "Neighbors: {{ ospf_neighbors.stdout_lines }}"
-          - "OSPF routes: {{ ospf_routes.stdout_lines }}"
-```
+          - "Host: {{ inventory_hostname }}"
+          - "ICMP Echo SLA (ID {{ sla_icmp_id }}) -> Target: {{ sla_icmp_target }}"
+          - "{{ sla_stats.stdout[0] }}"
+
+    - name: Display UDP jitter probe results
+      ansible.builtin.debug:
+        msg:
+          - "UDP Jitter SLA (ID {{ sla_jitter_id }}) -> Target: {{ sla_jitter_target }}:{{ sla_jitter_port }}"
+          - "{{ sla_stats.stdout[1] }}"
+
+    - name: Save running configuration
+      cisco.ios.ios_command:
+        commands:
+          - write memory
+      register: save_result
+
+    - name: Confirm save status
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} config saved: {{ save_result.stdout[0] | trim }}
