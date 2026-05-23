@@ -1,112 +1,100 @@
-```yaml
 ---
-# acl_deploy_v3.yml — Deploy named ACLs and bind to interfaces on Cisco IOS
-# Credentials stored in Ansible Vault: group_vars/all/vault.yml
-#
-# Inventory example:
-#   [distribution_switches]
-#   dist-sw1 ansible_host=10.10.1.1
-#   dist-sw2 ansible_host=10.10.1.2
-#
-#   [distribution_switches:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user={{ vault_network_user }}
-#   ansible_password={{ vault_network_password }}
-#   ansible_become=yes
-#   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_password }}
-
-- name: Deploy named extended ACLs and apply to interfaces on Cisco IOS
-  hosts: distribution_switches
-  gather_facts: false
-
+- name: Configure VLANs on Network Devices
+  hosts: network_devices
+  gather_facts: no
+  
   vars:
-    acl_name: MGMT_ACCESS
-    acl_direction: in
-    acl_interface: GigabitEthernet0/1
-    mgmt_permitted_hosts:
-      - 10.100.0.10
-      - 10.100.0.11
-      - 10.100.0.20
-    mgmt_network: 10.100.0.0
-    mgmt_wildcard: 0.0.0.255
-
+    # VLAN configuration - customize per environment
+    vlans:
+      - vlan_id: 10
+        name: Management
+        state: present
+      - vlan_id: 20
+        name: Production
+        state: present
+      - vlan_id: 30
+        name: Guest
+        state: present
+    
+    ansible_network_os: ios
+    ansible_connection: network_cli
+    # Credentials stored in vault: ansible-vault encrypt_string 'password' --name ansible_password
+  
   tasks:
-    - name: Confirm connectivity before making changes
-      cisco.ios.ios_command:
-        commands: show clock
-      register: connectivity_check
+    - name: Display VLAN management task
+      debug:
+        msg: "Managing VLANs on {{ inventory_hostname }}"
+    
+    - name: Configure VLANs on Cisco IOS devices
+      ios_vlan:
+        vlan_id: "{{ item.vlan_id }}"
+        name: "{{ item.name }}"
+        state: "{{ item.state }}"
+      loop: "{{ vlans }}"
+      register: vlan_config_result
       retries: 3
-      delay: 5
-      until: not connectivity_check.failed
-
-    - name: Snapshot existing ACL and interface state
-      cisco.ios.ios_command:
+      delay: 2
+      until: vlan_config_result is not failed
+      when: "'ios' in ansible_network_os"
+    
+    - name: Configure VLANs on Nexus devices
+      nxos_vlan:
+        vlan_id: "{{ item.vlan_id }}"
+        name: "{{ item.name }}"
+        state: "{{ item.state }}"
+      loop: "{{ vlans }}"
+      register: nxos_vlan_result
+      retries: 3
+      delay: 2
+      until: nxos_vlan_result is not failed
+      when: "'nexus' in ansible_network_os"
+    
+    - name: Validate VLAN configuration with show command
+      ios_command:
         commands:
-          - "show ip access-lists {{ acl_name }}"
-          - "show ip interface {{ acl_interface }}"
-      register: pre_state
+          - "show vlan brief"
+      register: vlan_show_output
+      when: "'ios' in ansible_network_os"
+    
+    - name: Parse and display VLAN configuration results
+      debug:
+        msg: |
+          VLAN Configuration Summary for {{ inventory_hostname }}:
+          Total VLANs configured: {{ vlans | length }}
+          {% for vlan in vlans %}
+          - VLAN {{ vlan.vlan_id }}: {{ vlan.name }} ({{ vlan.state }})
+          {% endfor %}
+    
+    - name: Display command output
+      debug:
+        msg: "{{ vlan_show_output.stdout[0] }}"
+      when: vlan_show_output is defined and vlan_show_output.stdout is defined
+    
+    - name: Register configuration status
+      set_fact:
+        vlan_deployment_status: "Success"
+        vlan_deployment_time: "{{ ansible_date_time.iso8601 }}"
+  
+  rescue:
+    - name: Handle configuration error
+      debug:
+        msg: "Failed to configure VLANs on {{ inventory_hostname }}: {{ ansible_failed_result.msg }}"
+    
+    - name: Attempt rollback on failure
+      ios_vlan:
+        vlan_id: "{{ item.vlan_id }}"
+        state: absent
+      loop: "{{ vlans }}"
+      when: inventory_hostname in groups.get('ios_devices', [])
+      ignore_errors: yes
 
-    - name: Deploy and bind ACL
-      block:
-        - name: Build named extended ACL
-          cisco.ios.ios_config:
-            lines:
-              - "ip access-list extended {{ acl_name }}"
-              - " remark === Managed by Ansible — do not edit manually ==="
-              - " 10 permit tcp {{ mgmt_network }} {{ mgmt_wildcard }} any eq 22"
-              - " 20 permit tcp {{ mgmt_network }} {{ mgmt_wildcard }} any eq 443"
-              - " 30 permit icmp {{ mgmt_network }} {{ mgmt_wildcard }} any"
-              - " 100 deny ip any any log"
-            match: exact
-          register: acl_config_result
-
-        - name: Apply ACL to interface
-          cisco.ios.ios_config:
-            parents: "interface {{ acl_interface }}"
-            lines:
-              - "ip access-group {{ acl_name }} {{ acl_direction }}"
-          register: interface_bind_result
-
-      rescue:
-        - name: Report failure and remove partial ACL binding
-          cisco.ios.ios_config:
-            parents: "interface {{ acl_interface }}"
-            lines:
-              - "no ip access-group {{ acl_name }} {{ acl_direction }}"
-          ignore_errors: true
-
-        - name: Fail with rollback notice
-          ansible.builtin.fail:
-            msg: "ACL deployment failed on {{ inventory_hostname }} — interface binding removed. Review logs."
-
-    - name: Verify ACL was created with correct entry count
-      cisco.ios.ios_command:
-        commands:
-          - "show ip access-lists {{ acl_name }}"
-      register: acl_verify
-      failed_when: acl_name not in acl_verify.stdout[0]
-
-    - name: Verify ACL is bound to the target interface
-      cisco.ios.ios_command:
-        commands:
-          - "show ip interface {{ acl_interface }}"
-      register: interface_verify
-      failed_when: acl_name not in interface_verify.stdout[0]
-
-    - name: Save configuration
-      cisco.ios.ios_command:
-        commands:
-          - write memory
-      when: acl_config_result.changed or interface_bind_result.changed
-      register: save_result
-
-    - name: Display final ACL state
-      ansible.builtin.debug:
-        msg:
-          - "Host: {{ inventory_hostname }}"
-          - "ACL deployed: {{ acl_config_result.changed }}"
-          - "Interface bound: {{ interface_bind_result.changed }}"
-          - "ACL detail: {{ acl_verify.stdout[0] }}"
-```
+# Inventory example for testing:
+# [network_devices]
+# switch1 ansible_host=192.168.1.10 ansible_user=admin ansible_network_os=ios
+# switch2 ansible_host=192.168.1.11 ansible_user=admin ansible_network_os=nexus
+#
+# [ios_devices]
+# switch1
+#
+# [nxos_devices]
+# switch2
