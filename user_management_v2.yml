@@ -1,139 +1,121 @@
-```yaml
 ---
-- name: Configure SSH Key-Based Authentication and User Access Control
+# AAA (Authentication, Authorization, Accounting) Configuration
+# Configures RADIUS and TACACS+ server groups, AAA method lists, and
+# accounting policies on Cisco IOS/IOS-XE devices.
+#
+# Distinct from user_management.yml (local accounts) -- this playbook
+# manages the AAA framework: server groups, method lists, and accounting.
+#
+# Credentials: ansible-vault encrypted group_vars/network/vault.yml
+#   ansible_user: "{{ vault_network_user }}"
+#   ansible_password: "{{ vault_network_password }}"
+#   ansible_become_password: "{{ vault_enable_password }}"
+#
+# Inventory example:
+# [network_devices]
+# core-sw-01  ansible_host=10.0.0.1  ansible_network_os=ios
+# dist-rtr-01 ansible_host=10.0.0.2  ansible_network_os=ios
+#
+# [network_devices:vars]
+# ansible_connection=network_cli
+# ansible_become=yes
+# ansible_become_method=enable
+
+- name: Configure AAA with RADIUS/TACACS+ on network devices
   hosts: network_devices
-  gather_facts: no
+  gather_facts: false
+
   vars:
-    # Vault reference: ansible-vault encrypt_string --vault-password-file ~/.vault_pass
-    device_username: "{{ vault_device_username | default('admin') }}"
-    device_password: "{{ vault_device_password }}"
-    enable_password: "{{ vault_enable_password }}"
-    
-    # SSH key and user access configuration
-    authorized_ssh_keys:
-      - name: "netadmin_prod"
-        key: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDxx... netadmin@company.com"
-        privilege_level: 15
-      - name: "netops_readonly"
-        key: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDyy... netops@company.com"
-        privilege_level: 5
-    
-    session_logging:
-      enabled: true
-      buffer_size: 1000
-      archive_path: "flash:session_logs"
+    # Override via group_vars or extra-vars; secrets via ansible-vault
+    tacacs_servers:
+      - host: "{{ vault_tacacs_primary | default('10.0.1.10') }}"
+        key: "{{ vault_tacacs_key }}"
+        timeout: 5
+        priority: primary
+      - host: "{{ vault_tacacs_secondary | default('10.0.1.11') }}"
+        key: "{{ vault_tacacs_key }}"
+        timeout: 5
+        priority: secondary
+    radius_servers:
+      - host: "{{ vault_radius_primary | default('10.0.1.20') }}"
+        auth_port: 1812
+        acct_port: 1813
+        key: "{{ vault_radius_key }}"
+    aaa_local_fallback: true
 
   tasks:
-    - name: Configure SSH server parameters
-      ios_config:
-        lines:
-          - "ip ssh version 2"
-          - "ip ssh authentication retries 2"
-          - "ip ssh time-out 60"
-          - "ip ssh pubkey-chain"
-        after:
-          - "exit"
-      vars:
-        ansible_connection: network_cli
-        ansible_network_os: ios
-      register: ssh_config_result
-      retries: 3
-      delay: 5
-      until: ssh_config_result is succeeded
-      tags: ssh_config
+    - name: Gather device facts for pre-change baseline
+      cisco.ios.ios_facts:
+        gather_subset:
+          - config
+      register: pre_facts
+
+    - name: Apply AAA configuration
+      block:
+        - name: Configure TACACS+ server group
+          cisco.ios.ios_config:
+            lines:
+              - "server-private {{ item.host }} key {{ item.key }}"
+              - "timeout {{ item.timeout }}"
+            parents: "aaa group server tacacs+ TACACS-SERVERS"
+          loop: "{{ tacacs_servers }}"
+          loop_control:
+            label: "{{ item.priority }} TACACS+ {{ item.host }}"
+          register: tacacs_result
+          retries: 2
+          delay: 5
+          until: tacacs_result is not failed
+
+        - name: Configure RADIUS server group
+          cisco.ios.ios_config:
+            lines:
+              - "server-private {{ item.host }} auth-port {{ item.auth_port }} acct-port {{ item.acct_port }} key {{ item.key }}"
+            parents: "aaa group server radius RADIUS-SERVERS"
+          loop: "{{ radius_servers }}"
+          loop_control:
+            label: "RADIUS {{ item.host }}"
+          register: radius_result
+
+        - name: Enable AAA new-model and configure method lists
+          cisco.ios.ios_config:
+            lines:
+              - aaa new-model
+              - "aaa authentication login default group TACACS-SERVERS {{ 'local' if aaa_local_fallback else '' }}"
+              - "aaa authentication enable default group TACACS-SERVERS enable"
+              - "aaa authorization exec default group TACACS-SERVERS {{ 'local' if aaa_local_fallback else '' }}"
+              - "aaa authorization commands 15 default group TACACS-SERVERS {{ 'local' if aaa_local_fallback else '' }}"
+              - "aaa accounting exec default start-stop group TACACS-SERVERS"
+              - "aaa accounting commands 15 default start-stop group TACACS-SERVERS"
+              - "aaa accounting network default start-stop group RADIUS-SERVERS"
+
+        - name: Save running configuration
+          cisco.ios.ios_config:
+            save_when: modified
+
       rescue:
-        - name: Log SSH configuration error
-          debug:
-            msg: "SSH configuration failed on {{ inventory_hostname }}: {{ ssh_config_result.msg }}"
-          tags: ssh_config
+        - name: Log AAA configuration failure
+          ansible.builtin.debug:
+            msg: "AAA configuration failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
 
-    - name: Deploy authorized SSH public keys for users
-      ios_config:
-        lines:
-          - "username {{ item.name }}"
-          - "privilege level {{ item.privilege_level }}"
-          - "pubkey-chain"
-          - "key-string"
-          - "{{ item.key }}"
-          - "quit"
-          - "quit"
-          - "exit"
-        before:
-          - "no username {{ item.name }}"
-      loop: "{{ authorized_ssh_keys }}"
-      vars:
-        ansible_connection: network_cli
-        ansible_network_os: ios
-      register: pubkey_deploy_result
-      retries: 3
-      delay: 5
-      until: pubkey_deploy_result is succeeded
-      tags: pubkey_deploy
-      rescue:
-        - name: Handle key deployment failure
-          debug:
-            msg: "Public key deployment failed for user {{ item.name }}"
-          tags: pubkey_deploy
+        - name: Fail with actionable message
+          ansible.builtin.fail:
+            msg: >
+              AAA config failed on {{ inventory_hostname }}.
+              Verify TACACS/RADIUS server reachability and vault keys.
+              Device retains previous AAA state -- no lockout risk.
 
-    - name: Configure session logging for user activity audit
-      ios_config:
-        lines:
-          - "logging buffered {{ session_logging.buffer_size }}"
-          - "logging userinfo"
-          - "logging console informational"
-          - "logging monitor informational"
-        match: line
-      vars:
-        ansible_connection: network_cli
-        ansible_network_os: ios
-      register: logging_config_result
-      retries: 2
-      delay: 5
-      until: logging_config_result is succeeded
-      when: session_logging.enabled
-      tags: logging
-
-    - name: Verify SSH key installation
-      ios_command:
+    - name: Verify AAA server reachability via show output
+      cisco.ios.ios_command:
         commands:
-          - "show ip ssh"
-          - "show username"
-      vars:
-        ansible_connection: network_cli
-        ansible_network_os: ios
-      register: ssh_verify_result
-      failed_when: "'SSH Enabled' not in ssh_verify_result.stdout[0]"
-      tags: verify
-      rescue:
-        - name: Log SSH verification failure
-          debug:
-            msg: "SSH verification failed on {{ inventory_hostname }}"
+          - show aaa servers
+          - show running-config | section ^aaa
+      register: aaa_verify
+      failed_when: "'% Invalid' in aaa_verify.stdout[0]"
 
-    - name: Display user access configuration summary
-      debug:
-        msg: |
-          User Access Configuration Summary - {{ inventory_hostname }}
-          ============================================================
-          SSH Version 2: Enabled
-          Configured Users: {{ authorized_ssh_keys | length }}
-          {% for user in authorized_ssh_keys %}
-          - {{ user.name }}: Privilege Level {{ user.privilege_level }}
-          {% endfor %}
-          Session Logging: {{ 'Enabled' if session_logging.enabled else 'Disabled' }}
-          Buffer Size: {{ session_logging.buffer_size }} bytes
-          SSH Status: {{ 'Operational' if ssh_verify_result is succeeded else 'FAILED' }}
-      tags: summary
-
-  # Inventory Example:
-  # [network_devices]
-  # router1.lab ansible_host=192.168.1.10 ansible_user=admin
-  # router2.lab ansible_host=192.168.1.11 ansible_user=admin
-  # switch1.lab ansible_host=192.168.1.20 ansible_user=admin
-  #
-  # [network_devices:vars]
-  # ansible_network_os=ios
-  # ansible_connection=network_cli
-  # ansible_become=yes
-  # ansible_become_method=enable
-  # ansible_python_interpreter=/usr/bin/python3
-```
+    - name: Display AAA verification output
+      ansible.builtin.debug:
+        msg:
+          - "=== AAA Servers on {{ inventory_hostname }} ==="
+          - "{{ aaa_verify.stdout[0] }}"
+          - "=== AAA Config Section ==="
+          - "{{ aaa_verify.stdout[1] }}
