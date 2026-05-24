@@ -1,127 +1,144 @@
+```yaml
 ---
-- name: Deploy and manage VLANs across network infrastructure
-  hosts: network_devices
+# Ansible Playbook: VLAN Configuration Management
+# Purpose: Deploy and manage VLAN configurations across network devices
+# Supported Platforms: Cisco IOS, IOS-XR, Nexus (NX-OS), Juniper
+# Author: Network Engineering Team
+#
+# Inventory Example:
+# [ios_devices]
+# router1 ansible_host=192.168.1.1 ansible_network_os=ios
+# switch1 ansible_host=192.168.1.2 ansible_network_os=ios
+#
+# [iosxr_devices]
+# router2 ansible_host=192.168.2.1 ansible_network_os=iosxr
+#
+# [nxos_devices]
+# switch2 ansible_host=192.168.3.1 ansible_network_os=nxos
+#
+# Vault Usage: ansible-vault encrypt group_vars/all/credentials.yml
+
+- name: VLAN Configuration and Management
+  hosts: "{{ target_devices | default('all') }}"
   gather_facts: no
-  connection: network_cli
   vars:
-    # Credentials - reference vault for sensitive data
-    # ansible-vault encrypt_string 'your_password' --name 'ansible_password'
+    ansible_connection: network_cli
     ansible_user: "{{ vault_username }}"
     ansible_password: "{{ vault_password }}"
-    # VLAN configurations to deploy
-    vlans_to_deploy:
-      - vlan_id: 10
-        name: Management
-        description: "Device and infrastructure management"
-      - vlan_id: 20
-        name: Data
-        description: "User and application data traffic"
-      - vlan_id: 30
-        name: Voice
-        description: "VoIP and telephony traffic"
-      - vlan_id: 99
-        name: Native
-        description: "Native VLAN for untagged traffic"
 
   tasks:
-    - name: Gather device facts and current configuration
-      ios_facts:
-      register: device_info
-      retries: 3
-      delay: 10
-      until: device_info is not failed
-
-    - name: Display target device information
+    - name: Display playbook execution details
       debug:
-        msg: |
-          Hostname: {{ inventory_hostname }}
-          OS Version: {{ device_info.ansible_facts.ansible_net_version }}
-          Model: {{ device_info.ansible_facts.ansible_net_model }}
-          Serial: {{ device_info.ansible_facts.ansible_net_serialnum }}
+        msg: "Managing VLANs on {{ inventory_hostname }} ({{ ansible_network_os }})"
 
-    - name: Retrieve current VLAN configuration
+    - name: Configure VLANs on Cisco IOS devices
+      when: ansible_network_os == 'ios'
+      block:
+        - name: Create or modify VLANs
+          ios_vlan:
+            vlan_id: "{{ item.vlan_id }}"
+            name: "{{ item.name }}"
+            state: "{{ item.state | default('present') }}"
+          register: ios_vlan_result
+          loop: "{{ vlans }}"
+          retries: 3
+          delay: 5
+          failed_when:
+            - ios_vlan_result.failed
+            - "'failed' not in ios_vlan_result.msg | lower"
+
+        - name: Display IOS VLAN configuration results
+          debug:
+            msg: "VLAN {{ item.item.vlan_id }} - {{ item.item.name }}: {{ 'Created' if item.changed else 'Unchanged' }}"
+          loop: "{{ ios_vlan_result.results }}"
+          when: ios_vlan_result.results is defined
+
+      rescue:
+        - name: Handle IOS configuration failure
+          debug:
+            msg: "Failed to configure VLANs on {{ inventory_hostname }}: {{ ansible_failed_result.msg }}"
+
+    - name: Configure VLANs on Cisco IOS-XR devices
+      when: ansible_network_os == 'iosxr'
+      block:
+        - name: Configure VLAN via CLI
+          iosxr_config:
+            lines:
+              - "vlan {{ item.vlan_id }}"
+              - "name {{ item.name }}"
+            match: line
+            replace: block
+          register: iosxr_vlan_result
+          loop: "{{ vlans }}"
+          retries: 3
+          delay: 5
+
+        - name: Commit configuration
+          iosxr_config:
+            commit: true
+          when: iosxr_vlan_result.changed
+
+        - name: Display IOS-XR configuration status
+          debug:
+            msg: "VLANs configured on {{ inventory_hostname }}"
+
+      rescue:
+        - name: Handle IOS-XR configuration failure
+          debug:
+            msg: "Failed to configure VLANs on {{ inventory_hostname }}: {{ ansible_failed_result.msg }}"
+
+    - name: Configure VLANs on Cisco NX-OS devices
+      when: ansible_network_os == 'nxos'
+      block:
+        - name: Create or modify VLANs
+          nxos_vlan:
+            vlan_id: "{{ item.vlan_id }}"
+            name: "{{ item.name }}"
+            state: "{{ item.state | default('present') }}"
+          register: nxos_vlan_result
+          loop: "{{ vlans }}"
+          retries: 3
+          delay: 5
+
+        - name: Display NX-OS VLAN results
+          debug:
+            msg: "VLAN {{ item.item.vlan_id }} - {{ item.item.name }}: {{ 'Created' if item.changed else 'Unchanged' }}"
+          loop: "{{ nxos_vlan_result.results }}"
+          when: nxos_vlan_result.results is defined
+
+      rescue:
+        - name: Handle NX-OS configuration failure
+          debug:
+            msg: "Failed to configure VLANs on {{ inventory_hostname }}: {{ ansible_failed_result.msg }}"
+
+    - name: Verify VLAN configuration
       ios_command:
         commands:
           - "show vlan brief"
-      register: current_vlans
+      register: vlan_verification
+      when: ansible_network_os == 'ios'
       retries: 2
-      delay: 5
+      delay: 3
 
-    - name: Deploy VLAN configurations
-      ios_config:
-        lines:
-          - "name {{ item.name }}"
-          - "description {{ item.description }}"
-        parents: "vlan {{ item.vlan_id }}"
-        before: "vlan {{ item.vlan_id }}"
-      loop: "{{ vlans_to_deploy }}"
-      register: vlan_deploy
-      retries: 2
-      delay: 5
-      until: vlan_deploy is not failed
-      ignore_errors: yes
-
-    - name: Verify VLAN deployment
-      ios_command:
-        commands:
-          - "show vlan id {{ item.vlan_id }}"
-      loop: "{{ vlans_to_deploy }}"
-      register: vlan_verify
-      retries: 2
-      delay: 5
-      until: vlan_verify is not failed
-      failed_when: "'not exist' in vlan_verify.stdout[0]"
-
-    - name: Display deployed VLANs
+    - name: Display VLAN verification results
       debug:
-        msg: "{{ item.stdout }}"
-      loop: "{{ vlan_verify.results }}"
+        var: vlan_verification.stdout_lines[0]
+      when:
+        - vlan_verification.stdout_lines is defined
+        - vlan_verification.stdout_lines | length > 0
 
-    - name: Save running configuration to startup
-      ios_config:
-        save_when: modified
-      register: config_save
-
-    - name: Report configuration save status
-      debug:
-        msg: |
-          Configuration modified: {{ config_save.changed }}
-          Commands executed: {{ config_save.updates | length }}
-
-  rescue:
-    - name: Handle configuration errors
-      debug:
-        msg: |
-          Error deploying VLANs on {{ inventory_hostname }}
-          Failed task: {{ ansible_failed_task.name }}
-          Error details: {{ ansible_failed_result.msg }}
-
-    - name: Backup configuration on failure
-      ios_command:
-        commands:
-          - "show running-config"
-      register: running_config
-      when: ansible_failed_result is defined
-
-    - name: Save failed state for troubleshooting
-      copy:
-        content: "{{ running_config.stdout[0] }}"
-        dest: "/tmp/{{ inventory_hostname }}_config_backup.txt"
-      delegate_to: localhost
-      when: running_config is defined
-
-# Inventory example for hosts.yml:
-# [network_devices]
-# core-switch-1 ansible_host=192.168.1.1 device_type=ios
-# core-switch-2 ansible_host=192.168.1.2 device_type=ios
-# access-switch-1 ansible_host=192.168.1.3 device_type=ios
-# router-1 ansible_host=192.168.1.4 device_type=iosxr
-#
-# [network_devices:vars]
-# ansible_connection=network_cli
-# vault_username=admin
-# vault_password=!vault |encrypted...
-#
-# Usage:
-# ansible-playbook vlan_deploy.yml -i hosts.yml --ask-vault-pass
-# ansible-playbook vlan_deploy.yml -i hosts.yml -k (for ssh password prompt)
+  vars:
+    vlans:
+      - vlan_id: 10
+        name: "Management"
+        state: present
+      - vlan_id: 20
+        name: "Data"
+        state: present
+      - vlan_id: 30
+        name: "Voice"
+        state: present
+      - vlan_id: 40
+        name: "Video"
+        state: present
+```
