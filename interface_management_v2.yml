@@ -1,111 +1,112 @@
-The playbook needs to cover something not already in the existing set. OSPF routing configuration is the right pick — it's a core network engineering skill distinct from all 20 existing playbooks.
+Writing a BGP neighbor configuration playbook — not covered by any of the existing 20 playbooks.
 
 ---
-# ospf_config.yml
-# Deploys OSPF routing on Cisco IOS devices: process config, network statements,
-# passive interfaces, and MD5 area authentication. Verifies neighbor adjacency post-deploy.
+# BGP Neighbor Configuration and Session Verification
+# Configures eBGP/iBGP peers on Cisco IOS routers and validates session establishment
 #
 # Inventory example:
-#   [core_routers]
-#   rtr-01 ansible_host=10.0.1.1
-#   rtr-02 ansible_host=10.0.1.2
+#   [bgp_routers]
+#   core-rtr-01 ansible_host=10.0.1.1
+#   core-rtr-02 ansible_host=10.0.1.2
 #
-#   [core_routers:vars]
+#   [bgp_routers:vars]
 #   ansible_network_os=ios
-#   ansible_user={{ vault_net_username }}
-#   ansible_password={{ vault_net_password }}
+#   ansible_connection=network_cli
+#   ansible_user="{{ vault_network_user }}"          # stored in ansible-vault
+#   ansible_password="{{ vault_network_password }}"
 #   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_become_pass={{ vault_enable_secret }}
+#   ansible_become_password="{{ vault_enable_password }}"
+#   local_asn=65001
+#   bgp_peer_ip=10.0.1.2
+#   bgp_peer_asn=65002
 
-- name: Configure OSPF routing on Cisco IOS devices
-  hosts: core_routers
+- name: Configure BGP neighbors and verify peering on Cisco IOS
+  hosts: bgp_routers
   gather_facts: false
-  connection: network_cli
 
   vars:
-    ospf_process_id: 1
-    ospf_router_id: "{{ ansible_host }}"
-    ospf_reference_bw: 10000
-    ospf_auth_key: "{{ vault_ospf_md5_key }}"  # ansible-vault encrypted
-    ospf_networks:
-      - { prefix: "10.0.0.0", wildcard: "0.0.255.255", area: "0" }
-      - { prefix: "192.168.100.0", wildcard: "0.0.0.255", area: "1" }
-    ospf_passive_interfaces:
-      - Loopback0
-      - GigabitEthernet0/2
-    ospf_area0_interfaces:
-      - GigabitEthernet0/0
-      - GigabitEthernet0/1
+    bgp_keepalive: 30
+    bgp_holdtime: 90
+    bgp_update_source: Loopback0
+    bgp_session_timeout: 150
 
   tasks:
-    - name: Deploy OSPF process configuration
-      block:
-        - name: Configure OSPF process, router-id, and area authentication
-          cisco.ios.ios_config:
-            parents: "router ospf {{ ospf_process_id }}"
-            lines:
-              - "router-id {{ ospf_router_id }}"
-              - "auto-cost reference-bandwidth {{ ospf_reference_bw }}"
-              - "area 0 authentication message-digest"
-          register: ospf_base_result
-          retries: 2
-          delay: 5
-          until: ospf_base_result is not failed
 
-        - name: Add OSPF network statements
-          cisco.ios.ios_config:
-            parents: "router ospf {{ ospf_process_id }}"
-            lines: "network {{ item.prefix }} {{ item.wildcard }} area {{ item.area }}"
-          loop: "{{ ospf_networks }}"
-
-        - name: Set passive interfaces
-          cisco.ios.ios_config:
-            parents: "router ospf {{ ospf_process_id }}"
-            lines: "passive-interface {{ item }}"
-          loop: "{{ ospf_passive_interfaces }}"
-
-        - name: Apply MD5 authentication key on area 0 interfaces
-          cisco.ios.ios_config:
-            parents: "interface {{ item }}"
-            lines:
-              - "ip ospf message-digest-key 1 md5 {{ ospf_auth_key }}"
-              - "ip ospf hello-interval 10"
-              - "ip ospf dead-interval 40"
-          loop: "{{ ospf_area0_interfaces }}"
-
-      rescue:
-        - name: Log configuration failure detail
-          ansible.builtin.debug:
-            msg: "OSPF config failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('see task output above') }}"
-
-        - name: Abort with actionable message
-          ansible.builtin.fail:
-            msg: "OSPF deployment aborted on {{ inventory_hostname }} — manual review required before retry"
-
-    - name: Verify OSPF neighbor adjacency (retries up to 60s for convergence)
+    - name: Capture pre-change BGP summary
       cisco.ios.ios_command:
         commands:
-          - show ip ospf neighbor
-          - show ip ospf
-          - show ip route ospf
-      register: ospf_verify
-      retries: 6
-      delay: 10
-      until: ospf_verify is not failed
+          - show ip bgp summary
+      register: bgp_pre_state
+      failed_when: false
 
-    - name: Assert at least one neighbor in FULL state
+    - name: Configure BGP neighbor
+      block:
+
+        - name: Apply BGP global neighbor statements
+          cisco.ios.ios_config:
+            lines:
+              - "neighbor {{ bgp_peer_ip }} remote-as {{ bgp_peer_asn }}"
+              - "neighbor {{ bgp_peer_ip }} description PEER-AS{{ bgp_peer_asn }}"
+              - "neighbor {{ bgp_peer_ip }} update-source {{ bgp_update_source }}"
+              - "neighbor {{ bgp_peer_ip }} timers {{ bgp_keepalive }} {{ bgp_holdtime }}"
+            parents: "router bgp {{ local_asn }}"
+          register: bgp_neighbor_cfg
+          notify: Write configuration to NVRAM
+
+        - name: Activate neighbor in IPv4 unicast address-family
+          cisco.ios.ios_config:
+            lines:
+              - "neighbor {{ bgp_peer_ip }} activate"
+              - "neighbor {{ bgp_peer_ip }} soft-reconfiguration inbound"
+            parents:
+              - "router bgp {{ local_asn }}"
+              - "address-family ipv4 unicast"
+          register: bgp_af_cfg
+
+      rescue:
+
+        - name: Log configuration failure details
+          ansible.builtin.debug:
+            msg: "BGP config failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown') }}"
+
+        - name: Abort with descriptive message
+          ansible.builtin.fail:
+            msg: "BGP neighbor configuration failed on {{ inventory_hostname }}. Verify BGP process exists and credentials are correct."
+
+    - name: Poll until BGP session reaches Established state
+      cisco.ios.ios_command:
+        commands:
+          - "show ip bgp neighbors {{ bgp_peer_ip }} | include BGP state"
+      register: bgp_state_poll
+      until: "'Established' in bgp_state_poll.stdout[0]"
+      retries: "{{ (bgp_session_timeout / 15) | int }}"
+      delay: 15
+
+    - name: Gather full BGP neighbor detail
+      cisco.ios.ios_command:
+        commands:
+          - "show ip bgp neighbors {{ bgp_peer_ip }}"
+          - "show ip bgp summary"
+      register: bgp_detail
+
+    - name: Assert BGP session is Established
       ansible.builtin.assert:
         that:
-          - "'FULL' in ospf_verify.stdout[0]"
-        fail_msg: "No OSPF neighbors reached FULL state on {{ inventory_hostname }} — check area config and MD5 keys"
-        success_msg: "OSPF adjacency confirmed on {{ inventory_hostname }}"
-      when: ospf_verify.stdout[0] | length > 40
+          - "'Established' in bgp_state_poll.stdout[0]"
+        fail_msg: "BGP peer {{ bgp_peer_ip }} did not reach Established state on {{ inventory_hostname }}"
+        success_msg: "BGP session with {{ bgp_peer_ip }} (AS {{ bgp_peer_asn }}) is Established"
 
-    - name: Display OSPF neighbor table and learned routes
+    - name: Display BGP session result
       ansible.builtin.debug:
         msg:
-          - "=== {{ inventory_hostname }} OSPF Neighbors ==="
-          - "{{ ospf_verify.stdout[0] }}"
-          - "=== OSPF Learned Routes ==="
-          - "{{ ospf_verify.stdout[2] }}
+          - "Device  : {{ inventory_hostname }}"
+          - "Local AS: {{ local_asn }}"
+          - "Peer    : {{ bgp_peer_ip }} (AS {{ bgp_peer_asn }})"
+          - "State   : {{ bgp_state_poll.stdout[0] | trim }}"
+
+  handlers:
+    - name: Write configuration to NVRAM
+      cisco.ios.ios_command:
+        commands:
+          - write memory
