@@ -1,112 +1,122 @@
 ---
-# Playbook: VLAN Configuration Management
-# Description: Deploy and manage VLAN configurations across network infrastructure
-# Supported devices: Cisco IOS/IOS-XE
+# vlan_management.yml
 #
-# Inventory Example:
-# [network_devices]
-# switch1.example.com ansible_host=10.1.1.1 device_type=ios
-# switch2.example.com ansible_host=10.1.1.2 device_type=ios
+# Provisions and verifies VLAN configuration across Cisco IOS/IOS-XE switching
+# infrastructure. Credentials stored in Ansible Vault — see vars/vault.yml.
 #
-# Vault reference: ansible-vault encrypt group_vars/network_devices.yml
-# Contains: ansible_user, ansible_password, ansible_network_os
+# Inventory example:
+#   [access_switches]
+#   sw-access-01  ansible_host=10.0.1.11
+#   sw-access-02  ansible_host=10.0.1.12
+#
+#   [distribution_switches]
+#   sw-dist-01    ansible_host=10.0.1.1
+#
+#   [switches:children]
+#   access_switches
+#   distribution_switches
+#
+#   [switches:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user="{{ vault_net_user }}"
+#   ansible_password="{{ vault_net_password }}"
+#   ansible_become=true
+#   ansible_become_method=enable
+#   ansible_become_password="{{ vault_enable_password }}"
 
-- name: Configure and Manage VLANs Across Network Infrastructure
-  hosts: network_devices
-  gather_facts: no
+- name: VLAN Provisioning - Create and verify VLANs across switching infrastructure
+  hosts: "{{ target_hosts | default('switches') }}"
+  gather_facts: false
 
   vars:
-    ansible_connection: network_cli
-    ansible_network_os: ios
-    # Credentials reference - stored in vault for production
-    # ansible_user: "{{ vault_network_user }}"
-    # ansible_password: "{{ vault_network_password }}"
-
-    vlan_configurations:
+    vlans_to_provision:
       - vlan_id: 10
-        name: Management
+        name: MANAGEMENT
       - vlan_id: 20
-        name: DataVLAN
+        name: SERVERS_PROD
       - vlan_id: 30
-        name: VoiceVLAN
+        name: SERVERS_DEV
+      - vlan_id: 40
+        name: USERS_CORP
+      - vlan_id: 99
+        name: NATIVE_UNUSED
 
   tasks:
-    - name: Gather current VLAN information from network device
-      ios_facts:
-        gather_network_resources: vlans
-      register: current_vlans
-      retries: 3
-      delay: 5
-      until: current_vlans is not failed
-      tags: [gather, vlans]
-
-    - name: Display current VLAN status before deployment
-      debug:
-        msg: |
-          Current VLANs on {{ inventory_hostname }}:
-          {{ current_vlans.ansible_facts.ansible_network_resources.vlans | default([]) | to_nice_yaml }}
-      tags: [display]
-
-    - name: Deploy VLAN configurations to network device
-      ios_vlans:
-        config: "{{ vlan_configurations }}"
-        state: merged
-      register: vlan_deployment
+    - name: Capture pre-change VLAN table
+      cisco.ios.ios_command:
+        commands:
+          - show vlan brief
+      register: pre_change_vlans
       retries: 2
-      delay: 10
-      until: vlan_deployment is not failed
-      tags: [deploy, vlans]
+      delay: 5
+
+    - name: Display current VLAN state
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} existing VLANs:\n{{ pre_change_vlans.stdout[0] }}"
+
+    - block:
+        - name: Configure each VLAN
+          cisco.ios.ios_vlans:
+            config:
+              - vlan_id: "{{ item.vlan_id }}"
+                name: "{{ item.name }}"
+                state: active
+            state: merged
+          loop: "{{ vlans_to_provision }}"
+          loop_control:
+            label: "VLAN {{ item.vlan_id }} ({{ item.name }})"
+          register: vlan_config_result
+
+        - name: Verify VLAN is active in database
+          cisco.ios.ios_command:
+            commands:
+              - "show vlan id {{ item.vlan_id }}"
+          register: vlan_verify
+          failed_when: "'active' not in vlan_verify.stdout[0]"
+          loop: "{{ vlans_to_provision }}"
+          loop_control:
+            label: "Verify VLAN {{ item.vlan_id }}"
+
+        - name: Write running configuration to startup
+          cisco.ios.ios_command:
+            commands:
+              - write memory
+          register: save_result
+          failed_when: >
+            '[OK]' not in save_result.stdout[0] and
+            'Building configuration' not in save_result.stdout[0]
 
       rescue:
-        - name: Handle VLAN deployment failure
-          debug:
-            msg: |
-              VLAN deployment failed on {{ inventory_hostname }}:
-              Error: {{ vlan_deployment.msg | default('Unknown error') }}
-          failed_when: true
+        - name: Gather diagnostic information after failure
+          cisco.ios.ios_command:
+            commands:
+              - show vlan brief
+              - show running-config | section ^vlan
+          register: failure_diag
+          ignore_errors: true
 
-    - name: Verify VLAN configuration post-deployment
-      ios_facts:
-        gather_network_resources: vlans
-      register: post_deployment_vlans
-      retries: 2
-      delay: 5
-      until: post_deployment_vlans is not failed
-      tags: [verify, vlans]
+        - name: Display failure diagnostics
+          ansible.builtin.debug:
+            msg:
+              - "VLAN provisioning failed on {{ inventory_hostname }}"
+              - "Failed task: {{ ansible_failed_task.name }}"
+              - "Error: {{ ansible_failed_result.msg | default('see task output') }}"
+              - "VLAN state at failure: {{ failure_diag.stdout | default(['unavailable']) }}"
 
-    - name: Validate VLAN deployment results
-      assert:
-        that:
-          - post_deployment_vlans.ansible_facts.ansible_network_resources.vlans is defined
-          - post_deployment_vlans.ansible_facts.ansible_network_resources.vlans | length >= vlan_configurations | length
-        fail_msg: "VLAN deployment validation failed - required VLANs not found"
-        success_msg: "VLAN validation successful - all VLANs deployed correctly"
-      tags: [validate]
+        - name: Abort with actionable message
+          ansible.builtin.fail:
+            msg: "VLAN provisioning failed on {{ inventory_hostname }} — manual review required"
 
-    - name: Display final deployment summary
-      debug:
-        msg: |
-          ===========================================
-          VLAN Deployment Summary for {{ inventory_hostname }}
-          ===========================================
-          Target VLANs: {{ vlan_configurations | length }}
-          Current VLANs: {{ post_deployment_vlans.ansible_facts.ansible_network_resources.vlans | length }}
-          Deployment Status: {{ 'CHANGED' if vlan_deployment is changed else 'UNCHANGED' }}
-          Timestamp: {{ ansible_date_time.iso8601 | default('N/A') }}
-      tags: [summary]
-
-    - name: Save running configuration to startup
-      ios_command:
+    - name: Capture post-change VLAN table
+      cisco.ios.ios_command:
         commands:
-          - command: "write memory"
-            prompt: "\[OK\]|[OK]"
-      register: save_result
-      failed_when: false
-      tags: [save]
+          - show vlan brief
+      register: post_change_vlans
 
-    - name: Display configuration save status
-      debug:
-        msg: |
-          Configuration save result:
-          {{ save_result.stdout_lines | default(['Save operation completed']) }}
-      tags: [save]
+    - name: Report provisioning summary
+      ansible.builtin.debug:
+        msg:
+          - "Provisioning complete on {{ inventory_hostname }}"
+          - "VLANs deployed: {{ vlans_to_provision | map(attribute='vlan_id') | list }}"
+          - "Post-change VLAN table:\n{{ post_change_vlans.stdout[0] }}
