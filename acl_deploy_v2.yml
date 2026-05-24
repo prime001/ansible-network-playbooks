@@ -1,100 +1,115 @@
 ---
-- name: Configure VLANs on Network Devices
-  hosts: network_devices
-  gather_facts: no
-  
-  vars:
-    # VLAN configuration - customize per environment
-    vlans:
-      - vlan_id: 10
-        name: Management
-        state: present
-      - vlan_id: 20
-        name: Production
-        state: present
-      - vlan_id: 30
-        name: Guest
-        state: present
-    
-    ansible_network_os: ios
-    ansible_connection: network_cli
-    # Credentials stored in vault: ansible-vault encrypt_string 'password' --name ansible_password
-  
-  tasks:
-    - name: Display VLAN management task
-      debug:
-        msg: "Managing VLANs on {{ inventory_hostname }}"
-    
-    - name: Configure VLANs on Cisco IOS devices
-      ios_vlan:
-        vlan_id: "{{ item.vlan_id }}"
-        name: "{{ item.name }}"
-        state: "{{ item.state }}"
-      loop: "{{ vlans }}"
-      register: vlan_config_result
-      retries: 3
-      delay: 2
-      until: vlan_config_result is not failed
-      when: "'ios' in ansible_network_os"
-    
-    - name: Configure VLANs on Nexus devices
-      nxos_vlan:
-        vlan_id: "{{ item.vlan_id }}"
-        name: "{{ item.name }}"
-        state: "{{ item.state }}"
-      loop: "{{ vlans }}"
-      register: nxos_vlan_result
-      retries: 3
-      delay: 2
-      until: nxos_vlan_result is not failed
-      when: "'nexus' in ansible_network_os"
-    
-    - name: Validate VLAN configuration with show command
-      ios_command:
-        commands:
-          - "show vlan brief"
-      register: vlan_show_output
-      when: "'ios' in ansible_network_os"
-    
-    - name: Parse and display VLAN configuration results
-      debug:
-        msg: |
-          VLAN Configuration Summary for {{ inventory_hostname }}:
-          Total VLANs configured: {{ vlans | length }}
-          {% for vlan in vlans %}
-          - VLAN {{ vlan.vlan_id }}: {{ vlan.name }} ({{ vlan.state }})
-          {% endfor %}
-    
-    - name: Display command output
-      debug:
-        msg: "{{ vlan_show_output.stdout[0] }}"
-      when: vlan_show_output is defined and vlan_show_output.stdout is defined
-    
-    - name: Register configuration status
-      set_fact:
-        vlan_deployment_status: "Success"
-        vlan_deployment_time: "{{ ansible_date_time.iso8601 }}"
-  
-  rescue:
-    - name: Handle configuration error
-      debug:
-        msg: "Failed to configure VLANs on {{ inventory_hostname }}: {{ ansible_failed_result.msg }}"
-    
-    - name: Attempt rollback on failure
-      ios_vlan:
-        vlan_id: "{{ item.vlan_id }}"
-        state: absent
-      loop: "{{ vlans }}"
-      when: inventory_hostname in groups.get('ios_devices', [])
-      ignore_errors: yes
+# bgp_routing_config.yml
+# Playbook: Configure BGP routing protocol on Cisco IOS devices
+# Purpose: Establish eBGP/iBGP neighbor sessions, advertise prefixes, set BGP attributes
+#
+# Inventory example:
+#   [bgp_routers]
+#   core-rtr-01 ansible_host=10.0.1.1
+#   core-rtr-02 ansible_host=10.0.1.2
+#
+#   [bgp_routers:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_network_user }}
+#   ansible_password={{ vault_network_password }}
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_enable_password }}
 
-# Inventory example for testing:
-# [network_devices]
-# switch1 ansible_host=192.168.1.10 ansible_user=admin ansible_network_os=ios
-# switch2 ansible_host=192.168.1.11 ansible_user=admin ansible_network_os=nexus
-#
-# [ios_devices]
-# switch1
-#
-# [nxos_devices]
-# switch2
+- name: Configure BGP routing on Cisco IOS routers
+  hosts: bgp_routers
+  gather_facts: false
+
+  vars:
+    # Sensitive values stored in Ansible Vault (ansible-vault encrypt group_vars/bgp_routers/vault.yml)
+    bgp_local_as: "{{ vault_bgp_local_as | default('65001') }}"
+    bgp_router_id: "{{ vault_bgp_router_id | default(ansible_host) }}"
+    bgp_neighbors:
+      - peer_ip: "10.255.0.2"
+        remote_as: "65002"
+        description: "PEER-DC-EAST"
+        update_source: "Loopback0"
+      - peer_ip: "10.255.0.6"
+        remote_as: "65003"
+        description: "PEER-DC-WEST"
+        update_source: "Loopback0"
+    bgp_networks:
+      - prefix: "192.168.100.0"
+        mask: "255.255.255.0"
+      - prefix: "192.168.200.0"
+        mask: "255.255.255.0"
+
+  tasks:
+    - name: Verify device is reachable and IOS version is readable
+      cisco.ios.ios_command:
+        commands:
+          - show version | include IOS
+      register: ios_version_check
+      retries: 3
+      delay: 5
+      until: ios_version_check is not failed
+
+    - name: Display device software version
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ ios_version_check.stdout[0] | trim }}"
+
+    - block:
+        - name: Configure BGP process, router-id, and global attributes
+          cisco.ios.ios_config:
+            lines:
+              - "router bgp {{ bgp_local_as }}"
+              - " bgp router-id {{ bgp_router_id }}"
+              - " bgp log-neighbor-changes"
+              - " no auto-summary"
+
+        - name: Configure BGP neighbor relationships
+          cisco.ios.ios_config:
+            parents: "router bgp {{ bgp_local_as }}"
+            lines:
+              - "neighbor {{ item.peer_ip }} remote-as {{ item.remote_as }}"
+              - "neighbor {{ item.peer_ip }} description {{ item.description }}"
+              - "neighbor {{ item.peer_ip }} update-source {{ item.update_source }}"
+              - "neighbor {{ item.peer_ip }} send-community both"
+          loop: "{{ bgp_neighbors }}"
+          loop_control:
+            label: "{{ item.peer_ip }} AS{{ item.remote_as }}"
+
+        - name: Advertise local networks into BGP
+          cisco.ios.ios_config:
+            parents: "router bgp {{ bgp_local_as }}"
+            lines:
+              - "network {{ item.prefix }} mask {{ item.mask }}"
+          loop: "{{ bgp_networks }}"
+          loop_control:
+            label: "{{ item.prefix }}"
+
+        - name: Save running configuration to NVRAM
+          cisco.ios.ios_config:
+            save_when: changed
+
+      rescue:
+        - name: Report BGP configuration failure
+          ansible.builtin.debug:
+            msg: >
+              BGP config failed on {{ inventory_hostname }}.
+              Review with: show run | section router bgp
+
+        - name: Abort play with descriptive message
+          ansible.builtin.fail:
+            msg: "BGP configuration on {{ inventory_hostname }} failed — manual remediation required."
+
+    - name: Verify BGP neighbor sessions are established
+      cisco.ios.ios_command:
+        commands:
+          - show bgp summary
+        wait_for:
+          - result[0] contains "Neighbor"
+      register: bgp_summary
+      retries: 2
+      delay: 15
+      failed_when: bgp_summary.failed and bgp_summary.attempts == 2
+
+    - name: Display BGP neighbor summary
+      ansible.builtin.debug:
+        var: bgp_summary.stdout_lines
