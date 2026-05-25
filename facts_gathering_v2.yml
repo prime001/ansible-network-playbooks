@@ -1,127 +1,120 @@
 ---
-# hardware_inventory.yml
+# cdp_lldp_neighbor_discovery.yml
 #
-# Collects chassis hardware details, module inventory, serial numbers,
-# software version, CPU utilization, and memory stats from Cisco IOS
-# and NX-OS devices. Saves a per-device report under reports/hardware_inventory/.
-# Distinct from facts_gathering.yml (Ansible network facts) — this targets
-# operational telemetry and physical asset tracking.
+# Discovers and reports Layer 2 neighbors via CDP (Cisco) and LLDP (multi-vendor).
+# Useful for topology validation, cable-plant audits, and onboarding new segments.
 #
 # Inventory example:
 #   [core_switches]
-#   core-sw-01  ansible_host=10.0.1.1  ansible_network_os=ios
-#   core-sw-02  ansible_host=10.0.1.2  ansible_network_os=ios
+#   sw-core-01 ansible_host=10.0.0.1
+#   sw-core-02 ansible_host=10.0.0.2
 #
 #   [distribution]
-#   dist-sw-01  ansible_host=10.0.2.1  ansible_network_os=nxos
+#   sw-dist-01 ansible_host=10.0.1.1
 #
-#   [network_devices:children]
+#   [network:children]
 #   core_switches
 #   distribution
 #
-#   [network_devices:vars]
-#   ansible_user="{{ vault_net_username }}"      # ansible-vault encrypted
-#   ansible_password="{{ vault_net_password }}"  # ansible-vault encrypted
+#   [network:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_network_user }}           # ansible-vault encrypted
+#   ansible_password={{ vault_network_password }}   # ansible-vault encrypted
 #   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_connection=network_cli
+#   ansible_become_pass={{ vault_enable_password }} # ansible-vault encrypted
 
-- name: Hardware inventory and environmental telemetry collection
-  hosts: network_devices
+- name: Discover Layer 2 neighbors via CDP and LLDP
+  hosts: network
   gather_facts: false
-
   vars:
-    report_dir: "{{ playbook_dir }}/reports/hardware_inventory"
+    output_dir: "{{ playbook_dir }}/neighbor_reports"
+    timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
 
   tasks:
+    - name: Gather minimal platform facts
+      cisco.ios.ios_facts:
+        gather_subset:
+          - "!all"
+          - min
+      register: device_facts
+      retries: 2
+      delay: 5
+      until: device_facts is not failed
 
-    - name: Create local report directory
+    - name: Collect CDP and LLDP neighbor data
+      block:
+        - name: Run CDP neighbor detail
+          cisco.ios.ios_command:
+            commands:
+              - show cdp neighbors detail
+              - show cdp neighbors
+          register: cdp_output
+          failed_when: >
+            cdp_output.failed or
+            'CDP is not enabled' in (cdp_output.stdout[0] | default(''))
+
+        - name: Run LLDP neighbor detail
+          cisco.ios.ios_command:
+            commands:
+              - show lldp neighbors detail
+              - show lldp neighbors
+          register: lldp_output
+          failed_when: false
+
+      rescue:
+        - name: Log collection failure
+          ansible.builtin.debug:
+            msg: "Neighbor collection failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
+
+        - name: Seed empty facts on failure
+          ansible.builtin.set_fact:
+            cdp_output: { stdout: ['', ''] }
+            lldp_output: { stdout: ['', ''] }
+
+    - name: Display CDP neighbor summary
+      ansible.builtin.debug:
+        msg:
+          - "=== CDP: {{ inventory_hostname }} ({{ ansible_net_hostname | default(inventory_hostname) }}) ==="
+          - "{{ cdp_output.stdout[1] | default('No CDP data') }}"
+
+    - name: Display LLDP neighbor summary
+      ansible.builtin.debug:
+        msg:
+          - "=== LLDP: {{ inventory_hostname }} ==="
+          - "{{ lldp_output.stdout[1] | default('No LLDP data') }}"
+
+    - name: Create report output directory
       ansible.builtin.file:
-        path: "{{ report_dir }}"
+        path: "{{ output_dir }}"
         state: directory
-        mode: "0755"
+        mode: "0750"
       delegate_to: localhost
       run_once: true
 
-    - name: Gather IOS hardware and environmental data
-      block:
-        - name: Execute IOS show commands
-          cisco.ios.ios_command:
-            commands:
-              - show version
-              - show inventory
-              - show environment all
-              - show processes cpu sorted | head 10
-              - show processes memory sorted | head 10
-          register: ios_facts
-          retries: 3
-          delay: 5
-          until: ios_facts is not failed
-      rescue:
-        - name: Report IOS collection error
-          ansible.builtin.debug:
-            msg: "Failed collecting hardware facts from {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
-        - ansible.builtin.fail:
-            msg: "Hardware inventory aborted for {{ inventory_hostname }}"
-      when: ansible_network_os == 'ios'
-
-    - name: Gather NX-OS hardware and environmental data
-      block:
-        - name: Execute NX-OS show commands
-          cisco.nxos.nxos_command:
-            commands:
-              - show version
-              - show inventory
-              - show environment
-              - show processes cpu sort | head 10
-              - show processes memory sort | head 10
-          register: nxos_facts
-          retries: 3
-          delay: 5
-          until: nxos_facts is not failed
-      rescue:
-        - name: Report NX-OS collection error
-          ansible.builtin.debug:
-            msg: "Failed collecting hardware facts from {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
-        - ansible.builtin.fail:
-            msg: "Hardware inventory aborted for {{ inventory_hostname }}"
-      when: ansible_network_os == 'nxos'
-
-    - name: Set unified device data fact
-      ansible.builtin.set_fact:
-        device_data: "{{ ios_facts if (ios_facts is defined and ios_facts.stdout is defined) else nxos_facts }}"
-      when: (ios_facts is defined and ios_facts.stdout is defined) or
-            (nxos_facts is defined and nxos_facts.stdout is defined)
-
-    - name: Display inventory collection summary
-      ansible.builtin.debug:
-        msg:
-          - "=== {{ inventory_hostname }} ({{ ansible_network_os }}) ==="
-          - "Sections collected: version, inventory, environment, cpu-top10, memory-top10"
-      when: device_data is defined
-
-    - name: Write hardware inventory report
+    - name: Save per-device neighbor report
       ansible.builtin.copy:
         content: |
-          ================================================================
-          Hardware Inventory — {{ inventory_hostname }} | {{ ansible_network_os | upper }}
-          ================================================================
+          Neighbor Discovery Report
+          Device      : {{ inventory_hostname }}
+          Hostname    : {{ ansible_net_hostname | default('unknown') }}
+          Platform    : {{ ansible_net_model | default('unknown') }}
+          IOS Version : {{ ansible_net_version | default('unknown') }}
+          Collected   : {{ timestamp }}
 
-          --- SHOW VERSION ---
-          {{ device_data.stdout[0] }}
+          --- CDP Neighbors Detail ---
+          {{ cdp_output.stdout[0] | default('not available') }}
 
-          --- SHOW INVENTORY ---
-          {{ device_data.stdout[1] }}
-
-          --- ENVIRONMENT ---
-          {{ device_data.stdout[2] }}
-
-          --- CPU TOP-10 PROCESSES ---
-          {{ device_data.stdout[3] }}
-
-          --- MEMORY TOP-10 PROCESSES ---
-          {{ device_data.stdout[4] }}
-        dest: "{{ report_dir }}/{{ inventory_hostname }}_hardware.txt"
-        mode: "0644"
+          --- LLDP Neighbors Detail ---
+          {{ lldp_output.stdout[0] | default('not available') }}
+        dest: "{{ output_dir }}/{{ inventory_hostname }}_neighbors_{{ timestamp }}.txt"
+        mode: "0640"
       delegate_to: localhost
-      when: device_data is defined
+
+    - name: Report neighbor counts
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} —
+          CDP peers: {{ (cdp_output.stdout[0] | default('') | regex_findall('Device ID')).count('Device ID') }},
+          LLDP peers: {{ (lldp_output.stdout[0] | default('') | regex_findall('System Name')).count('System Name') }}
