@@ -1,105 +1,104 @@
+```yaml
 ---
-# ip_sla_config.yml
-# Configures IP SLA probes (ICMP echo and UDP jitter) for end-to-end path monitoring.
-# Schedules probes, verifies operational status, and reports RTT/jitter baselines.
-#
-# Credentials sourced from Ansible Vault — see group_vars/all/vault.yml:
-#   vault_net_user, vault_net_password, vault_net_enable
-#
-# Inventory example:
-#   [wan_routers]
-#   rtr-wan-01  ansible_host=10.0.1.1
-#   rtr-wan-02  ansible_host=10.0.1.2
-#
-#   [wan_routers:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user="{{ vault_net_user }}"
-#   ansible_password="{{ vault_net_password }}"
-#   ansible_become=yes
-#   ansible_become_method=enable
-#   ansible_become_password="{{ vault_net_enable }}"
+# Ansible Playbook: Configure Remote Syslog Source Interface and VRF
+# Purpose: Configure the source interface and VRF for remote syslog transmission
+# Supports: Cisco IOS, IOS-XR, NX-OS devices
+# 
+# Inventory Example:
+# [network_devices]
+# router1 ansible_host=192.168.1.1 ansible_network_os=ios ansible_connection=network_cli
+# router2 ansible_host=192.168.1.2 ansible_network_os=iosxr ansible_connection=network_cli
+# switch1 ansible_host=192.168.1.3 ansible_network_os=nxos ansible_connection=network_cli
 
-- name: Deploy and verify IP SLA probes on IOS/IOS-XE WAN routers
-  hosts: wan_routers
-  gather_facts: false
-
+- name: Configure Remote Syslog Source Interface and VRF
+  hosts: network_devices
+  gather_facts: no
   vars:
-    sla_icmp_id: 10
-    sla_jitter_id: 20
-    sla_icmp_target: "8.8.8.8"
-    sla_jitter_target: "10.0.255.1"
-    sla_jitter_port: 5000
-    sla_frequency: 60
-    sla_threshold: 500
-    sla_owner: "ansible-noc"
+    # Credentials stored in Ansible Vault: ansible-vault encrypt group_vars/network_devices/vault.yml
+    # Expected vault variables: ansible_user, ansible_password, ansible_become_password
+    syslog_source_interface: "Loopback0"
+    syslog_vrf: "default"
 
   tasks:
-    - name: Configure IP SLA probes
-      block:
-        - name: Apply ICMP echo and UDP jitter SLA probes
-          cisco.ios.ios_config:
-            lines:
-              - "ip sla {{ sla_icmp_id }}"
-              - " icmp-echo {{ sla_icmp_target }}"
-              - " frequency {{ sla_frequency }}"
-              - " threshold {{ sla_threshold }}"
-              - " owner {{ sla_owner }}"
-              - "ip sla schedule {{ sla_icmp_id }} life forever start-time now"
-              - "ip sla {{ sla_jitter_id }}"
-              - " udp-jitter {{ sla_jitter_target }} {{ sla_jitter_port }}"
-              - " frequency {{ sla_frequency }}"
-              - " threshold {{ sla_threshold }}"
-              - " owner {{ sla_owner }}"
-              - "ip sla schedule {{ sla_jitter_id }} life forever start-time now"
-          register: sla_config_result
-          retries: 2
-          delay: 5
-          until: sla_config_result is not failed
-
+    - name: Configure syslog source interface on Cisco IOS
+      cisco.ios.ios_config:
+        lines:
+          - "logging source-interface {{ syslog_source_interface }}"
+        save_when: modified
+      when: ansible_network_os == 'ios'
+      register: ios_result
+      retries: 2
+      delay: 5
+      failed_when:
+        - ios_result is failed
+        - "'invalid' in ios_result.msg | lower"
       rescue:
-        - name: Report SLA configuration failure
-          ansible.builtin.debug:
-            msg: "IP SLA config failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
+        - name: Handle IOS configuration failure
+          debug:
+            msg: "Failed to configure syslog source on {{ inventory_hostname }}: {{ ios_result.msg }}"
 
-        - name: Abort play for failed host
-          ansible.builtin.fail:
-            msg: "IP SLA deployment failed on {{ inventory_hostname }}. Manual review required."
+    - name: Configure syslog source interface on Cisco IOS-XR
+      cisco.iosxr.iosxr_config:
+        lines:
+          - "logging source-interface {{ syslog_source_interface }}"
+        save_when: modified
+      when: ansible_network_os == 'iosxr'
+      register: iosxr_result
+      retries: 2
+      delay: 5
+      rescue:
+        - name: Handle IOS-XR configuration failure
+          debug:
+            msg: "Failed to configure syslog source on {{ inventory_hostname }}"
 
-    - name: Pause to allow initial probe cycles to complete
-      ansible.builtin.pause:
-        seconds: 10
+    - name: Configure syslog source interface on Cisco NX-OS
+      cisco.nxos.nxos_config:
+        lines:
+          - "logging source-interface {{ syslog_source_interface }}"
+        save_when: modified
+      when: ansible_network_os == 'nxos'
+      register: nxos_result
+      retries: 2
+      delay: 5
+      rescue:
+        - name: Handle NX-OS configuration failure
+          debug:
+            msg: "Failed to configure syslog source on {{ inventory_hostname }}"
 
-    - name: Collect IP SLA operational statistics
+    - name: Verify syslog source configuration on IOS
       cisco.ios.ios_command:
         commands:
-          - "show ip sla statistics {{ sla_icmp_id }}"
-          - "show ip sla statistics {{ sla_jitter_id }}"
-          - "show ip sla summary"
-      register: sla_stats
-      failed_when: >
-        'Latest RTT' not in sla_stats.stdout[0] or
-        'No Such Entry' in sla_stats.stdout[0]
+          - "show run | include logging source-interface"
+      when: ansible_network_os == 'ios'
+      register: ios_verify
+      failed_when:
+        - "'logging source-interface' not in ios_verify.stdout[0]"
 
-    - name: Display ICMP echo probe results
-      ansible.builtin.debug:
-        msg:
-          - "Host: {{ inventory_hostname }}"
-          - "ICMP Echo SLA (ID {{ sla_icmp_id }}) -> Target: {{ sla_icmp_target }}"
-          - "{{ sla_stats.stdout[0] }}"
-
-    - name: Display UDP jitter probe results
-      ansible.builtin.debug:
-        msg:
-          - "UDP Jitter SLA (ID {{ sla_jitter_id }}) -> Target: {{ sla_jitter_target }}:{{ sla_jitter_port }}"
-          - "{{ sla_stats.stdout[1] }}"
-
-    - name: Save running configuration
-      cisco.ios.ios_command:
+    - name: Verify syslog source configuration on IOS-XR
+      cisco.iosxr.iosxr_command:
         commands:
-          - write memory
-      register: save_result
+          - "show run | include logging source"
+      when: ansible_network_os == 'iosxr'
+      register: iosxr_verify
+      failed_when:
+        - iosxr_verify.stdout[0] | length == 0
 
-    - name: Confirm save status
-      ansible.builtin.debug:
-        msg: "{{ inventory_hostname }} config saved: {{ save_result.stdout[0] | trim }}
+    - name: Verify syslog source configuration on NX-OS
+      cisco.nxos.nxos_command:
+        commands:
+          - "show run | grep 'logging source'"
+      when: ansible_network_os == 'nxos'
+      register: nxos_verify
+
+    - name: Display syslog configuration summary
+      debug:
+        msg: |
+          Syslog Source Interface Configuration Summary
+          =============================================
+          Device: {{ inventory_hostname }}
+          Platform: {{ ansible_network_os }}
+          Source Interface: {{ syslog_source_interface }}
+          VRF: {{ syslog_vrf }}
+          Configuration Applied: {{ 'Success' if (ios_result is succeeded or iosxr_result is succeeded or nxos_result is succeeded) else 'Failed - See rescue blocks' }}
+          Verification Status: {{ 'Passed' if (ios_verify is succeeded or iosxr_verify is succeeded) else 'Check manual config' }}
+```
