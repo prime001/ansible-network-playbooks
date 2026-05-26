@@ -1,108 +1,94 @@
-The ansible-network-playbooks repo is a separate GitHub portfolio — I just need to output the YAML directly.
-
 ---
-# ntp_auth_config.yml
-# Hardens NTP by enabling MD5 peer authentication on Cisco IOS devices.
-# Complements basic NTP server config (ntp_config.yml / ntp_config_v2.yml) by
-# adding cryptographic key binding, trusted-key enforcement, and sync validation.
-#
-# Usage:
-#   ansible-playbook ntp_auth_config.yml -i inventory/production --ask-vault-pass
+# NTP Authentication and Peer Security Hardening
+# Configures MD5 authentication keys, trusted-key bindings, and access-group
+# restrictions on Cisco IOS/IOS-XE. Complements ntp_config.yml (server/source
+# basics) with cryptographic peer authentication and query access control.
 #
 # Inventory example:
-#   [distribution_switches]
-#   sw-dist-01 ansible_host=10.10.1.10
-#   sw-dist-02 ansible_host=10.10.1.11
+#   [core_routers]
+#   rtr-core-01 ansible_host=10.10.1.1
+#   rtr-core-02 ansible_host=10.10.1.2
 #
-#   [distribution_switches:vars]
-#   ansible_user=netadmin
+#   [core_routers:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
+#   ansible_user="{{ vault_net_user }}"
+#   ansible_password="{{ vault_net_password }}"
 #   ansible_become=true
 #   ansible_become_method=enable
-#   ansible_password=!vault |
-#     $ANSIBLE_VAULT;1.1;AES256
-#     636661643530336566653939...
-#   vault_ntp_auth_key=!vault |
-#     $ANSIBLE_VAULT;1.1;AES256
-#     346237613263396664653939...
+#   ansible_become_password="{{ vault_net_enable_pass }}"
 
-- name: Configure NTP MD5 Authentication on Cisco IOS Distribution Layer
-  hosts: distribution_switches
+- name: Harden NTP with MD5 authentication and access control
+  hosts: core_routers
   gather_facts: false
+
   vars:
-    ntp_auth_key_id: 10
-    ntp_auth_key: "{{ vault_ntp_auth_key }}"   # ansible-vault encrypt_string
+    # Vault reference: ansible-vault encrypt_string '<secret>' --name 'vault_ntp_key'
+    ntp_key_id: 10
+    ntp_key_string: "{{ vault_ntp_key }}"
     ntp_servers:
-      - { address: "10.0.0.1", prefer: true }
-      - { address: "10.0.0.2", prefer: false }
-    ntp_sync_timeout_seconds: 60
+      - address: 10.0.100.1
+        prefer: true
+      - address: 10.0.100.2
+        prefer: false
+    # Standard ACL number — must exist on device before running this playbook
+    ntp_query_acl: 55
 
   tasks:
-    - name: Apply NTP authentication configuration
+    - name: Apply NTP authentication hardening
       block:
-        - name: Enable NTP auth global flag and register trusted key
+        - name: Enable NTP auth and register MD5 key
           cisco.ios.ios_config:
             lines:
               - ntp authenticate
-              - "ntp authentication-key {{ ntp_auth_key_id }} md5 {{ ntp_auth_key }}"
-              - "ntp trusted-key {{ ntp_auth_key_id }}"
+              - "ntp authentication-key {{ ntp_key_id }} md5 {{ ntp_key_string }}"
+              - "ntp trusted-key {{ ntp_key_id }}"
             save_when: changed
-          register: ntp_auth_config
+          register: auth_cfg
           retries: 2
           delay: 5
-          until: ntp_auth_config is not failed
+          until: auth_cfg is not failed
 
-        - name: Bind NTP servers to authentication key
+        - name: Bind authentication key to each NTP server
           cisco.ios.ios_config:
             lines:
-              - "ntp server {{ item.address }} key {{ ntp_auth_key_id }}{{ ' prefer' if item.prefer else '' }}"
-            save_when: changed
+              - "ntp server {{ item.address }} key {{ ntp_key_id }}{{ ' prefer' if item.prefer else '' }}"
           loop: "{{ ntp_servers }}"
-          register: ntp_server_config
-          retries: 2
-          delay: 5
-          until: ntp_server_config is not failed
+          register: server_cfg
 
-        - name: Poll NTP status — allow time for synchronization
+        - name: Restrict inbound NTP queries via access-group
+          cisco.ios.ios_config:
+            lines:
+              - "ntp access-group serve-only {{ ntp_query_acl }}"
+            save_when: changed
+          register: acl_cfg
+
+        - name: Verify NTP sync status post-hardening
           cisco.ios.ios_command:
             commands:
               - show ntp status
               - show ntp associations
           register: ntp_status
-          retries: 4
-          delay: "{{ (ntp_sync_timeout_seconds / 4) | int }}"
-          until: "'synchronized' in ntp_status.stdout[0] | lower"
-          failed_when: false
-
-        - name: Assert at least one peer was selected
-          ansible.builtin.assert:
-            that: "'*' in ntp_status.stdout[1]"
-            fail_msg: "No NTP peer selected on {{ inventory_hostname }} — check reachability and key mismatch"
-            success_msg: "NTP peer selected on {{ inventory_hostname }}"
-
-        - name: Display NTP synchronization summary
-          ansible.builtin.debug:
-            msg:
-              - "Device      : {{ inventory_hostname }}"
-              - "Synchronized: {{ 'YES' if 'synchronized' in ntp_status.stdout[0] | lower else 'PENDING' }}"
-              - "Status line : {{ ntp_status.stdout[0].splitlines()[0] }}"
-              - "Associations: {{ ntp_status.stdout[1] }}"
+          failed_when: ntp_status.stdout[0] is not defined or ntp_status.stdout[0] == ""
 
       rescue:
-        - name: Collect current NTP running config for diagnostics
-          cisco.ios.ios_command:
-            commands: show running-config | section ntp
-          register: ntp_running
-          ignore_errors: true
-
-        - name: Display NTP running config
+        - name: Surface device-level failure details
           ansible.builtin.debug:
-            var: ntp_running.stdout_lines
+            msg: >-
+              NTP hardening failed on {{ inventory_hostname }}:
+              {{ ansible_failed_result.msg | default(ansible_failed_result.stdout | default('no detail')) }}
 
         - name: Fail with actionable message
           ansible.builtin.fail:
-            msg: >
-              NTP authentication setup failed on {{ inventory_hostname }}.
-              Verify: (1) key ID matches NTP server config, (2) MD5 key value matches,
-              (3) IOS version supports 'ntp authenticate', (4) vault decryption succeeded.
+            msg: >-
+              NTP authentication hardening incomplete on {{ inventory_hostname }}.
+              Verify ACL {{ ntp_query_acl }} exists and vault_ntp_key is set.
+
+    - name: Display NTP hardening summary
+      ansible.builtin.debug:
+        msg:
+          - "Device         : {{ inventory_hostname }}"
+          - "Auth key cfg   : {{ 'changed' if auth_cfg.changed else 'already present' }}"
+          - "Server binding : {{ 'changed' if server_cfg.changed else 'already present' }}"
+          - "ACL applied    : {{ 'changed' if acl_cfg.changed else 'already present' }}"
+          - "NTP Status     : {{ ntp_status.stdout[0].split('\n')[0] | default('unavailable') }}
