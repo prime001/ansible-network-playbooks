@@ -1,144 +1,109 @@
-```yaml
 ---
-# Ansible Playbook: VLAN Configuration Management
-# Purpose: Deploy and manage VLAN configurations across network devices
-# Supported Platforms: Cisco IOS, IOS-XR, Nexus (NX-OS), Juniper
-# Author: Network Engineering Team
+# ospf_config.yml
+# Deploys OSPF process, network statements, and interface roles to Cisco IOS routers
+# Credentials stored in Ansible Vault — encrypt with:
+#   ansible-vault encrypt_string 'secret' --name vault_net_password
 #
-# Inventory Example:
-# [ios_devices]
-# router1 ansible_host=192.168.1.1 ansible_network_os=ios
-# switch1 ansible_host=192.168.1.2 ansible_network_os=ios
+# Inventory example:
+# [core_routers]
+# rtr-core-01 ansible_host=10.0.1.1 ospf_router_id=10.0.1.1
+# rtr-core-02 ansible_host=10.0.1.2 ospf_router_id=10.0.1.2
 #
-# [iosxr_devices]
-# router2 ansible_host=192.168.2.1 ansible_network_os=iosxr
-#
-# [nxos_devices]
-# switch2 ansible_host=192.168.3.1 ansible_network_os=nxos
-#
-# Vault Usage: ansible-vault encrypt group_vars/all/credentials.yml
+# [core_routers:vars]
+# ansible_network_os=ios
+# ansible_connection=network_cli
+# ansible_user={{ vault_net_username }}
+# ansible_password={{ vault_net_password }}
+# ansible_become=yes
+# ansible_become_method=enable
+# ansible_become_password={{ vault_enable_password }}
 
-- name: VLAN Configuration and Management
-  hosts: "{{ target_devices | default('all') }}"
-  gather_facts: no
+- name: Deploy OSPF routing configuration to IOS core routers
+  hosts: core_routers
+  gather_facts: false
   vars:
-    ansible_connection: network_cli
-    ansible_user: "{{ vault_username }}"
-    ansible_password: "{{ vault_password }}"
+    ospf_process_id: 1
+    # Per-host ospf_router_id set in inventory or host_vars
+    ospf_reference_bandwidth: 10000
+    ospf_networks:
+      - { prefix: 10.0.0.0,   wildcard: 0.0.255.255, area: 0 }
+      - { prefix: 192.168.0.0, wildcard: 0.0.0.255,  area: 1 }
+    ospf_active_interfaces:
+      - GigabitEthernet0/0
+      - GigabitEthernet0/1
+    max_retries: 3
 
   tasks:
-    - name: Display playbook execution details
-      debug:
-        msg: "Managing VLANs on {{ inventory_hostname }} ({{ ansible_network_os }})"
+    - name: Verify device is reachable before making changes
+      cisco.ios.ios_command:
+        commands: show clock
+      register: reachability_check
+      retries: "{{ max_retries }}"
+      delay: 5
+      until: reachability_check is not failed
 
-    - name: Configure VLANs on Cisco IOS devices
-      when: ansible_network_os == 'ios'
+    - name: Configure OSPF process
       block:
-        - name: Create or modify VLANs
-          ios_vlan:
-            vlan_id: "{{ item.vlan_id }}"
-            name: "{{ item.name }}"
-            state: "{{ item.state | default('present') }}"
-          register: ios_vlan_result
-          loop: "{{ vlans }}"
-          retries: 3
-          delay: 5
-          failed_when:
-            - ios_vlan_result.failed
-            - "'failed' not in ios_vlan_result.msg | lower"
-
-        - name: Display IOS VLAN configuration results
-          debug:
-            msg: "VLAN {{ item.item.vlan_id }} - {{ item.item.name }}: {{ 'Created' if item.changed else 'Unchanged' }}"
-          loop: "{{ ios_vlan_result.results }}"
-          when: ios_vlan_result.results is defined
-
-      rescue:
-        - name: Handle IOS configuration failure
-          debug:
-            msg: "Failed to configure VLANs on {{ inventory_hostname }}: {{ ansible_failed_result.msg }}"
-
-    - name: Configure VLANs on Cisco IOS-XR devices
-      when: ansible_network_os == 'iosxr'
-      block:
-        - name: Configure VLAN via CLI
-          iosxr_config:
+        - name: Set OSPF global parameters — router-id, bandwidth, passive-interface default
+          cisco.ios.ios_config:
             lines:
-              - "vlan {{ item.vlan_id }}"
-              - "name {{ item.name }}"
-            match: line
-            replace: block
-          register: iosxr_vlan_result
-          loop: "{{ vlans }}"
-          retries: 3
-          delay: 5
+              - "router-id {{ ospf_router_id }}"
+              - "auto-cost reference-bandwidth {{ ospf_reference_bandwidth }}"
+              - "passive-interface default"
+            parents: "router ospf {{ ospf_process_id }}"
+          register: ospf_global_result
 
-        - name: Commit configuration
-          iosxr_config:
-            commit: true
-          when: iosxr_vlan_result.changed
+        - name: Add OSPF network statements per area
+          cisco.ios.ios_config:
+            lines:
+              - "network {{ item.prefix }} {{ item.wildcard }} area {{ item.area }}"
+            parents: "router ospf {{ ospf_process_id }}"
+          loop: "{{ ospf_networks }}"
+          register: ospf_networks_result
 
-        - name: Display IOS-XR configuration status
-          debug:
-            msg: "VLANs configured on {{ inventory_hostname }}"
-
-      rescue:
-        - name: Handle IOS-XR configuration failure
-          debug:
-            msg: "Failed to configure VLANs on {{ inventory_hostname }}: {{ ansible_failed_result.msg }}"
-
-    - name: Configure VLANs on Cisco NX-OS devices
-      when: ansible_network_os == 'nxos'
-      block:
-        - name: Create or modify VLANs
-          nxos_vlan:
-            vlan_id: "{{ item.vlan_id }}"
-            name: "{{ item.name }}"
-            state: "{{ item.state | default('present') }}"
-          register: nxos_vlan_result
-          loop: "{{ vlans }}"
-          retries: 3
-          delay: 5
-
-        - name: Display NX-OS VLAN results
-          debug:
-            msg: "VLAN {{ item.item.vlan_id }} - {{ item.item.name }}: {{ 'Created' if item.changed else 'Unchanged' }}"
-          loop: "{{ nxos_vlan_result.results }}"
-          when: nxos_vlan_result.results is defined
+        - name: Activate OSPF on transit interfaces (override passive-interface default)
+          cisco.ios.ios_config:
+            lines:
+              - "no passive-interface {{ item }}"
+            parents: "router ospf {{ ospf_process_id }}"
+          loop: "{{ ospf_active_interfaces }}"
+          register: ospf_interfaces_result
 
       rescue:
-        - name: Handle NX-OS configuration failure
-          debug:
-            msg: "Failed to configure VLANs on {{ inventory_hostname }}: {{ ansible_failed_result.msg }}"
+        - name: Report configuration failure
+          ansible.builtin.debug:
+            msg: "OSPF configuration failed on {{ inventory_hostname }} — review device logs before retrying"
 
-    - name: Verify VLAN configuration
-      ios_command:
+        - name: Abort play with descriptive error
+          ansible.builtin.fail:
+            msg: "Halting OSPF deployment on {{ inventory_hostname }} due to configuration error in block"
+
+    - name: Wait for OSPF adjacencies to reach FULL state (up to 60s)
+      cisco.ios.ios_command:
+        commands: show ip ospf neighbor
+      register: ospf_neighbors
+      retries: 6
+      delay: 10
+      until: "'FULL' in ospf_neighbors.stdout[0]"
+      failed_when: false
+
+    - name: Collect OSPF state for audit record
+      cisco.ios.ios_command:
         commands:
-          - "show vlan brief"
-      register: vlan_verification
-      when: ansible_network_os == 'ios'
-      retries: 2
-      delay: 3
+          - show ip ospf
+          - show ip ospf neighbor detail
+          - show ip route ospf
+      register: ospf_audit
 
-    - name: Display VLAN verification results
-      debug:
-        var: vlan_verification.stdout_lines[0]
-      when:
-        - vlan_verification.stdout_lines is defined
-        - vlan_verification.stdout_lines | length > 0
+    - name: Display OSPF adjacency and route summary
+      ansible.builtin.debug:
+        msg: "{{ ospf_audit.stdout_lines }}"
 
-  vars:
-    vlans:
-      - vlan_id: 10
-        name: "Management"
-        state: present
-      - vlan_id: 20
-        name: "Data"
-        state: present
-      - vlan_id: 30
-        name: "Voice"
-        state: present
-      - vlan_id: 40
-        name: "Video"
-        state: present
-```
+    - name: Warn if no OSPF FULL adjacencies found
+      ansible.builtin.debug:
+        msg: "WARNING: No FULL OSPF adjacencies on {{ inventory_hostname }} — verify peer config and network statements"
+      when: "'FULL' not in ospf_neighbors.stdout[0]"
+
+    - name: Persist approved configuration to NVRAM
+      cisco.ios.ios_config:
+        save_when: changed
