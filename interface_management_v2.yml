@@ -1,143 +1,104 @@
 ---
-# BGP Prefix-List and Route-Map Deployment
-# Deploys inbound/outbound BGP route policy on Cisco IOS routers.
-# Prefix-lists define allowed/denied prefixes; route-maps apply policy to BGP neighbors.
-# Distinct from acl_deploy.yml, which manages traffic ACLs — these filters control BGP RIB.
+# ospf_config.yml — Deploy and verify OSPF on Cisco IOS/IOS-XE devices
+# Configures OSPF process, network statements, passive interfaces, and
+# validates neighbor adjacencies form successfully after deployment.
 #
-# Inventory example (inventory/network.yml):
-# ---
-# all:
-#   children:
-#     routers:
-#       hosts:
-#         core-rtr-01:
-#           ansible_host: 10.0.0.1
-#         core-rtr-02:
-#           ansible_host: 10.0.0.2
-#       vars:
-#         ansible_network_os: ios
-#         ansible_connection: network_cli
-#         ansible_user: "{{ vault_net_user }}"
-#         ansible_password: "{{ vault_net_pass }}"
-#         ansible_become: true
-#         ansible_become_method: enable
-#         ansible_become_password: "{{ vault_enable_pass }}"
+# Credentials stored in Ansible Vault:
+#   ansible-vault edit group_vars/all/vault.yml
+#   Required keys: vault_network_user, vault_network_password, vault_enable_password
+#
+# Inventory example:
+# [core_routers]
+# r1  ansible_host=10.0.1.1
+# r2  ansible_host=10.0.1.2
+#
+# [core_routers:vars]
+# ansible_network_os=ios
+# ansible_connection=network_cli
+# ansible_user={{ vault_network_user }}
+# ansible_password={{ vault_network_password }}
+# ansible_become=yes
+# ansible_become_method=enable
+# ansible_become_password={{ vault_enable_password }}
 
-- name: Deploy BGP prefix-lists and route-maps for inbound/outbound route filtering
-  hosts: routers
+- name: Deploy OSPF routing configuration on Cisco IOS devices
+  hosts: core_routers
   gather_facts: false
-
   vars:
-    # Credentials — store in group_vars/routers/vault.yml, encrypted with ansible-vault
-    ansible_user: "{{ vault_net_user }}"
-    ansible_password: "{{ vault_net_pass }}"
-    ansible_become_password: "{{ vault_enable_pass }}"
-
-    bgp_prefix_lists:
-      - name: PL_ALLOWED_INBOUND
-        description: "Permitted inbound BGP prefixes from upstream peer"
-        entries:
-          - sequence: 10
-            action: permit
-            prefix: 192.0.2.0/24
-          - sequence: 20
-            action: permit
-            prefix: 198.51.100.0/24
-          - sequence: 99
-            action: deny
-            prefix: 0.0.0.0/0
-            le: 32
-      - name: PL_SUPPRESS_DEFAULT
-        description: "Block default route in outbound BGP advertisements"
-        entries:
-          - sequence: 10
-            action: deny
-            prefix: 0.0.0.0/0
-          - sequence: 20
-            action: permit
-            prefix: 0.0.0.0/0
-            le: 32
+    ansible_user: "{{ vault_network_user }}"
+    ansible_password: "{{ vault_network_password }}"
+    ansible_become_password: "{{ vault_enable_password }}"
+    ospf_process_id: 1
+    ospf_reference_bandwidth: 1000
+    ospf_networks:
+      - prefix: "10.0.0.0"
+        wildcard: "0.0.255.255"
+        area: 0
+      - prefix: "192.168.100.0"
+        wildcard: "0.0.0.255"
+        area: 1
+    ospf_passive_interfaces:
+      - GigabitEthernet0/2
 
   tasks:
-    - name: Confirm device is reachable before applying changes
-      cisco.ios.ios_command:
-        commands: show clock
-      register: reach_check
-      retries: 3
-      delay: 5
-      until: reach_check is not failed
-
-    - name: Configure prefix-lists and route-maps
+    - name: Configure OSPF process and settings
       block:
-        - name: Apply BGP prefix-lists
-          cisco.ios.ios_prefix_lists:
-            config:
-              - afi: ipv4
-                prefix_lists: "{{ bgp_prefix_lists }}"
-            state: merged
-          register: prefix_list_result
+        - name: Set OSPF reference bandwidth
+          cisco.ios.ios_config:
+            lines:
+              - "auto-cost reference-bandwidth {{ ospf_reference_bandwidth }}"
+            parents: "router ospf {{ ospf_process_id }}"
 
-        - name: Apply BGP route-maps referencing prefix-lists
-          cisco.ios.ios_route_maps:
-            config:
-              - route_map: RM_BGP_INBOUND
-                entries:
-                  - sequence: 10
-                    action: permit
-                    description: "Permit explicitly allowed inbound prefixes"
-                    match:
-                      ip:
-                        address:
-                          prefix_lists:
-                            - PL_ALLOWED_INBOUND
-                  - sequence: 99
-                    action: deny
-                    description: "Deny all remaining inbound prefixes"
-              - route_map: RM_BGP_OUTBOUND
-                entries:
-                  - sequence: 10
-                    action: permit
-                    description: "Advertise all prefixes except default route"
-                    match:
-                      ip:
-                        address:
-                          prefix_lists:
-                            - PL_SUPPRESS_DEFAULT
-            state: merged
-          register: route_map_result
-          notify: Save running configuration
+        - name: Configure OSPF network statements
+          cisco.ios.ios_config:
+            lines:
+              - "network {{ item.prefix }} {{ item.wildcard }} area {{ item.area }}"
+            parents: "router ospf {{ ospf_process_id }}"
+          loop: "{{ ospf_networks }}"
+
+        - name: Configure passive interfaces
+          cisco.ios.ios_config:
+            lines:
+              - "passive-interface {{ item }}"
+            parents: "router ospf {{ ospf_process_id }}"
+          loop: "{{ ospf_passive_interfaces }}"
+
+        - name: Verify OSPF process is active
+          cisco.ios.ios_command:
+            commands:
+              - "show ip ospf {{ ospf_process_id }}"
+              - "show ip ospf neighbor"
+              - "show ip ospf interface brief"
+          register: ospf_verify
+          retries: 3
+          delay: 10
+          until: ospf_verify.stdout[0] != ""
+          failed_when: "'OSPF Router with ID' not in ospf_verify.stdout[0]"
+
+        - name: Display OSPF neighbor table
+          ansible.builtin.debug:
+            msg: "{{ ospf_verify.stdout_lines[1] }}"
+
+        - name: Display OSPF interface summary
+          ansible.builtin.debug:
+            msg: "{{ ospf_verify.stdout_lines[2] }}"
 
       rescue:
-        - name: Report configuration failure
+        - name: Collect diagnostic information
+          cisco.ios.ios_command:
+            commands:
+              - "show ip protocols"
+              - "show running-config | section router ospf"
+          register: diag_output
+          ignore_errors: true
+
+        - name: Display diagnostics
           ansible.builtin.debug:
-            msg: "Policy deployment failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('see task output') }}"
+            msg: "{{ diag_output.stdout_lines | default(['No diagnostic data collected']) }}"
 
-        - name: Abort with descriptive error
+        - name: Fail with descriptive context
           ansible.builtin.fail:
-            msg: "BGP route policy deployment failed on {{ inventory_hostname }}. No partial config saved."
-
-    - name: Verify prefix-lists and route-maps are active on device
-      cisco.ios.ios_command:
-        commands:
-          - show ip prefix-list summary
-          - show route-map
-      register: verify_output
-      failed_when: >
-        'PL_ALLOWED_INBOUND' not in verify_output.stdout[0] or
-        'RM_BGP_INBOUND' not in verify_output.stdout[1]
-
-    - name: Display post-deployment verification output
-      ansible.builtin.debug:
-        msg:
-          - "--- {{ inventory_hostname }} Prefix-List Summary ---"
-          - "{{ verify_output.stdout_lines[0] }}"
-          - "--- Route-Map Summary ---"
-          - "{{ verify_output.stdout_lines[1] }}"
-
-  handlers:
-    - name: Save running configuration
-      cisco.ios.ios_command:
-        commands:
-          - command: write memory
-            prompt: '\[confirm\]'
-            answer: ''
+            msg: >
+              OSPF deployment failed on {{ inventory_hostname }}.
+              Failed task: {{ ansible_failed_task.name }}.
+              Review diagnostic output above before retrying.
