@@ -1,112 +1,143 @@
-Writing a BGP neighbor configuration playbook — not covered by any of the existing 20 playbooks.
-
 ---
-# BGP Neighbor Configuration and Session Verification
-# Configures eBGP/iBGP peers on Cisco IOS routers and validates session establishment
+# BGP Prefix-List and Route-Map Deployment
+# Deploys inbound/outbound BGP route policy on Cisco IOS routers.
+# Prefix-lists define allowed/denied prefixes; route-maps apply policy to BGP neighbors.
+# Distinct from acl_deploy.yml, which manages traffic ACLs — these filters control BGP RIB.
 #
-# Inventory example:
-#   [bgp_routers]
-#   core-rtr-01 ansible_host=10.0.1.1
-#   core-rtr-02 ansible_host=10.0.1.2
-#
-#   [bgp_routers:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user="{{ vault_network_user }}"          # stored in ansible-vault
-#   ansible_password="{{ vault_network_password }}"
-#   ansible_become=yes
-#   ansible_become_method=enable
-#   ansible_become_password="{{ vault_enable_password }}"
-#   local_asn=65001
-#   bgp_peer_ip=10.0.1.2
-#   bgp_peer_asn=65002
+# Inventory example (inventory/network.yml):
+# ---
+# all:
+#   children:
+#     routers:
+#       hosts:
+#         core-rtr-01:
+#           ansible_host: 10.0.0.1
+#         core-rtr-02:
+#           ansible_host: 10.0.0.2
+#       vars:
+#         ansible_network_os: ios
+#         ansible_connection: network_cli
+#         ansible_user: "{{ vault_net_user }}"
+#         ansible_password: "{{ vault_net_pass }}"
+#         ansible_become: true
+#         ansible_become_method: enable
+#         ansible_become_password: "{{ vault_enable_pass }}"
 
-- name: Configure BGP neighbors and verify peering on Cisco IOS
-  hosts: bgp_routers
+- name: Deploy BGP prefix-lists and route-maps for inbound/outbound route filtering
+  hosts: routers
   gather_facts: false
 
   vars:
-    bgp_keepalive: 30
-    bgp_holdtime: 90
-    bgp_update_source: Loopback0
-    bgp_session_timeout: 150
+    # Credentials — store in group_vars/routers/vault.yml, encrypted with ansible-vault
+    ansible_user: "{{ vault_net_user }}"
+    ansible_password: "{{ vault_net_pass }}"
+    ansible_become_password: "{{ vault_enable_pass }}"
+
+    bgp_prefix_lists:
+      - name: PL_ALLOWED_INBOUND
+        description: "Permitted inbound BGP prefixes from upstream peer"
+        entries:
+          - sequence: 10
+            action: permit
+            prefix: 192.0.2.0/24
+          - sequence: 20
+            action: permit
+            prefix: 198.51.100.0/24
+          - sequence: 99
+            action: deny
+            prefix: 0.0.0.0/0
+            le: 32
+      - name: PL_SUPPRESS_DEFAULT
+        description: "Block default route in outbound BGP advertisements"
+        entries:
+          - sequence: 10
+            action: deny
+            prefix: 0.0.0.0/0
+          - sequence: 20
+            action: permit
+            prefix: 0.0.0.0/0
+            le: 32
 
   tasks:
-
-    - name: Capture pre-change BGP summary
+    - name: Confirm device is reachable before applying changes
       cisco.ios.ios_command:
-        commands:
-          - show ip bgp summary
-      register: bgp_pre_state
-      failed_when: false
+        commands: show clock
+      register: reach_check
+      retries: 3
+      delay: 5
+      until: reach_check is not failed
 
-    - name: Configure BGP neighbor
+    - name: Configure prefix-lists and route-maps
       block:
+        - name: Apply BGP prefix-lists
+          cisco.ios.ios_prefix_lists:
+            config:
+              - afi: ipv4
+                prefix_lists: "{{ bgp_prefix_lists }}"
+            state: merged
+          register: prefix_list_result
 
-        - name: Apply BGP global neighbor statements
-          cisco.ios.ios_config:
-            lines:
-              - "neighbor {{ bgp_peer_ip }} remote-as {{ bgp_peer_asn }}"
-              - "neighbor {{ bgp_peer_ip }} description PEER-AS{{ bgp_peer_asn }}"
-              - "neighbor {{ bgp_peer_ip }} update-source {{ bgp_update_source }}"
-              - "neighbor {{ bgp_peer_ip }} timers {{ bgp_keepalive }} {{ bgp_holdtime }}"
-            parents: "router bgp {{ local_asn }}"
-          register: bgp_neighbor_cfg
-          notify: Write configuration to NVRAM
-
-        - name: Activate neighbor in IPv4 unicast address-family
-          cisco.ios.ios_config:
-            lines:
-              - "neighbor {{ bgp_peer_ip }} activate"
-              - "neighbor {{ bgp_peer_ip }} soft-reconfiguration inbound"
-            parents:
-              - "router bgp {{ local_asn }}"
-              - "address-family ipv4 unicast"
-          register: bgp_af_cfg
+        - name: Apply BGP route-maps referencing prefix-lists
+          cisco.ios.ios_route_maps:
+            config:
+              - route_map: RM_BGP_INBOUND
+                entries:
+                  - sequence: 10
+                    action: permit
+                    description: "Permit explicitly allowed inbound prefixes"
+                    match:
+                      ip:
+                        address:
+                          prefix_lists:
+                            - PL_ALLOWED_INBOUND
+                  - sequence: 99
+                    action: deny
+                    description: "Deny all remaining inbound prefixes"
+              - route_map: RM_BGP_OUTBOUND
+                entries:
+                  - sequence: 10
+                    action: permit
+                    description: "Advertise all prefixes except default route"
+                    match:
+                      ip:
+                        address:
+                          prefix_lists:
+                            - PL_SUPPRESS_DEFAULT
+            state: merged
+          register: route_map_result
+          notify: Save running configuration
 
       rescue:
-
-        - name: Log configuration failure details
+        - name: Report configuration failure
           ansible.builtin.debug:
-            msg: "BGP config failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown') }}"
+            msg: "Policy deployment failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('see task output') }}"
 
-        - name: Abort with descriptive message
+        - name: Abort with descriptive error
           ansible.builtin.fail:
-            msg: "BGP neighbor configuration failed on {{ inventory_hostname }}. Verify BGP process exists and credentials are correct."
+            msg: "BGP route policy deployment failed on {{ inventory_hostname }}. No partial config saved."
 
-    - name: Poll until BGP session reaches Established state
+    - name: Verify prefix-lists and route-maps are active on device
       cisco.ios.ios_command:
         commands:
-          - "show ip bgp neighbors {{ bgp_peer_ip }} | include BGP state"
-      register: bgp_state_poll
-      until: "'Established' in bgp_state_poll.stdout[0]"
-      retries: "{{ (bgp_session_timeout / 15) | int }}"
-      delay: 15
+          - show ip prefix-list summary
+          - show route-map
+      register: verify_output
+      failed_when: >
+        'PL_ALLOWED_INBOUND' not in verify_output.stdout[0] or
+        'RM_BGP_INBOUND' not in verify_output.stdout[1]
 
-    - name: Gather full BGP neighbor detail
-      cisco.ios.ios_command:
-        commands:
-          - "show ip bgp neighbors {{ bgp_peer_ip }}"
-          - "show ip bgp summary"
-      register: bgp_detail
-
-    - name: Assert BGP session is Established
-      ansible.builtin.assert:
-        that:
-          - "'Established' in bgp_state_poll.stdout[0]"
-        fail_msg: "BGP peer {{ bgp_peer_ip }} did not reach Established state on {{ inventory_hostname }}"
-        success_msg: "BGP session with {{ bgp_peer_ip }} (AS {{ bgp_peer_asn }}) is Established"
-
-    - name: Display BGP session result
+    - name: Display post-deployment verification output
       ansible.builtin.debug:
         msg:
-          - "Device  : {{ inventory_hostname }}"
-          - "Local AS: {{ local_asn }}"
-          - "Peer    : {{ bgp_peer_ip }} (AS {{ bgp_peer_asn }})"
-          - "State   : {{ bgp_state_poll.stdout[0] | trim }}"
+          - "--- {{ inventory_hostname }} Prefix-List Summary ---"
+          - "{{ verify_output.stdout_lines[0] }}"
+          - "--- Route-Map Summary ---"
+          - "{{ verify_output.stdout_lines[1] }}"
 
   handlers:
-    - name: Write configuration to NVRAM
+    - name: Save running configuration
       cisco.ios.ios_command:
         commands:
-          - write memory
+          - command: write memory
+            prompt: '\[confirm\]'
+            answer: ''
