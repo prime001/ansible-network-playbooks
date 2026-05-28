@@ -1,94 +1,111 @@
 ---
-# NTP Authentication and Peer Security Hardening
-# Configures MD5 authentication keys, trusted-key bindings, and access-group
-# restrictions on Cisco IOS/IOS-XE. Complements ntp_config.yml (server/source
-# basics) with cryptographic peer authentication and query access control.
+# bgp_config.yml
+# Configures eBGP neighbors on Cisco IOS devices: neighbor auth, timers,
+# prefix limits, and soft-reconfiguration. Verifies session convergence
+# post-apply and captures diagnostics on failure.
 #
 # Inventory example:
 #   [core_routers]
-#   rtr-core-01 ansible_host=10.10.1.1
-#   rtr-core-02 ansible_host=10.10.1.2
+#   rtr-core-01 ansible_host=10.0.0.1 bgp_peer_ip=192.168.1.2 bgp_peer_asn=65002
+#   rtr-core-02 ansible_host=10.0.0.2 bgp_peer_ip=192.168.1.6 bgp_peer_asn=65002
 #
 #   [core_routers:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_user="{{ vault_net_user }}"
-#   ansible_password="{{ vault_net_password }}"
-#   ansible_become=true
+#   ansible_user={{ vault_net_username }}
+#   ansible_password={{ vault_net_password }}
+#   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_become_password="{{ vault_net_enable_pass }}"
+#   ansible_become_password={{ vault_net_enable_password }}
+#
+# Vault: ansible-vault encrypt_string 'secret' --name 'vault_net_password'
 
-- name: Harden NTP with MD5 authentication and access control
+- name: Configure eBGP neighbors on Cisco IOS routers
   hosts: core_routers
   gather_facts: false
-
   vars:
-    # Vault reference: ansible-vault encrypt_string '<secret>' --name 'vault_ntp_key'
-    ntp_key_id: 10
-    ntp_key_string: "{{ vault_ntp_key }}"
-    ntp_servers:
-      - address: 10.0.100.1
-        prefer: true
-      - address: 10.0.100.2
-        prefer: false
-    # Standard ACL number — must exist on device before running this playbook
-    ntp_query_acl: 55
+    # Credentials sourced from group_vars/all/vault.yml (ansible-vault)
+    ansible_user: "{{ vault_net_username }}"
+    ansible_password: "{{ vault_net_password }}"
+    ansible_become_password: "{{ vault_net_enable_password }}"
+    bgp_local_asn: 65001
+    bgp_router_id: "{{ ansible_host }}"
+    bgp_keepalive: 30
+    bgp_holdtime: 90
+    bgp_auth_password: "{{ vault_bgp_md5_password }}"
+    bgp_max_prefixes: 500
+    bgp_max_prefix_warning_pct: 80
 
   tasks:
-    - name: Apply NTP authentication hardening
+    - name: Capture pre-change BGP summary
+      cisco.ios.ios_command:
+        commands: "show ip bgp summary"
+      register: bgp_pre_check
+      retries: 2
+      delay: 5
+      failed_when: false
+
+    - name: Display pre-change BGP state
+      ansible.builtin.debug:
+        msg: "{{ bgp_pre_check.stdout_lines }}"
+
+    - name: Apply BGP neighbor configuration
       block:
-        - name: Enable NTP auth and register MD5 key
+        - name: Configure BGP process and neighbor
           cisco.ios.ios_config:
             lines:
-              - ntp authenticate
-              - "ntp authentication-key {{ ntp_key_id }} md5 {{ ntp_key_string }}"
-              - "ntp trusted-key {{ ntp_key_id }}"
-            save_when: changed
-          register: auth_cfg
-          retries: 2
-          delay: 5
-          until: auth_cfg is not failed
+              - "bgp router-id {{ bgp_router_id }}"
+              - "bgp log-neighbor-changes"
+              - "timers bgp {{ bgp_keepalive }} {{ bgp_holdtime }}"
+              - "neighbor {{ bgp_peer_ip }} remote-as {{ bgp_peer_asn }}"
+              - "neighbor {{ bgp_peer_ip }} description EBGP-{{ bgp_peer_asn }}"
+              - "neighbor {{ bgp_peer_ip }} password {{ bgp_auth_password }}"
+              - "neighbor {{ bgp_peer_ip }} maximum-prefix {{ bgp_max_prefixes }} {{ bgp_max_prefix_warning_pct }}"
+              - "neighbor {{ bgp_peer_ip }} soft-reconfiguration inbound"
+              - "neighbor {{ bgp_peer_ip }} send-community both"
+            parents: "router bgp {{ bgp_local_asn }}"
+          register: bgp_apply_result
+          notify: save_running_config
 
-        - name: Bind authentication key to each NTP server
-          cisco.ios.ios_config:
-            lines:
-              - "ntp server {{ item.address }} key {{ ntp_key_id }}{{ ' prefer' if item.prefer else '' }}"
-          loop: "{{ ntp_servers }}"
-          register: server_cfg
-
-        - name: Restrict inbound NTP queries via access-group
-          cisco.ios.ios_config:
-            lines:
-              - "ntp access-group serve-only {{ ntp_query_acl }}"
-            save_when: changed
-          register: acl_cfg
-
-        - name: Verify NTP sync status post-hardening
+        - name: Wait for BGP session to establish
           cisco.ios.ios_command:
-            commands:
-              - show ntp status
-              - show ntp associations
-          register: ntp_status
-          failed_when: ntp_status.stdout[0] is not defined or ntp_status.stdout[0] == ""
+            commands: "show ip bgp neighbors {{ bgp_peer_ip }} | include BGP state"
+          register: bgp_state
+          retries: 8
+          delay: 10
+          until: "'Established' in (bgp_state.stdout | join(''))"
+          failed_when:
+            - bgp_state.stdout | join('') | length == 0
+
+        - name: Display BGP session state
+          ansible.builtin.debug:
+            msg: "Neighbor {{ bgp_peer_ip }} on {{ inventory_hostname }}: {{ bgp_state.stdout_lines }}"
 
       rescue:
-        - name: Surface device-level failure details
+        - name: Log configuration failure
           ansible.builtin.debug:
-            msg: >-
-              NTP hardening failed on {{ inventory_hostname }}:
-              {{ ansible_failed_result.msg | default(ansible_failed_result.stdout | default('no detail')) }}
+            msg: >
+              BGP neighbor {{ bgp_peer_ip }} (AS {{ bgp_peer_asn }}) config
+              failed on {{ inventory_hostname }}: {{ ansible_failed_result | default('unknown error') }}
 
-        - name: Fail with actionable message
+        - name: Collect BGP section for diagnostics
+          cisco.ios.ios_command:
+            commands: "show run | section router bgp"
+          register: bgp_diag
+          failed_when: false
+
+        - name: Display diagnostic output
+          ansible.builtin.debug:
+            msg: "{{ bgp_diag.stdout_lines }}"
+
+        - name: Raise failure with context
           ansible.builtin.fail:
-            msg: >-
-              NTP authentication hardening incomplete on {{ inventory_hostname }}.
-              Verify ACL {{ ntp_query_acl }} exists and vault_ntp_key is set.
+            msg: >
+              BGP neighbor setup failed on {{ inventory_hostname }}.
+              Check diagnostic output above and verify peer reachability.
 
-    - name: Display NTP hardening summary
-      ansible.builtin.debug:
-        msg:
-          - "Device         : {{ inventory_hostname }}"
-          - "Auth key cfg   : {{ 'changed' if auth_cfg.changed else 'already present' }}"
-          - "Server binding : {{ 'changed' if server_cfg.changed else 'already present' }}"
-          - "ACL applied    : {{ 'changed' if acl_cfg.changed else 'already present' }}"
-          - "NTP Status     : {{ ntp_status.stdout[0].split('\n')[0] | default('unavailable') }}
+  handlers:
+    - name: save_running_config
+      cisco.ios.ios_command:
+        commands: "write memory"
+      listen: save_running_config
