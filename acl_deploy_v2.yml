@@ -1,115 +1,128 @@
 ---
-# bgp_routing_config.yml
-# Playbook: Configure BGP routing protocol on Cisco IOS devices
-# Purpose: Establish eBGP/iBGP neighbor sessions, advertise prefixes, set BGP attributes
+# qos_policy_deploy.yml
+#
+# Deploys QoS class-maps, policy-maps, and service-policy bindings
+# on Cisco IOS/IOS-XE devices. Verifies policy attachment after deploy.
 #
 # Inventory example:
-#   [bgp_routers]
-#   core-rtr-01 ansible_host=10.0.1.1
-#   core-rtr-02 ansible_host=10.0.1.2
+#   [routers]
+#   core-rtr-01 ansible_host=192.168.1.1
+#   core-rtr-02 ansible_host=192.168.1.2
 #
-#   [bgp_routers:vars]
+#   [routers:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_user={{ vault_network_user }}
-#   ansible_password={{ vault_network_password }}
+#   ansible_user={{ vault_net_username }}          # ansible-vault encrypted
+#   ansible_password={{ vault_net_password }}       # ansible-vault encrypted
 #   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_password }}
+#   ansible_become_password={{ vault_enable_pass }} # ansible-vault encrypted
 
-- name: Configure BGP routing on Cisco IOS routers
-  hosts: bgp_routers
+- name: Deploy QoS policy-maps and service-policy to network devices
+  hosts: routers
   gather_facts: false
 
   vars:
-    # Sensitive values stored in Ansible Vault (ansible-vault encrypt group_vars/bgp_routers/vault.yml)
-    bgp_local_as: "{{ vault_bgp_local_as | default('65001') }}"
-    bgp_router_id: "{{ vault_bgp_router_id | default(ansible_host) }}"
-    bgp_neighbors:
-      - peer_ip: "10.255.0.2"
-        remote_as: "65002"
-        description: "PEER-DC-EAST"
-        update_source: "Loopback0"
-      - peer_ip: "10.255.0.6"
-        remote_as: "65003"
-        description: "PEER-DC-WEST"
-        update_source: "Loopback0"
-    bgp_networks:
-      - prefix: "192.168.100.0"
-        mask: "255.255.255.0"
-      - prefix: "192.168.200.0"
-        mask: "255.255.255.0"
+    qos_dscp_classes:
+      - name: VOICE
+        dscp_values: [ef]
+        bandwidth_percent: 30
+        priority: true
+      - name: VIDEO
+        dscp_values: [af41, af42, af43]
+        bandwidth_percent: 20
+        priority: false
+      - name: BUSINESS_CRITICAL
+        dscp_values: [af31, af32, af33]
+        bandwidth_percent: 15
+        priority: false
+    policy_map_name: WAN-EGRESS-POLICY
+    target_interfaces:
+      - GigabitEthernet0/0/1
+      - GigabitEthernet0/0/2
+    qos_verify_retries: 3
+    qos_verify_delay: 5
 
   tasks:
-    - name: Verify device is reachable and IOS version is readable
-      cisco.ios.ios_command:
-        commands:
-          - show version | include IOS
-      register: ios_version_check
-      retries: 3
-      delay: 5
-      until: ios_version_check is not failed
-
-    - name: Display device software version
-      ansible.builtin.debug:
-        msg: "{{ inventory_hostname }}: {{ ios_version_check.stdout[0] | trim }}"
-
-    - block:
-        - name: Configure BGP process, router-id, and global attributes
+    - name: Build and apply QoS class-maps
+      block:
+        - name: Configure DSCP-based class-maps
           cisco.ios.ios_config:
             lines:
-              - "router bgp {{ bgp_local_as }}"
-              - " bgp router-id {{ bgp_router_id }}"
-              - " bgp log-neighbor-changes"
-              - " no auto-summary"
-
-        - name: Configure BGP neighbor relationships
-          cisco.ios.ios_config:
-            parents: "router bgp {{ bgp_local_as }}"
-            lines:
-              - "neighbor {{ item.peer_ip }} remote-as {{ item.remote_as }}"
-              - "neighbor {{ item.peer_ip }} description {{ item.description }}"
-              - "neighbor {{ item.peer_ip }} update-source {{ item.update_source }}"
-              - "neighbor {{ item.peer_ip }} send-community both"
-          loop: "{{ bgp_neighbors }}"
+              - "class-map match-any {{ item.name }}"
+              - "{% for dscp in item.dscp_values %} match dscp {{ dscp }}{% endfor %}"
+          loop: "{{ qos_dscp_classes }}"
           loop_control:
-            label: "{{ item.peer_ip }} AS{{ item.remote_as }}"
+            label: "{{ item.name }}"
+          register: classmap_result
+          retries: 2
+          delay: 3
+          until: classmap_result is not failed
 
-        - name: Advertise local networks into BGP
+        - name: Build policy-map with bandwidth allocations
           cisco.ios.ios_config:
-            parents: "router bgp {{ bgp_local_as }}"
+            parents: "policy-map {{ policy_map_name }}"
+            lines: >-
+              {% set lines = [] %}
+              {% for cls in qos_dscp_classes %}
+              {% set _ = lines.append('class ' + cls.name) %}
+              {% if cls.priority %}
+              {% set _ = lines.append(' priority percent ' + cls.bandwidth_percent | string) %}
+              {% else %}
+              {% set _ = lines.append(' bandwidth percent ' + cls.bandwidth_percent | string) %}
+              {% endif %}
+              {% endfor %}
+              {{ lines }}
+          register: policymap_result
+
+        - name: Apply service-policy to WAN-facing interfaces
+          cisco.ios.ios_config:
+            parents: "interface {{ item }}"
             lines:
-              - "network {{ item.prefix }} mask {{ item.mask }}"
-          loop: "{{ bgp_networks }}"
-          loop_control:
-            label: "{{ item.prefix }}"
-
-        - name: Save running configuration to NVRAM
-          cisco.ios.ios_config:
-            save_when: changed
+              - "service-policy output {{ policy_map_name }}"
+          loop: "{{ target_interfaces }}"
+          register: service_policy_result
+          retries: 2
+          delay: 3
+          until: service_policy_result is not failed
 
       rescue:
-        - name: Report BGP configuration failure
+        - name: Log QoS deployment failure
           ansible.builtin.debug:
             msg: >
-              BGP config failed on {{ inventory_hostname }}.
-              Review with: show run | section router bgp
+              QoS deployment failed on {{ inventory_hostname }}.
+              Class-map result: {{ classmap_result | default('not reached') }}.
+              Policy-map result: {{ policymap_result | default('not reached') }}.
+          failed_when: true
 
-        - name: Abort play with descriptive message
-          ansible.builtin.fail:
-            msg: "BGP configuration on {{ inventory_hostname }} failed — manual remediation required."
-
-    - name: Verify BGP neighbor sessions are established
+    - name: Verify policy-map is active on interfaces
       cisco.ios.ios_command:
         commands:
-          - show bgp summary
-        wait_for:
-          - result[0] contains "Neighbor"
-      register: bgp_summary
-      retries: 2
-      delay: 15
-      failed_when: bgp_summary.failed and bgp_summary.attempts == 2
+          - "show policy-map interface {{ item }}"
+      loop: "{{ target_interfaces }}"
+      register: verify_output
+      retries: "{{ qos_verify_retries }}"
+      delay: "{{ qos_verify_delay }}"
+      until: verify_output.stdout[0] is search(policy_map_name)
+      failed_when: >
+        verify_output.stdout[0] is not search(policy_map_name)
 
-    - name: Display BGP neighbor summary
+    - name: Display QoS counters per interface
       ansible.builtin.debug:
-        var: bgp_summary.stdout_lines
+        msg: |
+          Interface: {{ item.item }}
+          Policy output:
+          {{ item.stdout[0] }}
+      loop: "{{ verify_output.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Capture running QoS config for audit
+      cisco.ios.ios_command:
+        commands:
+          - "show running-config | section policy-map|class-map|service-policy"
+      register: qos_audit_output
+
+    - name: Display QoS audit summary
+      ansible.builtin.debug:
+        msg: "QoS config on {{ inventory_hostname }}:\n{{ qos_audit_output.stdout[0] }}
