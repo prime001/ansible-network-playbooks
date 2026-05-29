@@ -1,109 +1,128 @@
+```yaml
 ---
-# ospf_config.yml
-# Deploys OSPF process, network statements, and interface roles to Cisco IOS routers
-# Credentials stored in Ansible Vault — encrypt with:
-#   ansible-vault encrypt_string 'secret' --name vault_net_password
+# BGP Neighbor and Route Policy Configuration
+# Configures eBGP peers, inbound/outbound prefix-lists, and max-prefix safety limits
+# on Cisco IOS/IOS-XE edge and core routers.
 #
 # Inventory example:
-# [core_routers]
-# rtr-core-01 ansible_host=10.0.1.1 ospf_router_id=10.0.1.1
-# rtr-core-02 ansible_host=10.0.1.2 ospf_router_id=10.0.1.2
+#   [bgp_routers]
+#   edge-rtr-01 ansible_host=10.0.1.1
+#   edge-rtr-02 ansible_host=10.0.1.2
 #
-# [core_routers:vars]
-# ansible_network_os=ios
-# ansible_connection=network_cli
-# ansible_user={{ vault_net_username }}
-# ansible_password={{ vault_net_password }}
-# ansible_become=yes
-# ansible_become_method=enable
-# ansible_become_password={{ vault_enable_password }}
+#   [bgp_routers:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_net_user }}
+#   ansible_password={{ vault_net_password }}
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_enable_password }}
+#
+# Run: ansible-playbook bgp_neighbor_config.yml -i inventory/network.yml --ask-vault-pass
 
-- name: Deploy OSPF routing configuration to IOS core routers
-  hosts: core_routers
+- name: Configure eBGP neighbors and route policy on Cisco IOS
+  hosts: bgp_routers
   gather_facts: false
+
   vars:
-    ospf_process_id: 1
-    # Per-host ospf_router_id set in inventory or host_vars
-    ospf_reference_bandwidth: 10000
-    ospf_networks:
-      - { prefix: 10.0.0.0,   wildcard: 0.0.255.255, area: 0 }
-      - { prefix: 192.168.0.0, wildcard: 0.0.0.255,  area: 1 }
-    ospf_active_interfaces:
-      - GigabitEthernet0/0
-      - GigabitEthernet0/1
-    max_retries: 3
+    bgp_asn: "{{ vault_bgp_asn | default('65000') }}"
+    bgp_router_id: "{{ ansible_host }}"
+    max_prefixes: 1000
+    max_prefixes_warning_pct: 80
+    bgp_peers:
+      - neighbor_ip: "{{ vault_peer1_ip | default('203.0.113.2') }}"
+        remote_asn: "{{ vault_peer1_asn | default('65001') }}"
+        description: "Transit Provider A"
+        prefix_list_in: "TRANSIT-A-IN"
+        prefix_list_out: "ADVERTISE-OUT"
+      - neighbor_ip: "{{ vault_peer2_ip | default('198.51.100.6') }}"
+        remote_asn: "{{ vault_peer2_asn | default('65002') }}"
+        description: "Transit Provider B"
+        prefix_list_in: "TRANSIT-B-IN"
+        prefix_list_out: "ADVERTISE-OUT"
 
   tasks:
-    - name: Verify device is reachable before making changes
-      cisco.ios.ios_command:
-        commands: show clock
-      register: reachability_check
-      retries: "{{ max_retries }}"
-      delay: 5
-      until: reachability_check is not failed
-
-    - name: Configure OSPF process
-      block:
-        - name: Set OSPF global parameters — router-id, bandwidth, passive-interface default
-          cisco.ios.ios_config:
-            lines:
-              - "router-id {{ ospf_router_id }}"
-              - "auto-cost reference-bandwidth {{ ospf_reference_bandwidth }}"
-              - "passive-interface default"
-            parents: "router ospf {{ ospf_process_id }}"
-          register: ospf_global_result
-
-        - name: Add OSPF network statements per area
-          cisco.ios.ios_config:
-            lines:
-              - "network {{ item.prefix }} {{ item.wildcard }} area {{ item.area }}"
-            parents: "router ospf {{ ospf_process_id }}"
-          loop: "{{ ospf_networks }}"
-          register: ospf_networks_result
-
-        - name: Activate OSPF on transit interfaces (override passive-interface default)
-          cisco.ios.ios_config:
-            lines:
-              - "no passive-interface {{ item }}"
-            parents: "router ospf {{ ospf_process_id }}"
-          loop: "{{ ospf_active_interfaces }}"
-          register: ospf_interfaces_result
-
-      rescue:
-        - name: Report configuration failure
-          ansible.builtin.debug:
-            msg: "OSPF configuration failed on {{ inventory_hostname }} — review device logs before retrying"
-
-        - name: Abort play with descriptive error
-          ansible.builtin.fail:
-            msg: "Halting OSPF deployment on {{ inventory_hostname }} due to configuration error in block"
-
-    - name: Wait for OSPF adjacencies to reach FULL state (up to 60s)
-      cisco.ios.ios_command:
-        commands: show ip ospf neighbor
-      register: ospf_neighbors
-      retries: 6
-      delay: 10
-      until: "'FULL' in ospf_neighbors.stdout[0]"
-      failed_when: false
-
-    - name: Collect OSPF state for audit record
+    - name: Capture pre-change BGP summary
       cisco.ios.ios_command:
         commands:
-          - show ip ospf
-          - show ip ospf neighbor detail
-          - show ip route ospf
-      register: ospf_audit
+          - show ip bgp summary
+      register: pre_bgp_summary
+      retries: 2
+      delay: 5
+      ignore_errors: true
 
-    - name: Display OSPF adjacency and route summary
+    - name: Display pre-change BGP state
       ansible.builtin.debug:
-        msg: "{{ ospf_audit.stdout_lines }}"
+        msg: "{{ pre_bgp_summary.stdout_lines[0] }}"
+      when: pre_bgp_summary.stdout is defined
 
-    - name: Warn if no OSPF FULL adjacencies found
+    - name: Configure BGP process and neighbors
+      block:
+        - name: Set BGP process, router-id, and global options
+          cisco.ios.ios_config:
+            lines:
+              - "router bgp {{ bgp_asn }}"
+              - " bgp router-id {{ bgp_router_id }}"
+              - " bgp log-neighbor-changes"
+              - " no auto-summary"
+            match: line
+          register: bgp_base_result
+
+        - name: Configure each eBGP neighbor
+          cisco.ios.ios_config:
+            lines:
+              - " neighbor {{ item.neighbor_ip }} remote-as {{ item.remote_asn }}"
+              - " neighbor {{ item.neighbor_ip }} description {{ item.description }}"
+              - " neighbor {{ item.neighbor_ip }} prefix-list {{ item.prefix_list_in }} in"
+              - " neighbor {{ item.neighbor_ip }} prefix-list {{ item.prefix_list_out }} out"
+              - " neighbor {{ item.neighbor_ip }} maximum-prefix {{ max_prefixes }} {{ max_prefixes_warning_pct }} warning-only"
+              - " neighbor {{ item.neighbor_ip }} soft-reconfiguration inbound"
+            parents: "router bgp {{ bgp_asn }}"
+            match: line
+          loop: "{{ bgp_peers }}"
+          loop_control:
+            label: "{{ item.neighbor_ip }} AS{{ item.remote_asn }}"
+          register: peer_results
+
+      rescue:
+        - name: Report configuration failure details
+          ansible.builtin.debug:
+            msg: >
+              BGP config failed on {{ inventory_hostname }}:
+              {{ ansible_failed_result.msg | default('check device connectivity and IOS version') }}
+
+        - name: Halt play for this host
+          ansible.builtin.fail:
+            msg: "BGP neighbor configuration aborted on {{ inventory_hostname }}."
+
+    - name: Verify neighbor sessions (allow time for BGP open)
+      cisco.ios.ios_command:
+        commands:
+          - show ip bgp neighbors | include BGP neighbor|BGP state
+      register: neighbor_state
+      retries: 4
+      delay: 15
+      until: "'Established' in neighbor_state.stdout[0] or neighbor_state.failed"
+      failed_when: false
+
+    - name: Display post-change neighbor states
       ansible.builtin.debug:
-        msg: "WARNING: No FULL OSPF adjacencies on {{ inventory_hostname }} — verify peer config and network statements"
-      when: "'FULL' not in ospf_neighbors.stdout[0]"
+        var: neighbor_state.stdout_lines
 
-    - name: Persist approved configuration to NVRAM
+    - name: Save running config when changes were made
       cisco.ios.ios_config:
-        save_when: changed
+        save_when: modified
+      register: save_result
+      failed_when:
+        - save_result.failed is defined
+        - save_result.failed
+
+    - name: Print configuration summary
+      ansible.builtin.debug:
+        msg:
+          - "Device      : {{ inventory_hostname }}"
+          - "Local ASN   : {{ bgp_asn }}"
+          - "Router-ID   : {{ bgp_router_id }}"
+          - "Peers added : {{ bgp_peers | map(attribute='neighbor_ip') | list | join(', ') }}"
+          - "Config saved: {{ save_result.changed | default(false) }}"
+```
