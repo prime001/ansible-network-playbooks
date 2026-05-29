@@ -1,104 +1,107 @@
-```yaml
 ---
-# Ansible Playbook: Configure Remote Syslog Source Interface and VRF
-# Purpose: Configure the source interface and VRF for remote syslog transmission
-# Supports: Cisco IOS, IOS-XR, NX-OS devices
-# 
-# Inventory Example:
-# [network_devices]
-# router1 ansible_host=192.168.1.1 ansible_network_os=ios ansible_connection=network_cli
-# router2 ansible_host=192.168.1.2 ansible_network_os=iosxr ansible_connection=network_cli
-# switch1 ansible_host=192.168.1.3 ansible_network_os=nxos ansible_connection=network_cli
+# qos_deploy.yml
+# Deploys QoS class-maps, policy-maps, and egress service-policy on Cisco IOS/IOS-XE.
+# Credentials sourced from Ansible Vault — see group_vars/all/vault.yml
+#
+# Inventory example:
+#   [wan_routers]
+#   rtr-core-01 ansible_host=10.0.1.1
+#   rtr-core-02 ansible_host=10.0.1.2
+#
+#   [wan_routers:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user="{{ vault_net_user }}"
+#   ansible_password="{{ vault_net_pass }}"
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_pass="{{ vault_net_enable }}"
 
-- name: Configure Remote Syslog Source Interface and VRF
-  hosts: network_devices
-  gather_facts: no
+- name: Deploy QoS class-maps, policy-map, and service-policy on WAN interfaces
+  hosts: wan_routers
+  gather_facts: false
+  connection: network_cli
+
   vars:
-    # Credentials stored in Ansible Vault: ansible-vault encrypt group_vars/network_devices/vault.yml
-    # Expected vault variables: ansible_user, ansible_password, ansible_become_password
-    syslog_source_interface: "Loopback0"
-    syslog_vrf: "default"
+    net_user: "{{ vault_net_user }}"
+    net_pass: "{{ vault_net_pass }}"
+    net_enable: "{{ vault_net_enable }}"
+
+    qos_classes:
+      - name: VOICE
+        dscp: ef
+        priority_pct: 20
+      - name: VIDEO
+        dscp: af41
+        bandwidth_pct: 30
+      - name: CRITICAL_DATA
+        dscp: af31
+        bandwidth_pct: 25
+
+    policy_name: WAN_EGRESS_POLICY
+    wan_interface: GigabitEthernet0/0/1
 
   tasks:
-    - name: Configure syslog source interface on Cisco IOS
-      cisco.ios.ios_config:
-        lines:
-          - "logging source-interface {{ syslog_source_interface }}"
-        save_when: modified
-      when: ansible_network_os == 'ios'
-      register: ios_result
-      retries: 2
-      delay: 5
-      failed_when:
-        - ios_result is failed
-        - "'invalid' in ios_result.msg | lower"
-      rescue:
-        - name: Handle IOS configuration failure
-          debug:
-            msg: "Failed to configure syslog source on {{ inventory_hostname }}: {{ ios_result.msg }}"
+    - name: Configure QoS class-maps and policy-map
+      block:
+        - name: Apply dscp-matched class-maps
+          cisco.ios.ios_config:
+            lines:
+              - "match dscp {{ item.dscp }}"
+            parents: "class-map match-any {{ item.name }}"
+          loop: "{{ qos_classes }}"
+          register: classmap_result
+          retries: 2
+          delay: 5
+          until: classmap_result is not failed
 
-    - name: Configure syslog source interface on Cisco IOS-XR
-      cisco.iosxr.iosxr_config:
-        lines:
-          - "logging source-interface {{ syslog_source_interface }}"
-        save_when: modified
-      when: ansible_network_os == 'iosxr'
-      register: iosxr_result
-      retries: 2
-      delay: 5
-      rescue:
-        - name: Handle IOS-XR configuration failure
-          debug:
-            msg: "Failed to configure syslog source on {{ inventory_hostname }}"
+        - name: Build policy-map queuing entries
+          cisco.ios.ios_config:
+            lines: >-
+              {{
+                ['class ' + item.name,
+                 '  priority percent ' + (item.priority_pct | string)]
+                if item.priority_pct is defined else
+                ['class ' + item.name,
+                 '  bandwidth percent ' + (item.bandwidth_pct | string)]
+              }}
+            parents: "policy-map {{ policy_name }}"
+          loop: "{{ qos_classes }}"
+          register: policymap_result
+          retries: 2
+          delay: 5
+          until: policymap_result is not failed
 
-    - name: Configure syslog source interface on Cisco NX-OS
-      cisco.nxos.nxos_config:
-        lines:
-          - "logging source-interface {{ syslog_source_interface }}"
-        save_when: modified
-      when: ansible_network_os == 'nxos'
-      register: nxos_result
-      retries: 2
-      delay: 5
-      rescue:
-        - name: Handle NX-OS configuration failure
-          debug:
-            msg: "Failed to configure syslog source on {{ inventory_hostname }}"
+        - name: Attach egress service-policy to WAN interface
+          cisco.ios.ios_config:
+            lines:
+              - "service-policy output {{ policy_name }}"
+            parents: "interface {{ wan_interface }}"
+          register: attach_result
+          failed_when:
+            - attach_result.failed
+            - "'already' not in (attach_result.msg | default(''))"
 
-    - name: Verify syslog source configuration on IOS
+      rescue:
+        - name: Report QoS deployment failure
+          ansible.builtin.debug:
+            msg: "QoS deployment failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
+
+        - name: Abort with actionable message
+          ansible.builtin.fail:
+            msg: "Halting — manual QoS remediation required on {{ inventory_hostname }}"
+
+    - name: Verify service-policy is active on interface
       cisco.ios.ios_command:
         commands:
-          - "show run | include logging source-interface"
-      when: ansible_network_os == 'ios'
-      register: ios_verify
-      failed_when:
-        - "'logging source-interface' not in ios_verify.stdout[0]"
+          - "show policy-map interface {{ wan_interface }}"
+          - "show class-map"
+        wait_for:
+          - "result[0] contains '{{ policy_name }}'"
+      register: qos_verify
+      retries: 3
+      delay: 10
 
-    - name: Verify syslog source configuration on IOS-XR
-      cisco.iosxr.iosxr_command:
-        commands:
-          - "show run | include logging source"
-      when: ansible_network_os == 'iosxr'
-      register: iosxr_verify
-      failed_when:
-        - iosxr_verify.stdout[0] | length == 0
-
-    - name: Verify syslog source configuration on NX-OS
-      cisco.nxos.nxos_command:
-        commands:
-          - "show run | grep 'logging source'"
-      when: ansible_network_os == 'nxos'
-      register: nxos_verify
-
-    - name: Display syslog configuration summary
-      debug:
-        msg: |
-          Syslog Source Interface Configuration Summary
-          =============================================
-          Device: {{ inventory_hostname }}
-          Platform: {{ ansible_network_os }}
-          Source Interface: {{ syslog_source_interface }}
-          VRF: {{ syslog_vrf }}
-          Configuration Applied: {{ 'Success' if (ios_result is succeeded or iosxr_result is succeeded or nxos_result is succeeded) else 'Failed - See rescue blocks' }}
-          Verification Status: {{ 'Passed' if (ios_verify is succeeded or iosxr_verify is succeeded) else 'Check manual config' }}
-```
+    - name: Display QoS verification output
+      ansible.builtin.debug:
+        var: qos_verify.stdout_lines
