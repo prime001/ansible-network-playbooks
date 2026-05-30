@@ -1,121 +1,101 @@
-The ansible-network-playbooks repo isn't local — I'll write the playbook directly based on what's already covered. Since `snmp_config.yml` and `snmp_config_v2.yml` exist, I'll write an SNMPv3 auth+priv configuration playbook, which is distinct from basic community-string SNMP.
-
 ---
-# snmp_v3_config.yml
-# Configures SNMPv3 users with SHA authentication and AES-128 encryption on
-# Cisco IOS. Distinct from snmp_config.yml (v1/v2c communities) — this enforces
-# message integrity, user authentication, and payload privacy per RFC 3414.
+# snmp_trap_config.yml
+# Configures SNMP trap destinations, source-interface binding, and notification
+# categories. Complements snmp_config.yml (community strings / views) by handling
+# trap delivery separately — avoids re-deploying community config on routine
+# trap-receiver changes.
 #
-# Vault usage:
-#   ansible-vault encrypt_string 'AuthP@ss!' --name 'vault_snmp_auth_password'
-#   ansible-vault encrypt_string 'PrivP@ss!' --name 'vault_snmp_priv_password'
+# Usage: ansible-playbook snmp_trap_config.yml -i inventory.ini --vault-id @prompt
 #
 # Inventory example:
-#   [core_switches]
-#   sw-core-01 ansible_host=10.0.1.1
-#   sw-core-02 ansible_host=10.0.1.2
+# [network_devices]
+# core-rtr1  ansible_host=10.0.0.1
+# dist-sw1   ansible_host=10.0.0.2
 #
-#   [core_switches:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user=netadmin
-#   ansible_password={{ vault_device_password }}
-#   ansible_become=yes
-#   ansible_become_method=enable
+# [network_devices:vars]
+# ansible_network_os=ios
+# ansible_connection=network_cli
+# ansible_user={{ vault_net_user }}
+# ansible_password={{ vault_net_password }}
+# ansible_become=yes
+# ansible_become_method=enable
+# ansible_become_password={{ vault_enable_password }}
 
-- name: Configure SNMPv3 auth+priv security on Cisco IOS
-  hosts: "{{ target_hosts | default('core_switches') }}"
+- name: Configure SNMP Trap Destinations and Notification Types
+  hosts: network_devices
   gather_facts: false
   vars:
-    snmp_v3_group: "NETMON_GROUP"
-    snmp_v3_user: "netmon_v3"
-    snmp_auth_proto: "sha"
-    snmp_auth_password: "{{ vault_snmp_auth_password }}"
-    snmp_priv_proto: "aes 128"
-    snmp_priv_password: "{{ vault_snmp_priv_password }}"
-    snmp_trap_host: "10.0.100.50"
-    snmp_location: "DC1-Row3-Rack12"
-    snmp_contact: "noc@example.com"
+    # Credentials sourced from vault — never store plaintext community strings
+    # ansible-vault encrypt_string 'secretstring' --name vault_trap_community
+    trap_community: "{{ vault_trap_community | default('public') }}"
+    trap_receivers:
+      - host: "10.10.50.10"
+        version: "2c"
+      - host: "10.10.50.11"
+        version: "2c"
+    trap_source_interface: "Loopback0"
+    trap_categories:
+      - "snmp linkdown linkup coldstart"
+      - "config"
+      - "envmon"
+      - "syslog"
+    config_retries: 3
+    config_retry_delay: 5
 
   tasks:
-    - name: Apply SNMPv3 configuration block
+    - name: Apply SNMP trap configuration
       block:
-        - name: Create SNMPv3 group with priv security level
+        - name: Configure SNMP trap receiver hosts
           cisco.ios.ios_config:
             lines:
-              - "snmp-server group {{ snmp_v3_group }} v3 priv"
+              - "snmp-server host {{ item.host }} version {{ item.version }} {{ trap_community }}"
             match: line
-          register: group_result
-          retries: 2
-          delay: 5
-          until: group_result is not failed
+          loop: "{{ trap_receivers }}"
+          register: trap_host_result
+          retries: "{{ config_retries }}"
+          delay: "{{ config_retry_delay }}"
+          until: trap_host_result is not failed
 
-        - name: Create SNMPv3 user with SHA auth and AES-128 priv
+        - name: Bind SNMP traps to source interface
           cisco.ios.ios_config:
             lines:
-              - >-
-                snmp-server user {{ snmp_v3_user }} {{ snmp_v3_group }} v3
-                auth {{ snmp_auth_proto }} {{ snmp_auth_password }}
-                priv {{ snmp_priv_proto }} {{ snmp_priv_password }}
-            match: line
-          no_log: true
-          register: user_result
-          retries: 2
-          delay: 5
-          until: user_result is not failed
+              - "snmp-server trap-source {{ trap_source_interface }}"
+          register: trap_source_result
 
-        - name: Set SNMP system location and contact
+        - name: Enable SNMP notification categories
           cisco.ios.ios_config:
             lines:
-              - "snmp-server location {{ snmp_location }}"
-              - "snmp-server contact {{ snmp_contact }}"
-            match: line
+              - "snmp-server enable traps {{ item }}"
+          loop: "{{ trap_categories }}"
 
-        - name: Configure SNMPv3 trap destination
-          cisco.ios.ios_config:
-            lines:
-              - "snmp-server host {{ snmp_trap_host }} traps version 3 priv {{ snmp_v3_user }}"
-            match: line
-          register: trap_result
-          retries: 2
-          delay: 5
-          until: trap_result is not failed
-
-        - name: Enable link-state, config-change, and environment traps
-          cisco.ios.ios_config:
-            lines:
-              - "snmp-server enable traps snmp linkdown linkup authentication"
-              - "snmp-server enable traps config"
-              - "snmp-server enable traps envmon"
-            match: line
+        - name: Verify SNMP trap configuration
+          cisco.ios.ios_command:
+            commands:
+              - "show snmp host"
+              - "show snmp trap"
+          register: snmp_verify
+          failed_when:
+            - snmp_verify.stdout[0] is not defined or snmp_verify.stdout[0] | length == 0
 
       rescue:
         - name: Report configuration failure
           ansible.builtin.debug:
-            msg: "SNMPv3 config failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
+            msg: >
+              SNMP trap config failed on {{ inventory_hostname }}.
+              Failed task: {{ ansible_failed_task.name }}.
+              Error: {{ ansible_failed_result.msg | default('No error detail available') }}
 
-        - name: Halt play on unrecoverable failure
+        - name: Abort play for failed host
           ansible.builtin.fail:
-            msg: "Aborting — SNMPv3 configuration incomplete on {{ inventory_hostname }}"
+            msg: "SNMP trap configuration incomplete on {{ inventory_hostname }} — manual review required."
 
-    - name: Verify SNMPv3 user exists in running config
-      cisco.ios.ios_command:
-        commands:
-          - "show snmp user {{ snmp_v3_user }}"
-      register: snmp_verify
-      failed_when: snmp_v3_user not in snmp_verify.stdout[0]
-
-    - name: Display SNMPv3 user details
+    - name: Display SNMP trap verification summary
       ansible.builtin.debug:
-        msg: "{{ snmp_verify.stdout_lines[0] }}"
-
-    - name: Confirm trap host registration
-      cisco.ios.ios_command:
-        commands:
-          - "show snmp host"
-      register: trap_verify
-      failed_when: snmp_trap_host not in trap_verify.stdout[0]
-
-    - name: Display active SNMP trap hosts
-      ansible.builtin.debug:
-        msg: "{{ trap_verify.stdout_lines[0] }}
+        msg:
+          - "=== {{ inventory_hostname }} SNMP Trap Summary ==="
+          - "Trap receivers : {{ trap_receivers | map(attribute='host') | join(', ') }}"
+          - "Source interface: {{ trap_source_interface }}"
+          - "--- show snmp host ---"
+          - "{{ snmp_verify.stdout[0] }}"
+          - "--- show snmp trap ---"
+          - "{{ snmp_verify.stdout[1] }}
