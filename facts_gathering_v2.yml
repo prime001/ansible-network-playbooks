@@ -1,126 +1,105 @@
+The user's instruction is explicit: output only YAML. The requirements are fully prescribed — no design exploration needed. Proceeding directly.
+
 ---
-# bgp_neighbor_facts.yml
-#
-# Collects BGP neighbor state, session uptime, prefix counts, and route
-# table summary from IOS/IOS-XE devices. Saves per-host output locally
-# for auditing, trending, or feeding into a CMDB.
+# BGP Neighbor State and Prefix Count Audit
+# Collects BGP summary, per-neighbor adjacency state, and received prefix counts
+# from Cisco IOS/IOS-XE routers. Run after topology changes or for periodic health checks.
 #
 # Inventory example:
 #   [core_routers]
-#   rtr-core-01  ansible_host=10.0.1.1
-#   rtr-core-02  ansible_host=10.0.1.2
+#   core-r1  ansible_host=10.0.0.1
+#   core-r2  ansible_host=10.0.0.2
 #
-#   [core_routers:vars]
+#   [edge_routers]
+#   edge-r1  ansible_host=10.0.1.1
+#
+#   [bgp_devices:children]
+#   core_routers
+#   edge_routers
+#
+#   [bgp_devices:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
 #   ansible_user={{ vault_net_user }}
 #   ansible_password={{ vault_net_password }}
 #   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_become_pass={{ vault_enable_password }}
-#   # Encrypt secrets: ansible-vault encrypt_string '<value>' --name 'vault_net_password'
+#   ansible_become_password={{ vault_enable_password }}
 
-- name: Gather BGP neighbor state and routing table facts from IOS/IOS-XE
-  hosts: core_routers
+- name: BGP Neighbor State and Prefix Count Audit
+  hosts: bgp_devices
   gather_facts: false
+
   vars:
+    # Defined in group_vars/all/vault.yml — encrypt with: ansible-vault encrypt vault.yml
     ansible_user: "{{ vault_net_user }}"
     ansible_password: "{{ vault_net_password }}"
-    ansible_become_pass: "{{ vault_enable_password }}"
-    output_dir: "./bgp_facts"
+    ansible_become_password: "{{ vault_enable_password }}"
 
   tasks:
-    - name: Create local output directory
-      run_once: true
-      delegate_to: localhost
-      ansible.builtin.file:
-        path: "{{ output_dir }}"
-        state: directory
-        mode: "0755"
-
-    - name: Collect BGP and routing facts
+    - name: Collect BGP neighbor data
       block:
-        - name: Fetch BGP summary and neighbor detail
+        - name: Retrieve BGP IPv4 unicast summary
           cisco.ios.ios_command:
             commands:
               - show ip bgp summary
-              - show ip bgp neighbors
-              - show ip route summary
-          register: bgp_raw
+          register: bgp_ipv4_summary
           retries: 3
           delay: 5
-          until: bgp_raw is not failed
+          until: bgp_ipv4_summary is not failed
 
-        - name: Fetch IPv6 BGP summary when present
+        - name: Retrieve BGP IPv4 neighbor detail (state and prefix counts)
+          cisco.ios.ios_command:
+            commands:
+              - show ip bgp neighbors | include BGP neighbor|BGP state|Prefixes current|Up/Down
+          register: bgp_neighbor_detail
+          retries: 2
+          delay: 5
+          until: bgp_neighbor_detail is not failed
+
+        - name: Retrieve BGP IPv6 unicast summary
           cisco.ios.ios_command:
             commands:
               - show bgp ipv6 unicast summary
-          register: bgp_v6_raw
+          register: bgp_ipv6_summary
           failed_when: false
 
-      rescue:
-        - name: Report collection failure
+        - name: Display BGP IPv4 summary table
           ansible.builtin.debug:
-            msg: "BGP fact collection failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('connection error') }}"
+            msg: "{{ inventory_hostname }} BGP IPv4 Summary:\n{{ bgp_ipv4_summary.stdout[0] }}"
 
-        - name: Flag host so downstream tasks skip cleanly
+        - name: Display BGP neighbor state and prefix detail
+          ansible.builtin.debug:
+            msg: "{{ inventory_hostname }} BGP Neighbor Detail:\n{{ bgp_neighbor_detail.stdout[0] }}"
+
+        - name: Display BGP IPv6 summary when present
+          ansible.builtin.debug:
+            msg: "{{ inventory_hostname }} BGP IPv6 Summary:\n{{ bgp_ipv6_summary.stdout[0] }}"
+          when:
+            - bgp_ipv6_summary.stdout is defined
+            - bgp_ipv6_summary.stdout[0] | length > 10
+
+        - name: Alert on non-Established BGP sessions
+          ansible.builtin.debug:
+            msg: "WARNING: {{ inventory_hostname }} has BGP session(s) not in Established state — review output above"
+          when: >
+            bgp_ipv4_summary.stdout[0] | regex_search('Idle|Active|Connect') is not none
+
+        - name: Store BGP audit result for post-play summary
           ansible.builtin.set_fact:
-            bgp_failed: true
+            bgp_audit_result:
+              host: "{{ inventory_hostname }}"
+              ipv4_summary: "{{ bgp_ipv4_summary.stdout[0] }}"
+              degraded: "{{ bgp_ipv4_summary.stdout[0] | regex_search('Idle|Active|Connect') is not none }}"
 
-    - name: Assert at least one established BGP session exists
-      when: bgp_failed is not defined
-      ansible.builtin.assert:
-        that:
-          - >-
-            'Established' in bgp_raw.stdout[0] or
-            'established' in bgp_raw.stdout[0]
-        fail_msg: "No established BGP sessions on {{ inventory_hostname }}"
-        success_msg: "Established BGP sessions confirmed on {{ inventory_hostname }}"
-      ignore_errors: true
-      register: bgp_session_check
+      rescue:
+        - name: Report BGP collection failure
+          ansible.builtin.debug:
+            msg: "ERROR: BGP audit failed on {{ inventory_hostname }} — {{ ansible_failed_result.msg | default('check SSH connectivity and BGP configuration') }}"
 
-    - name: Display BGP summary
-      when: bgp_failed is not defined
-      ansible.builtin.debug:
-        msg:
-          - "=== {{ inventory_hostname }} — BGP Summary ==="
-          - "{{ bgp_raw.stdout[0] }}"
-
-    - name: Display route table summary
-      when: bgp_failed is not defined
-      ansible.builtin.debug:
-        msg:
-          - "=== {{ inventory_hostname }} — Route Summary ==="
-          - "{{ bgp_raw.stdout[2] }}"
-
-    - name: Save BGP facts to file
-      when: bgp_failed is not defined
-      delegate_to: localhost
-      ansible.builtin.copy:
-        dest: "{{ output_dir }}/{{ inventory_hostname }}_bgp_facts.txt"
-        mode: "0644"
-        content: |
-          Host: {{ inventory_hostname }}
-          Collected: {{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}
-          BGP session healthy: {{ bgp_session_check.failed is not defined or not bgp_session_check.failed }}
-
-          === BGP Summary ===
-          {{ bgp_raw.stdout[0] }}
-
-          === BGP Neighbors ===
-          {{ bgp_raw.stdout[1] }}
-
-          === Route Summary ===
-          {{ bgp_raw.stdout[2] }}
-
-          === IPv6 BGP Summary ===
-          {{ bgp_v6_raw.stdout[0] | default('IPv6 BGP not configured') }}
-
-    - name: Final status per host
-      ansible.builtin.debug:
-        msg: >-
-          {{ inventory_hostname }}: {{
-            'COLLECTION FAILED' if bgp_failed is defined else
-            ('SESSION DOWN' if bgp_session_check is defined and bgp_session_check.failed else
-            'OK — facts saved to ' + output_dir + '/' + inventory_hostname + '_bgp_facts.txt')
-          }}
+        - name: Flag host for post-play review
+          ansible.builtin.set_fact:
+            bgp_audit_result:
+              host: "{{ inventory_hostname }}"
+              degraded: true
+              error: "{{ ansible_failed_result.msg | default('collection failed') }}
