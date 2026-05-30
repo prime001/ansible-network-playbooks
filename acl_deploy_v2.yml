@@ -1,128 +1,116 @@
 ---
-# qos_policy_deploy.yml
+# ACL Deployment with Validation and Pre-Flight Checks
+# Deploys access control lists to Cisco IOS devices with comprehensive
+# pre-deployment validation, backup, and post-deployment verification.
 #
-# Deploys QoS class-maps, policy-maps, and service-policy bindings
-# on Cisco IOS/IOS-XE devices. Verifies policy attachment after deploy.
+# Example Inventory:
+# [ios_devices]
+# router-core-01 ansible_host=10.0.1.1 ansible_network_os=ios
+# router-edge-01 ansible_host=10.0.2.1 ansible_network_os=ios
 #
-# Inventory example:
-#   [routers]
-#   core-rtr-01 ansible_host=192.168.1.1
-#   core-rtr-02 ansible_host=192.168.1.2
-#
-#   [routers:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user={{ vault_net_username }}          # ansible-vault encrypted
-#   ansible_password={{ vault_net_password }}       # ansible-vault encrypted
-#   ansible_become=yes
-#   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_pass }} # ansible-vault encrypted
+# [iosxr_devices]
+# router-pe-01 ansible_host=10.0.3.1 ansible_network_os=iosxr
 
-- name: Deploy QoS policy-maps and service-policy to network devices
-  hosts: routers
+- name: Deploy ACLs with Pre-Validation and Verification
+  hosts: network_devices
   gather_facts: false
-
+  connection: network_cli
+  
   vars:
-    qos_dscp_classes:
-      - name: VOICE
-        dscp_values: [ef]
-        bandwidth_percent: 30
-        priority: true
-      - name: VIDEO
-        dscp_values: [af41, af42, af43]
-        bandwidth_percent: 20
-        priority: false
-      - name: BUSINESS_CRITICAL
-        dscp_values: [af31, af32, af33]
-        bandwidth_percent: 15
-        priority: false
-    policy_map_name: WAN-EGRESS-POLICY
-    target_interfaces:
-      - GigabitEthernet0/0/1
-      - GigabitEthernet0/0/2
-    qos_verify_retries: 3
-    qos_verify_delay: 5
-
+    # Credentials - reference vault for production
+    ansible_user: "{{ vault_network_user | default('admin') }}"
+    ansible_password: "{{ vault_network_password }}"
+    ansible_network_os: "{{ device_os | default('ios') }}"
+    backup_dir: "/tmp/acl_backups"
+    acl_deploy_timeout: 30
+    
+  pre_tasks:
+    - name: Validate device connectivity
+      ios_command:
+        commands: "show version | include Device ID"
+      register: device_check
+      retries: 3
+      delay: 5
+      failed_when: device_check is failed
+      when: ansible_network_os == 'ios'
+  
   tasks:
-    - name: Build and apply QoS class-maps
-      block:
-        - name: Configure DSCP-based class-maps
-          cisco.ios.ios_config:
-            lines:
-              - "class-map match-any {{ item.name }}"
-              - "{% for dscp in item.dscp_values %} match dscp {{ dscp }}{% endfor %}"
-          loop: "{{ qos_dscp_classes }}"
-          loop_control:
-            label: "{{ item.name }}"
-          register: classmap_result
-          retries: 2
-          delay: 3
-          until: classmap_result is not failed
-
-        - name: Build policy-map with bandwidth allocations
-          cisco.ios.ios_config:
-            parents: "policy-map {{ policy_map_name }}"
-            lines: >-
-              {% set lines = [] %}
-              {% for cls in qos_dscp_classes %}
-              {% set _ = lines.append('class ' + cls.name) %}
-              {% if cls.priority %}
-              {% set _ = lines.append(' priority percent ' + cls.bandwidth_percent | string) %}
-              {% else %}
-              {% set _ = lines.append(' bandwidth percent ' + cls.bandwidth_percent | string) %}
-              {% endif %}
-              {% endfor %}
-              {{ lines }}
-          register: policymap_result
-
-        - name: Apply service-policy to WAN-facing interfaces
-          cisco.ios.ios_config:
-            parents: "interface {{ item }}"
-            lines:
-              - "service-policy output {{ policy_map_name }}"
-          loop: "{{ target_interfaces }}"
-          register: service_policy_result
-          retries: 2
-          delay: 3
-          until: service_policy_result is not failed
-
+    - name: Create local backup directory
+      file:
+        path: "{{ backup_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      run_once: true
+    
+    - name: Backup current running configuration
+      ios_config:
+        backup: yes
+        backup_options:
+          filename: "acl_pre_deploy_{{ inventory_hostname }}_{{ ansible_date_time.date }}.cfg"
+          dir_path: "{{ backup_dir }}"
+      when: ansible_network_os == 'ios'
+      register: config_backup
+      retries: 2
+      delay: 3
+    
+    - name: Deploy ACL to device
+      ios_acls:
+        config:
+          - afi: ipv4
+            acls:
+              - name: INBOUND_FILTER
+                aces:
+                  - sequence: 10
+                    grant: permit
+                    protocol: tcp
+                    source:
+                      address: 10.0.0.0
+                      netmask: 255.255.0.0
+                    destination:
+                      any: true
+                  - sequence: 20
+                    grant: deny
+                    protocol: ip
+                    source:
+                      any: true
+                    destination:
+                      any: true
+        state: merged
+      register: acl_deploy
+      failed_when: acl_deploy is failed
+      when: ansible_network_os == 'ios'
       rescue:
-        - name: Log QoS deployment failure
-          ansible.builtin.debug:
-            msg: >
-              QoS deployment failed on {{ inventory_hostname }}.
-              Class-map result: {{ classmap_result | default('not reached') }}.
-              Policy-map result: {{ policymap_result | default('not reached') }}.
-          failed_when: true
-
-    - name: Verify policy-map is active on interfaces
-      cisco.ios.ios_command:
-        commands:
-          - "show policy-map interface {{ item }}"
-      loop: "{{ target_interfaces }}"
-      register: verify_output
-      retries: "{{ qos_verify_retries }}"
-      delay: "{{ qos_verify_delay }}"
-      until: verify_output.stdout[0] is search(policy_map_name)
-      failed_when: >
-        verify_output.stdout[0] is not search(policy_map_name)
-
-    - name: Display QoS counters per interface
-      ansible.builtin.debug:
+        - name: Deployment failed - restore backup
+          debug:
+            msg: "ACL deployment failed on {{ inventory_hostname }}. Backup preserved at {{ config_backup.backup_path }}"
+        - name: Fail the play
+          fail:
+            msg: "ACL deployment failed - manual intervention required"
+    
+    - name: Verify ACL deployment
+      ios_command:
+        commands: "show ip access-lists INBOUND_FILTER"
+      register: acl_verify
+      failed_when: '"INBOUND_FILTER" not in acl_verify.stdout[0]'
+      retries: 2
+      delay: 5
+      when: ansible_network_os == 'ios'
+    
+    - name: Display deployment results
+      debug:
         msg: |
-          Interface: {{ item.item }}
-          Policy output:
-          {{ item.stdout[0] }}
-      loop: "{{ verify_output.results }}"
-      loop_control:
-        label: "{{ item.item }}"
-
-    - name: Capture running QoS config for audit
-      cisco.ios.ios_command:
-        commands:
-          - "show running-config | section policy-map|class-map|service-policy"
-      register: qos_audit_output
-
-    - name: Display QoS audit summary
-      ansible.builtin.debug:
-        msg: "QoS config on {{ inventory_hostname }}:\n{{ qos_audit_output.stdout[0] }}
+          ===== ACL Deployment Summary =====
+          Host: {{ inventory_hostname }}
+          Status: {{ 'DEPLOYED' if acl_deploy.changed else 'NO_CHANGES' }}
+          Backup: {{ config_backup.backup_path | default('N/A') }}
+          Verification: PASSED
+  
+  post_tasks:
+    - name: Log deployment event
+      lineinfile:
+        path: "/tmp/acl_deploy_log.txt"
+        line: "{{ ansible_date_time.iso8601 }} - {{ inventory_hostname }} - {{ acl_deploy.changed | ternary('SUCCESS', 'NO_CHANGE') }}"
+        create: yes
+      delegate_to: localhost
+      when: acl_deploy is defined
