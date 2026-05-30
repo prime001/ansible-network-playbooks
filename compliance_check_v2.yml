@@ -1,107 +1,124 @@
----
-# BGP Neighbor Configuration and Session Verification
-# Configures iBGP/eBGP peers on IOS routers and validates Established state.
-# Distinct from compliance_check.yml — this actively pushes BGP peer config,
-# not just auditing existing config against policy.
-#
-# Inventory example (inventory/routers.yml):
-#   all:
-#     children:
-#       core_routers:
-#         hosts:
-#           core-rtr-01:
-#             ansible_host: 192.168.1.1
-#             bgp_local_as: 65001
-#           core-rtr-02:
-#             ansible_host: 192.168.1.2
-#             bgp_local_as: 65001
-#         vars:
-#           ansible_network_os: ios
-#           ansible_connection: network_cli
-#           ansible_user: "{{ vault_net_user }}"
-#           ansible_password: "{{ vault_net_password }}"
-#           ansible_become: true
-#           ansible_become_method: enable
-#           ansible_become_password: "{{ vault_enable_password }}"
-#
-# Run: ansible-playbook bgp_neighbors.yml -i inventory/routers.yml --ask-vault-pass
+Here is the complete playbook — paste it directly into `routing_verification.yml` in the repo:
 
-- name: Configure and verify BGP neighbor sessions on IOS routers
-  hosts: core_routers
+```yaml
+---
+# routing_verification.yml
+#
+# Verifies BGP neighbor sessions are Established and confirms expected
+# prefixes are present in the IP routing table. Use as a post-change
+# validation step or scheduled network health check.
+#
+# Credentials: ansible-vault encrypted in group_vars/all/vault.yml
+#   vault_ansible_user: netops
+#   vault_ansible_password: <encrypted>
+#   vault_ansible_become_password: <encrypted>
+#
+# Inventory example:
+#   [core_routers]
+#   core-01  ansible_host=10.0.1.1
+#   core-02  ansible_host=10.0.1.2
+#
+#   [edge_routers]
+#   edge-01  ansible_host=10.0.2.1
+#
+#   [bgp_speakers:children]
+#   core_routers
+#   edge_routers
+#
+#   [bgp_speakers:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_ansible_user }}
+#   ansible_password={{ vault_ansible_password }}
+#   ansible_become=true
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_ansible_become_password }}
+#
+# Usage:
+#   ansible-playbook routing_verification.yml \
+#     -i inventory/network.yml --ask-vault-pass
+
+- name: BGP Neighbor and Routing Table Verification
+  hosts: bgp_speakers
   gather_facts: false
+  connection: network_cli
+
   vars:
-    # Credentials sourced from Ansible Vault — see group_vars/all/vault.yml
-    ansible_user: "{{ vault_net_user }}"
-    ansible_password: "{{ vault_net_password }}"
-    ansible_become_password: "{{ vault_enable_password }}"
-    bgp_local_as: "{{ hostvars[inventory_hostname]['bgp_local_as'] | default(65001) }}"
-    bgp_session_wait_retries: 12
-    bgp_session_wait_interval: 5
-    bgp_neighbors:
-      - peer_ip: 10.255.0.2
-        remote_as: 65001
-        description: "iBGP-to-core-rtr-02"
-        update_source: Loopback0
-      - peer_ip: 203.0.113.1
-        remote_as: 65100
-        description: "eBGP-to-ISP-A"
-        update_source: GigabitEthernet0/0/0
+    # Prefixes every device in this group must carry in its routing table
+    required_routes:
+      - "10.0.0.0/8"
+      - "172.16.0.0/16"
+      - "192.168.0.0/16"
 
   tasks:
-    - name: Apply BGP neighbor configuration
+    - name: Collect BGP and routing data
       block:
-        - name: Configure BGP peers under router bgp process
-          cisco.ios.ios_config:
-            parents: "router bgp {{ bgp_local_as }}"
-            lines:
-              - "neighbor {{ item.peer_ip }} remote-as {{ item.remote_as }}"
-              - "neighbor {{ item.peer_ip }} description {{ item.description }}"
-              - "neighbor {{ item.peer_ip }} update-source {{ item.update_source }}"
-            match: line
-          loop: "{{ bgp_neighbors }}"
-          register: bgp_config_result
-
-        - name: Persist configuration after successful BGP changes
-          cisco.ios.ios_command:
-            commands: "write memory"
-          when: bgp_config_result.changed
-
-      rescue:
-        - name: Collect diagnostic output after config failure
+        - name: Get BGP IPv4 unicast summary
           cisco.ios.ios_command:
             commands:
-              - "show running-config | section router bgp"
-              - "show ip bgp summary"
-          register: bgp_diag
-          ignore_errors: true
+              - show bgp ipv4 unicast summary
+          register: bgp_summary
+          retries: 3
+          delay: 10
+          until: bgp_summary is not failed
 
-        - name: Display diagnostic output
+        - name: Get routing table entries for required prefixes
+          cisco.ios.ios_command:
+            commands:
+              - "show ip route {{ item | regex_replace('/[0-9]+$', '') }}"
+          loop: "{{ required_routes }}"
+          register: route_checks
+          retries: 2
+          delay: 5
+          until: route_checks is not failed
+
+      rescue:
+        - name: Notify on data collection failure
           ansible.builtin.debug:
-            msg: "{{ bgp_diag.stdout_lines | default(['No output collected']) }}"
+            msg: "ALERT: Could not collect routing data from {{ inventory_hostname }}"
 
-        - name: Fail with actionable message
+        - name: Abort for unreachable device
           ansible.builtin.fail:
             msg: >
-              BGP configuration failed on {{ inventory_hostname }} —
-              verify AS number ({{ bgp_local_as }}) and neighbor IP reachability.
+              Data collection failed on {{ inventory_hostname }} after retries.
+              Verify SSH connectivity and enable credentials.
 
-    - name: Wait for BGP sessions to reach Established state
-      cisco.ios.ios_command:
-        commands: "show ip bgp neighbors {{ item.peer_ip }} | include BGP state"
-        wait_for:
-          - "result[0] contains 'BGP state = Established'"
-        retries: "{{ bgp_session_wait_retries }}"
-        interval: "{{ bgp_session_wait_interval }}"
-      loop: "{{ bgp_neighbors }}"
-      register: bgp_session_check
+    - name: Assert no BGP neighbors in Active or Idle state
+      ansible.builtin.assert:
+        that:
+          - "'Active' not in bgp_summary.stdout[0]"
+          - "'Idle'   not in bgp_summary.stdout[0]"
+        fail_msg: "BGP neighbor(s) not Established on {{ inventory_hostname }}"
+        success_msg: "All BGP neighbors Established on {{ inventory_hostname }}"
 
-    - name: Retrieve full BGP summary for reporting
-      cisco.ios.ios_command:
-        commands:
-          - "show ip bgp summary"
-          - "show ip bgp neighbors | include BGP state|Description|remote AS|BGP version"
-      register: bgp_final_report
+    - name: Validate each required prefix is in the routing table
+      ansible.builtin.assert:
+        that:
+          - "'% Network not in table' not in route_checks.results[idx].stdout[0]"
+          - "'% Subnet not in table'  not in route_checks.results[idx].stdout[0]"
+          - "'% Route not found'      not in route_checks.results[idx].stdout[0]"
+        fail_msg: "MISSING: {{ item }} not in routing table on {{ inventory_hostname }}"
+        success_msg: "OK: {{ item }} present on {{ inventory_hostname }}"
+      loop: "{{ required_routes }}"
+      loop_control:
+        index_var: idx
 
-    - name: Display BGP session report
+    - name: Display BGP summary
       ansible.builtin.debug:
-        msg: "BGP summary on {{ inventory_hostname }}:\n{{ bgp_final_report.stdout_lines | join('\n') }}
+        msg: |
+          ===== BGP Summary: {{ inventory_hostname }} =====
+          {{ bgp_summary.stdout[0] }}
+
+    - name: Display route lookup results
+      ansible.builtin.debug:
+        msg: "Route lookup for {{ item.item }} on {{ inventory_hostname }}: found"
+      loop: "{{ route_checks.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+```
+
+**What this covers (not duplicated by existing playbooks):**
+- **BGP session health** — asserts no neighbors in `Active`/`Idle` state using `show bgp ipv4 unicast summary`
+- **Routing table validation** — verifies a configurable list of required prefixes are actually installed, looping `show ip route` per prefix
+- **Error handling** — `block/rescue` catches unreachable devices, `retries/delay/until` handles transient SSH failures, `assert` with `fail_msg`/`success_msg` gives clear pass/fail output
+- **Vault pattern** — credentials referenced via `vault_*` vars with explicit comment pointing to `group_vars/all/vault.yml`
