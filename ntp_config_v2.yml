@@ -1,103 +1,108 @@
 ---
-# bgp_neighbor_config.yml
-# Configures eBGP and iBGP neighbor relationships on Cisco IOS/IOS-XE devices.
-# Supports MD5 authentication, custom timers, and soft-reconfiguration inbound.
+# ntp_auth_config.yml
+# Hardens NTP by enabling MD5 authentication, configuring trusted keys,
+# and binding NTP server associations to authenticated keys on Cisco IOS/IOS-XE.
+# Complements ntp_config.yml (basic server config) with cryptographic peer validation.
+#
+# Credentials: store in Ansible Vault — never in plaintext
+#   ansible-vault create group_vars/all/vault.yml
+#   vault_ntp_auth_key: "your-shared-secret"
+#   vault_net_user: "admin"
+#   vault_net_pass: "password"
+#   vault_enable_pass: "enable-secret"
 #
 # Inventory example:
 #   [core_routers]
-#   rtr-core-01 ansible_host=10.0.1.1
-#   rtr-core-02 ansible_host=10.0.1.2
+#   core-rtr1 ansible_host=10.0.0.1
+#   core-rtr2 ansible_host=10.0.0.2
 #
 #   [core_routers:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_user={{ vault_network_user }}
-#   ansible_password={{ vault_network_password }}
+#   ansible_user={{ vault_net_user }}
+#   ansible_password={{ vault_net_pass }}
 #   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_become_pass={{ vault_enable_password }}
+#   ansible_become_password={{ vault_enable_pass }}
 
-- name: Configure BGP Neighbors on IOS/IOS-XE Devices
+- name: Configure NTP MD5 Authentication on Cisco IOS/IOS-XE
   hosts: core_routers
   gather_facts: false
 
   vars:
-    # Credentials sourced from Ansible Vault — encrypt with: ansible-vault encrypt_string
-    ansible_user: "{{ vault_network_user }}"
-    ansible_password: "{{ vault_network_password }}"
-    ansible_become_pass: "{{ vault_enable_password }}"
-
-    bgp_local_as: "{{ bgp_local_as | default('65001') }}"
-    bgp_neighbors:
-      - peer_ip: "10.0.0.2"
-        remote_as: "65002"
-        description: "eBGP-UPSTREAM-ISP-01"
-        password: "{{ vault_bgp_md5_password }}"
-        keepalive: 30
-        hold: 90
-      - peer_ip: "192.168.1.2"
-        remote_as: "65001"
-        description: "iBGP-CORE-RTR-02"
-        password: "{{ vault_bgp_md5_password }}"
-        keepalive: 60
-        hold: 180
+    ntp_key_id: 1
+    ntp_key_type: md5
+    # vault_ntp_auth_key must be defined in encrypted group_vars/all/vault.yml
+    ntp_key_string: "{{ vault_ntp_auth_key }}"
+    ntp_servers:
+      - address: "10.0.0.100"
+        prefer: true
+      - address: "10.0.0.101"
+        prefer: false
 
   tasks:
-    - name: Confirm BGP process exists before modifying neighbors
-      cisco.ios.ios_command:
-        commands: "show ip bgp summary"
-      register: bgp_pre_check
-      failed_when: false
-
-    - name: Configure BGP neighbors with auth and timers
+    - name: Apply NTP authentication hardening
       block:
-        - name: Push BGP neighbor stanzas
+        - name: Enable NTP authentication and register trusted key
           cisco.ios.ios_config:
             lines:
-              - "neighbor {{ item.peer_ip }} remote-as {{ item.remote_as }}"
-              - "neighbor {{ item.peer_ip }} description {{ item.description }}"
-              - "neighbor {{ item.peer_ip }} password {{ item.password }}"
-              - "neighbor {{ item.peer_ip }} timers {{ item.keepalive }} {{ item.hold }}"
-              - "neighbor {{ item.peer_ip }} soft-reconfiguration inbound"
-              - "neighbor {{ item.peer_ip }} send-community"
-            parents: "router bgp {{ bgp_local_as }}"
-          loop: "{{ bgp_neighbors }}"
-          register: bgp_push_result
+              - ntp authenticate
+              - "ntp authentication-key {{ ntp_key_id }} {{ ntp_key_type }} {{ ntp_key_string }}"
+              - "ntp trusted-key {{ ntp_key_id }}"
+          register: ntp_auth_result
           retries: 2
           delay: 5
-          until: bgp_push_result is not failed
+          until: ntp_auth_result is not failed
 
-        - name: Poll for BGP session establishment
+        - name: Bind NTP server associations to authentication key
+          cisco.ios.ios_config:
+            lines:
+              - "ntp server {{ item.address }} key {{ ntp_key_id }}{{ ' prefer' if item.prefer else '' }}"
+          loop: "{{ ntp_servers }}"
+          register: ntp_server_result
+          failed_when:
+            - ntp_server_result.failed
+            - "'already configured' not in (ntp_server_result.msg | default(''))"
+
+        - name: Retrieve NTP association and status details
           cisco.ios.ios_command:
-            commands: "show ip bgp neighbors {{ item.peer_ip }} | include BGP state"
-          loop: "{{ bgp_neighbors }}"
-          register: bgp_state_poll
-          retries: 6
+            commands:
+              - show ntp associations detail
+              - show ntp status
+          register: ntp_status
+          retries: 3
           delay: 10
-          until: "'Established' in (bgp_state_poll.stdout | join(''))"
-          failed_when: false
+          until: ntp_status is not failed
+
+        - name: Assert authenticated NTP peer is present
+          ansible.builtin.assert:
+            that:
+              - >
+                'authenticated' in ntp_status.stdout[0] | lower
+                or 'auth' in ntp_status.stdout[0] | lower
+            fail_msg: "No authenticated NTP peers found on {{ inventory_hostname }}"
+            success_msg: "NTP authentication verified on {{ inventory_hostname }}"
+
+        - name: Display NTP authentication status
+          ansible.builtin.debug:
+            msg: "{{ ntp_status.stdout_lines }}"
 
       rescue:
-        - name: Collect BGP section from running config for diagnostics
+        - name: Capture current NTP state for diagnostics
           cisco.ios.ios_command:
-            commands: "show running-config | section router bgp"
-          register: bgp_diag
+            commands:
+              - show running-config | include ntp
+              - show ntp associations
+          register: ntp_diag
+          ignore_errors: true
 
-        - name: Log failure context
+        - name: Report failure with diagnostic context
           ansible.builtin.debug:
-            msg: |
-              BGP neighbor config failed on {{ inventory_hostname }}.
-              BGP config snapshot: {{ bgp_diag.stdout[0] }}
+            msg:
+              - "NTP auth configuration FAILED on {{ inventory_hostname }}"
+              - "Error: {{ ansible_failed_result.msg | default('unknown error') }}"
+              - "Current NTP state: {{ ntp_diag.stdout_lines | default([]) }}"
 
-        - name: Abort with actionable message
+        - name: Fail the play for this host
           ansible.builtin.fail:
-            msg: "BGP neighbor configuration failed on {{ inventory_hostname }} — see debug output above"
-
-    - name: Retrieve final BGP summary
-      cisco.ios.ios_command:
-        commands: "show ip bgp summary"
-      register: bgp_final_summary
-
-    - name: Display BGP neighbor table
-      ansible.builtin.debug:
-        msg: "{{ bgp_final_summary.stdout_lines[0] }}
+            msg: "NTP authentication setup failed on {{ inventory_hostname }} — review debug output above
