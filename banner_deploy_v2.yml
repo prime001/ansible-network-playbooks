@@ -1,128 +1,141 @@
-```yaml
 ---
-# BGP Neighbor and Route Policy Configuration
-# Configures eBGP peers, inbound/outbound prefix-lists, and max-prefix safety limits
-# on Cisco IOS/IOS-XE edge and core routers.
+# 135_banner_deploy_multiplatform.yml
+# Deploys MOTD and login banners across heterogeneous platforms (IOS, NX-OS, JunOS)
+# with per-platform conditional tasks and post-deploy verification.
+# Credentials sourced from Ansible Vault — see group_vars/all/vault.yml.
 #
 # Inventory example:
-#   [bgp_routers]
-#   edge-rtr-01 ansible_host=10.0.1.1
-#   edge-rtr-02 ansible_host=10.0.1.2
+#   [cisco_ios]
+#   rtr-core-01 ansible_host=10.0.1.1
+#   rtr-core-02 ansible_host=10.0.1.2
 #
-#   [bgp_routers:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
+#   [cisco_nxos]
+#   sw-dist-01 ansible_host=10.0.2.1
+#
+#   [juniper]
+#   fw-edge-01 ansible_host=10.0.3.1
+#
+#   [network:children]
+#   cisco_ios
+#   cisco_nxos
+#   juniper
+#
+#   [network:vars]
 #   ansible_user={{ vault_net_user }}
 #   ansible_password={{ vault_net_password }}
 #   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_password }}
-#
-# Run: ansible-playbook bgp_neighbor_config.yml -i inventory/network.yml --ask-vault-pass
+#   ansible_become_password={{ vault_net_enable_password }}
 
-- name: Configure eBGP neighbors and route policy on Cisco IOS
-  hosts: bgp_routers
+- name: Deploy MOTD and login banners across multi-vendor network devices
+  hosts: network
   gather_facts: false
+  connection: network_cli
 
   vars:
-    bgp_asn: "{{ vault_bgp_asn | default('65000') }}"
-    bgp_router_id: "{{ ansible_host }}"
-    max_prefixes: 1000
-    max_prefixes_warning_pct: 80
-    bgp_peers:
-      - neighbor_ip: "{{ vault_peer1_ip | default('203.0.113.2') }}"
-        remote_asn: "{{ vault_peer1_asn | default('65001') }}"
-        description: "Transit Provider A"
-        prefix_list_in: "TRANSIT-A-IN"
-        prefix_list_out: "ADVERTISE-OUT"
-      - neighbor_ip: "{{ vault_peer2_ip | default('198.51.100.6') }}"
-        remote_asn: "{{ vault_peer2_asn | default('65002') }}"
-        description: "Transit Provider B"
-        prefix_list_in: "TRANSIT-B-IN"
-        prefix_list_out: "ADVERTISE-OUT"
+    ansible_user: "{{ vault_net_user }}"
+    ansible_password: "{{ vault_net_password }}"
+    ansible_become_password: "{{ vault_net_enable_password }}"
+
+    motd_banner: |
+      ******************************************************************
+      *  AUTHORIZED ACCESS ONLY                                        *
+      *  Unauthorized access is prohibited and will be prosecuted.     *
+      *  All sessions are monitored and logged.                        *
+      ******************************************************************
+    login_banner: |
+      WARNING: This system is restricted to authorized users only.
+      Disconnect immediately if you are not an authorized user.
 
   tasks:
-    - name: Capture pre-change BGP summary
-      cisco.ios.ios_command:
-        commands:
-          - show ip bgp summary
-      register: pre_bgp_summary
-      retries: 2
-      delay: 5
-      ignore_errors: true
-
-    - name: Display pre-change BGP state
-      ansible.builtin.debug:
-        msg: "{{ pre_bgp_summary.stdout_lines[0] }}"
-      when: pre_bgp_summary.stdout is defined
-
-    - name: Configure BGP process and neighbors
+    - name: Deploy banners on Cisco IOS/IOS-XE
       block:
-        - name: Set BGP process, router-id, and global options
-          cisco.ios.ios_config:
-            lines:
-              - "router bgp {{ bgp_asn }}"
-              - " bgp router-id {{ bgp_router_id }}"
-              - " bgp log-neighbor-changes"
-              - " no auto-summary"
-            match: line
-          register: bgp_base_result
+        - name: Set MOTD banner (IOS)
+          cisco.ios.ios_banner:
+            banner: motd
+            text: "{{ motd_banner }}"
+            state: present
+          register: ios_motd
+          retries: 3
+          delay: 5
+          until: ios_motd is not failed
 
-        - name: Configure each eBGP neighbor
-          cisco.ios.ios_config:
-            lines:
-              - " neighbor {{ item.neighbor_ip }} remote-as {{ item.remote_asn }}"
-              - " neighbor {{ item.neighbor_ip }} description {{ item.description }}"
-              - " neighbor {{ item.neighbor_ip }} prefix-list {{ item.prefix_list_in }} in"
-              - " neighbor {{ item.neighbor_ip }} prefix-list {{ item.prefix_list_out }} out"
-              - " neighbor {{ item.neighbor_ip }} maximum-prefix {{ max_prefixes }} {{ max_prefixes_warning_pct }} warning-only"
-              - " neighbor {{ item.neighbor_ip }} soft-reconfiguration inbound"
-            parents: "router bgp {{ bgp_asn }}"
-            match: line
-          loop: "{{ bgp_peers }}"
-          loop_control:
-            label: "{{ item.neighbor_ip }} AS{{ item.remote_asn }}"
-          register: peer_results
+        - name: Set login banner (IOS)
+          cisco.ios.ios_banner:
+            banner: login
+            text: "{{ login_banner }}"
+            state: present
+          register: ios_login
+
+        - name: Verify banners in running config (IOS)
+          cisco.ios.ios_command:
+            commands: show running-config | section banner
+          register: ios_verify
+          failed_when: "'AUTHORIZED ACCESS' not in ios_verify.stdout[0]"
 
       rescue:
-        - name: Report configuration failure details
+        - name: Report IOS banner failure
           ansible.builtin.debug:
-            msg: >
-              BGP config failed on {{ inventory_hostname }}:
-              {{ ansible_failed_result.msg | default('check device connectivity and IOS version') }}
+            msg: "Banner deploy failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown') }}"
 
-        - name: Halt play for this host
-          ansible.builtin.fail:
-            msg: "BGP neighbor configuration aborted on {{ inventory_hostname }}."
+      when: ansible_network_os == 'cisco.ios.ios'
 
-    - name: Verify neighbor sessions (allow time for BGP open)
-      cisco.ios.ios_command:
-        commands:
-          - show ip bgp neighbors | include BGP neighbor|BGP state
-      register: neighbor_state
-      retries: 4
-      delay: 15
-      until: "'Established' in neighbor_state.stdout[0] or neighbor_state.failed"
-      failed_when: false
+    - name: Deploy banners on Cisco NX-OS
+      block:
+        - name: Set MOTD banner (NX-OS)
+          cisco.nxos.nxos_banner:
+            banner: motd
+            text: "{{ motd_banner }}"
+            state: present
+          register: nxos_result
+          retries: 3
+          delay: 5
+          until: nxos_result is not failed
 
-    - name: Display post-change neighbor states
-      ansible.builtin.debug:
-        var: neighbor_state.stdout_lines
+        - name: Verify MOTD banner (NX-OS)
+          cisco.nxos.nxos_command:
+            commands: show banner motd
+          register: nxos_verify
+          failed_when: "'AUTHORIZED ACCESS' not in nxos_verify.stdout[0]"
 
-    - name: Save running config when changes were made
-      cisco.ios.ios_config:
-        save_when: modified
-      register: save_result
-      failed_when:
-        - save_result.failed is defined
-        - save_result.failed
+      rescue:
+        - name: Report NX-OS banner failure
+          ansible.builtin.debug:
+            msg: "Banner deploy failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown') }}"
 
-    - name: Print configuration summary
+      when: ansible_network_os == 'cisco.nxos.nxos'
+
+    - name: Deploy banners on Juniper JunOS
+      block:
+        - name: Set login announcement and message (JunOS)
+          junipernetworks.junos.junos_config:
+            lines:
+              - "set system login announcement \"{{ login_banner | replace('\n', '\\n') }}\""
+              - "set system login message \"{{ motd_banner | replace('\n', '\\n') }}\""
+          register: junos_result
+          retries: 2
+          delay: 10
+          until: junos_result is not failed
+
+        - name: Verify login config (JunOS)
+          junipernetworks.junos.junos_command:
+            commands: show system login
+          register: junos_verify
+          failed_when: junos_verify.stdout | length == 0
+
+      rescue:
+        - name: Report JunOS banner failure
+          ansible.builtin.debug:
+            msg: "Banner deploy failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown') }}"
+
+      when: ansible_network_os == 'junipernetworks.junos.junos'
+
+    - name: Summarize banner deployment results
       ansible.builtin.debug:
         msg:
-          - "Device      : {{ inventory_hostname }}"
-          - "Local ASN   : {{ bgp_asn }}"
-          - "Router-ID   : {{ bgp_router_id }}"
-          - "Peers added : {{ bgp_peers | map(attribute='neighbor_ip') | list | join(', ') }}"
-          - "Config saved: {{ save_result.changed | default(false) }}"
-```
+          - "Host      : {{ inventory_hostname }}"
+          - "Platform  : {{ ansible_network_os | default('unknown') }}"
+          - "MOTD changed (IOS)  : {{ ios_motd.changed | default('N/A') }}"
+          - "Login changed (IOS) : {{ ios_login.changed | default('N/A') }}"
+          - "Changed (NX-OS)     : {{ nxos_result.changed | default('N/A') }}"
+          - "Changed (JunOS)     : {{ junos_result.changed | default('N/A') }}
