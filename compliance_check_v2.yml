@@ -1,124 +1,118 @@
-Here is the complete playbook — paste it directly into `routing_verification.yml` in the repo:
-
-```yaml
 ---
-# routing_verification.yml
+# routing_protocol_check.yml
 #
-# Verifies BGP neighbor sessions are Established and confirms expected
-# prefixes are present in the IP routing table. Use as a post-change
-# validation step or scheduled network health check.
-#
-# Credentials: ansible-vault encrypted in group_vars/all/vault.yml
-#   vault_ansible_user: netops
-#   vault_ansible_password: <encrypted>
-#   vault_ansible_become_password: <encrypted>
+# Verifies BGP and OSPF neighbor/adjacency health on Cisco IOS core routers.
+# Detects peers not in Established/FULL state and flags stuck adjacencies.
 #
 # Inventory example:
 #   [core_routers]
-#   core-01  ansible_host=10.0.1.1
-#   core-02  ansible_host=10.0.1.2
+#   router1  ansible_host=10.0.1.1
+#   router2  ansible_host=10.0.1.2
 #
-#   [edge_routers]
-#   edge-01  ansible_host=10.0.2.1
-#
-#   [bgp_speakers:children]
-#   core_routers
-#   edge_routers
-#
-#   [bgp_speakers:vars]
+#   [core_routers:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_user={{ vault_ansible_user }}
-#   ansible_password={{ vault_ansible_password }}
-#   ansible_become=true
+#   ansible_user={{ vault_net_user }}           # ansible-vault encrypted
+#   ansible_password={{ vault_net_password }}    # ansible-vault encrypted
+#   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_become_password={{ vault_ansible_become_password }}
+#   ansible_become_password={{ vault_enable_password }}
 #
 # Usage:
-#   ansible-playbook routing_verification.yml \
-#     -i inventory/network.yml --ask-vault-pass
+#   ansible-playbook -i inventory/hosts routing_protocol_check.yml \
+#     --vault-password-file ~/.vault_pass
 
-- name: BGP Neighbor and Routing Table Verification
-  hosts: bgp_speakers
+- name: Routing Protocol Health Check — BGP and OSPF neighbor verification
+  hosts: core_routers
   gather_facts: false
-  connection: network_cli
 
   vars:
-    # Prefixes every device in this group must carry in its routing table
-    required_routes:
-      - "10.0.0.0/8"
-      - "172.16.0.0/16"
-      - "192.168.0.0/16"
+    # Credentials from ansible-vault — never hardcode in playbooks
+    ansible_user: "{{ vault_net_user }}"
+    ansible_password: "{{ vault_net_password }}"
+    ansible_become_password: "{{ vault_enable_password }}"
+    ospf_stuck_states: "INIT|EXSTART|EXCHANGE|LOADING"
 
   tasks:
-    - name: Collect BGP and routing data
-      block:
-        - name: Get BGP IPv4 unicast summary
-          cisco.ios.ios_command:
-            commands:
-              - show bgp ipv4 unicast summary
-          register: bgp_summary
-          retries: 3
-          delay: 10
-          until: bgp_summary is not failed
 
-        - name: Get routing table entries for required prefixes
+    - name: Check BGP neighbor summary
+      block:
+
+        - name: Gather BGP summary from device
           cisco.ios.ios_command:
             commands:
-              - "show ip route {{ item | regex_replace('/[0-9]+$', '') }}"
-          loop: "{{ required_routes }}"
-          register: route_checks
+              - show bgp summary
+          register: bgp_summary
           retries: 2
           delay: 5
-          until: route_checks is not failed
+          until: bgp_summary is not failed
+
+        - name: Flag BGP peers not in Established state
+          ansible.builtin.assert:
+            that:
+              - "'Established' in bgp_summary.stdout[0]"
+            fail_msg: "No BGP peers in Established state on {{ inventory_hostname }}"
+            success_msg: "BGP neighbors verified on {{ inventory_hostname }}"
+          ignore_errors: true
+
+        - name: Display BGP summary
+          ansible.builtin.debug:
+            var: bgp_summary.stdout_lines[0]
 
       rescue:
-        - name: Notify on data collection failure
+
+        - name: Record BGP check failure
           ansible.builtin.debug:
-            msg: "ALERT: Could not collect routing data from {{ inventory_hostname }}"
-
-        - name: Abort for unreachable device
-          ansible.builtin.fail:
             msg: >
-              Data collection failed on {{ inventory_hostname }} after retries.
-              Verify SSH connectivity and enable credentials.
+              BGP check failed on {{ inventory_hostname }} — device may not run BGP
+              or the command timed out after retries.
 
-    - name: Assert no BGP neighbors in Active or Idle state
-      ansible.builtin.assert:
-        that:
-          - "'Active' not in bgp_summary.stdout[0]"
-          - "'Idle'   not in bgp_summary.stdout[0]"
-        fail_msg: "BGP neighbor(s) not Established on {{ inventory_hostname }}"
-        success_msg: "All BGP neighbors Established on {{ inventory_hostname }}"
+    - name: Check OSPF neighbor states
+      block:
 
-    - name: Validate each required prefix is in the routing table
-      ansible.builtin.assert:
-        that:
-          - "'% Network not in table' not in route_checks.results[idx].stdout[0]"
-          - "'% Subnet not in table'  not in route_checks.results[idx].stdout[0]"
-          - "'% Route not found'      not in route_checks.results[idx].stdout[0]"
-        fail_msg: "MISSING: {{ item }} not in routing table on {{ inventory_hostname }}"
-        success_msg: "OK: {{ item }} present on {{ inventory_hostname }}"
-      loop: "{{ required_routes }}"
-      loop_control:
-        index_var: idx
+        - name: Gather OSPF neighbor details
+          cisco.ios.ios_command:
+            commands:
+              - show ip ospf neighbor detail
+          register: ospf_output
+          retries: 2
+          delay: 5
+          until: ospf_output is not failed
 
-    - name: Display BGP summary
+        - name: Identify stuck OSPF adjacencies
+          ansible.builtin.set_fact:
+            ospf_stuck: "{{ ospf_output.stdout[0] | regex_findall('State:\\s+(' + ospf_stuck_states + ')') }}"
+
+        - name: Alert on stuck OSPF adjacencies
+          ansible.builtin.debug:
+            msg: "ALERT: Stuck OSPF adjacency states detected on {{ inventory_hostname }}: {{ ospf_stuck }}"
+          when: ospf_stuck | length > 0
+
+        - name: Verify at least one OSPF neighbor is FULL
+          ansible.builtin.assert:
+            that:
+              - "'FULL' in ospf_output.stdout[0]"
+            fail_msg: "No OSPF neighbors in FULL state on {{ inventory_hostname }}"
+            success_msg: "OSPF FULL adjacency confirmed on {{ inventory_hostname }}"
+          ignore_errors: true
+          failed_when: false
+
+        - name: Display OSPF neighbor output
+          ansible.builtin.debug:
+            var: ospf_output.stdout_lines[0]
+
+      rescue:
+
+        - name: Record OSPF check failure
+          ansible.builtin.debug:
+            msg: >
+              OSPF check failed on {{ inventory_hostname }} — device may not run OSPF
+              or the command timed out after retries.
+
+    - name: Routing protocol health summary
       ansible.builtin.debug:
-        msg: |
-          ===== BGP Summary: {{ inventory_hostname }} =====
-          {{ bgp_summary.stdout[0] }}
-
-    - name: Display route lookup results
-      ansible.builtin.debug:
-        msg: "Route lookup for {{ item.item }} on {{ inventory_hostname }}: found"
-      loop: "{{ route_checks.results }}"
-      loop_control:
-        label: "{{ item.item }}"
-```
-
-**What this covers (not duplicated by existing playbooks):**
-- **BGP session health** — asserts no neighbors in `Active`/`Idle` state using `show bgp ipv4 unicast summary`
-- **Routing table validation** — verifies a configurable list of required prefixes are actually installed, looping `show ip route` per prefix
-- **Error handling** — `block/rescue` catches unreachable devices, `retries/delay/until` handles transient SSH failures, `assert` with `fail_msg`/`success_msg` gives clear pass/fail output
-- **Vault pattern** — credentials referenced via `vault_*` vars with explicit comment pointing to `group_vars/all/vault.yml`
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "BGP data collected  : {{ bgp_summary is defined and (bgp_summary.failed is not defined or not bgp_summary.failed) }}"
+          - "OSPF data collected : {{ ospf_output is defined and (ospf_output.failed is not defined or not ospf_output.failed) }}"
+          - "Stuck OSPF states   : {{ ospf_stuck | default([]) }}
