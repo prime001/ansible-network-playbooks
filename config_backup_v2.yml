@@ -1,133 +1,123 @@
 ---
-# ospf_config.yml
-# Configures OSPF routing protocol on Cisco IOS/IOS-XE devices.
-# Manages process ID, router-id, network statements, passive interfaces,
-# and per-interface timers. Verifies neighbor adjacency post-deployment.
+# routing_protocol_verify.yml
 #
-# Credentials: ansible-vault encrypted vars (group_vars/network_devices/vault.yml)
-#   vault_network_user:     SSH username
-#   vault_network_password: SSH password
-#   vault_enable_password:  Enable/become password
+# Verifies OSPF neighbor adjacencies, BGP peer states, and route table
+# counts on Cisco IOS/IOS-XE devices. Run before/after maintenance windows
+# to confirm routing plane health. Saves per-device text reports locally.
 #
 # Inventory example:
 #   [core_routers]
-#   core-rtr-01 ansible_host=10.0.1.1 ospf_router_id=10.0.1.1
-#   core-rtr-02 ansible_host=10.0.1.2 ospf_router_id=10.0.1.2
+#   rtr-core-01  ansible_host=10.0.1.1
+#   rtr-core-02  ansible_host=10.0.1.2
 #
 #   [core_routers:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
+#   ansible_user={{ vault_net_username }}        # ansible-vault encrypted
+#   ansible_password={{ vault_net_password }}    # ansible-vault encrypted
 #   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_user={{ vault_network_user }}
-#   ansible_password={{ vault_network_password }}
 #   ansible_become_password={{ vault_enable_password }}
 
-- name: Configure OSPF routing on Cisco IOS/IOS-XE
+- name: Verify Routing Protocol Adjacencies and Prefix Counts
   hosts: core_routers
   gather_facts: false
-
   vars:
-    ospf_process_id: 1
-    ospf_reference_bandwidth: 1000
-    ospf_networks:
-      - prefix: "10.0.0.0"
-        wildcard: "0.0.0.255"
-        area: 0
-      - prefix: "192.168.100.0"
-        wildcard: "0.0.0.255"
-        area: 1
-    ospf_passive_interfaces:
-      - Loopback0
-      - GigabitEthernet0/2
-    ospf_active_interface: GigabitEthernet0/0
-    ospf_hello_interval: 10
-    ospf_dead_interval: 40
-    ospf_neighbor_wait_retries: 4
-    ospf_neighbor_wait_delay: 20
+    report_dir: "./routing_reports"
+    timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
 
   tasks:
-    - name: Capture pre-change OSPF state
-      cisco.ios.ios_command:
-        commands:
-          - "show ip ospf {{ ospf_process_id }}"
-          - "show ip ospf neighbor"
-      register: ospf_pre_state
-      failed_when: false
+    - name: Ensure local report directory exists
+      delegate_to: localhost
+      run_once: true
+      file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: "0755"
 
-    - name: Display pre-change OSPF state
-      ansible.builtin.debug:
-        msg: "{{ ospf_pre_state.stdout_lines }}"
-
-    - name: Apply OSPF configuration
+    - name: Collect OSPF and route data
       block:
-        - name: Configure OSPF process, router-id, and reference bandwidth
-          cisco.ios.ios_config:
-            lines:
-              - "router-id {{ ospf_router_id | default(ansible_host) }}"
-              - "auto-cost reference-bandwidth {{ ospf_reference_bandwidth }}"
-              - "passive-interface default"
-            parents: "router ospf {{ ospf_process_id }}"
-            save_when: changed
+        - name: Gather OSPF neighbor table and process info
+          cisco.ios.ios_command:
+            commands:
+              - show ip ospf neighbor
+              - show ip ospf
+              - show ip route summary
+          register: ospf_data
+          retries: 3
+          delay: 5
+          until: ospf_data is not failed
 
-        - name: Advertise networks into OSPF
-          cisco.ios.ios_config:
-            lines:
-              - "network {{ item.prefix }} {{ item.wildcard }} area {{ item.area }}"
-            parents: "router ospf {{ ospf_process_id }}"
-            save_when: changed
-          loop: "{{ ospf_networks }}"
-          register: ospf_network_config
-
-        - name: Allow active interfaces through passive-interface default
-          cisco.ios.ios_config:
-            lines:
-              - "no passive-interface {{ item }}"
-            parents: "router ospf {{ ospf_process_id }}"
-            save_when: changed
-          loop: "{{ ospf_passive_interfaces | difference([ospf_active_interface]) }}"
-
-        - name: Set OSPF hello/dead timers on WAN-facing interface
-          cisco.ios.ios_config:
-            lines:
-              - "ip ospf hello-interval {{ ospf_hello_interval }}"
-              - "ip ospf dead-interval {{ ospf_dead_interval }}"
-            parents: "interface {{ ospf_active_interface }}"
-            save_when: changed
+        - name: Gather BGP summary
+          cisco.ios.ios_command:
+            commands:
+              - show ip bgp summary
+          register: bgp_data
+          retries: 3
+          delay: 5
+          until: bgp_data is not failed
+          ignore_errors: true
 
       rescue:
-        - name: Report configuration failure
-          ansible.builtin.debug:
-            msg: >
-              OSPF configuration FAILED on {{ inventory_hostname }}.
-              Error: {{ ansible_failed_result.msg | default('unknown') }}
+        - name: Report collection failure
+          debug:
+            msg: >-
+              Failed to collect routing data from {{ inventory_hostname }}
+              after retries. Verify SSH and enable credentials.
 
-        - name: Abort with failure
-          ansible.builtin.fail:
-            msg: "Halting OSPF deploy on {{ inventory_hostname }} — review connectivity and vault credentials."
+        - name: Abort play for this host
+          fail:
+            msg: "Routing data collection aborted for {{ inventory_hostname }}"
 
-    - name: Wait for OSPF neighbor adjacency to establish
-      cisco.ios.ios_command:
-        commands:
-          - "show ip ospf neighbor"
-      register: ospf_neighbors
-      retries: "{{ ospf_neighbor_wait_retries }}"
-      delay: "{{ ospf_neighbor_wait_delay }}"
-      until: "'FULL' in ospf_neighbors.stdout[0] or 'EXCHANGE' in ospf_neighbors.stdout[0]"
+    - name: Assert at least one OSPF neighbor is FULL
+      assert:
+        that:
+          - "'FULL' in ospf_data.stdout[0] or 'Full' in ospf_data.stdout[0]"
+        fail_msg: "WARNING: No OSPF neighbors in FULL state on {{ inventory_hostname }}"
+        success_msg: "OSPF adjacencies healthy on {{ inventory_hostname }}"
+      when: "'OSPF Routing Process' in ospf_data.stdout[1] or 'ospf' in ospf_data.stdout[1]"
+      register: ospf_health
       failed_when: false
 
-    - name: Collect post-change OSPF and route summary
-      cisco.ios.ios_command:
-        commands:
-          - "show ip ospf neighbor detail"
-          - "show ip route ospf | include O"
-      register: ospf_post_state
+    - name: Display OSPF neighbor and route summary
+      debug:
+        msg:
+          - "=== {{ inventory_hostname }} — OSPF Neighbors ==="
+          - "{{ ospf_data.stdout[0] }}"
+          - "=== Route Summary ==="
+          - "{{ ospf_data.stdout[2] }}"
 
-    - name: Display OSPF neighbor adjacency and learned routes
-      ansible.builtin.debug:
-        msg: "{{ ospf_post_state.stdout_lines }}"
+    - name: Display BGP summary when available
+      debug:
+        msg:
+          - "=== {{ inventory_hostname }} — BGP Summary ==="
+          - "{{ bgp_data.stdout[0] }}"
+      when:
+        - bgp_data is defined
+        - not bgp_data.failed
 
-    - name: Warn if no OSPF adjacencies formed
-      ansible.builtin.debug:
-        msg: "WARNING: No FULL/EXCHANGE neighbors detected on {{ inventory_hostname }} after {{ ospf_neighbor_wait_retries * ospf_neighbor_wait_delay }}s"
-      when: "'FULL' not in ospf_neighbors.stdout[0] and 'EXCHANGE' not in ospf_neighbors.stdout[0]
+    - name: Save routing health report to local disk
+      delegate_to: localhost
+      copy:
+        content: |
+          Routing Health Report
+          Host      : {{ inventory_hostname }}
+          Timestamp : {{ timestamp }}
+
+          === OSPF Neighbor Table ===
+          {{ ospf_data.stdout[0] }}
+
+          === OSPF Process ===
+          {{ ospf_data.stdout[1] }}
+
+          === Route Table Summary ===
+          {{ ospf_data.stdout[2] }}
+
+          {% if bgp_data is defined and not bgp_data.failed %}
+          === BGP Summary ===
+          {{ bgp_data.stdout[0] }}
+          {% endif %}
+
+          === OSPF Health Assert ===
+          {{ ospf_health.msg | default('OSPF check skipped — process not active') }}
+        dest: "{{ report_dir }}/{{ inventory_hostname }}_routing_{{ timestamp }}.txt
