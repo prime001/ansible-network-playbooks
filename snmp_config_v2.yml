@@ -1,101 +1,151 @@
----
-# snmp_trap_config.yml
-# Configures SNMP trap destinations, source-interface binding, and notification
-# categories. Complements snmp_config.yml (community strings / views) by handling
-# trap delivery separately — avoids re-deploying community config on routine
-# trap-receiver changes.
-#
-# Usage: ansible-playbook snmp_trap_config.yml -i inventory.ini --vault-id @prompt
-#
-# Inventory example:
-# [network_devices]
-# core-rtr1  ansible_host=10.0.0.1
-# dist-sw1   ansible_host=10.0.0.2
-#
-# [network_devices:vars]
-# ansible_network_os=ios
-# ansible_connection=network_cli
-# ansible_user={{ vault_net_user }}
-# ansible_password={{ vault_net_password }}
-# ansible_become=yes
-# ansible_become_method=enable
-# ansible_become_password={{ vault_enable_password }}
+Writing the BGP neighbor management playbook now.
 
-- name: Configure SNMP Trap Destinations and Notification Types
-  hosts: network_devices
+```yaml
+---
+# BGP Neighbor Configuration and Validation
+# Configures iBGP/eBGP peers on Cisco IOS devices and validates adjacency state.
+#
+# Inventory example (inventory/network.yml):
+# ---
+# all:
+#   children:
+#     routers:
+#       hosts:
+#         core-rtr-01:
+#           ansible_host: 10.0.0.1
+#           bgp_local_as: 65001
+#           bgp_peers:
+#             - neighbor_ip: 10.0.0.2
+#               remote_as: 65001
+#               description: "iBGP to core-rtr-02"
+#               update_source: Loopback0
+#             - neighbor_ip: 203.0.113.1
+#               remote_as: 65100
+#               description: "eBGP to upstream-isp"
+#               password: "{{ vault_bgp_peer_password }}"
+#         core-rtr-02:
+#           ansible_host: 10.0.0.2
+#           bgp_local_as: 65001
+#           bgp_peers:
+#             - neighbor_ip: 10.0.0.1
+#               remote_as: 65001
+#               description: "iBGP to core-rtr-01"
+#               update_source: Loopback0
+#
+# Credentials stored in Ansible Vault — reference with:
+#   ansible_user: "{{ vault_net_username }}"
+#   ansible_password: "{{ vault_net_password }}"
+#   ansible_become_password: "{{ vault_net_enable_password }}"
+
+- name: Configure and validate BGP neighbors on Cisco IOS
+  hosts: routers
   gather_facts: false
+  connection: network_cli
+
   vars:
-    # Credentials sourced from vault — never store plaintext community strings
-    # ansible-vault encrypt_string 'secretstring' --name vault_trap_community
-    trap_community: "{{ vault_trap_community | default('public') }}"
-    trap_receivers:
-      - host: "10.10.50.10"
-        version: "2c"
-      - host: "10.10.50.11"
-        version: "2c"
-    trap_source_interface: "Loopback0"
-    trap_categories:
-      - "snmp linkdown linkup coldstart"
-      - "config"
-      - "envmon"
-      - "syslog"
-    config_retries: 3
-    config_retry_delay: 5
+    ansible_network_os: ios
+    # Credentials sourced from group_vars/all/vault.yml (ansible-vault encrypted)
+    ansible_user: "{{ vault_net_username }}"
+    ansible_password: "{{ vault_net_password }}"
+    ansible_become: true
+    ansible_become_method: enable
+    ansible_become_password: "{{ vault_net_enable_password }}"
+    bgp_convergence_wait: 30
 
   tasks:
-    - name: Apply SNMP trap configuration
+    - name: Apply BGP neighbor configuration
       block:
-        - name: Configure SNMP trap receiver hosts
+        - name: Configure BGP router process and neighbors
           cisco.ios.ios_config:
             lines:
-              - "snmp-server host {{ item.host }} version {{ item.version }} {{ trap_community }}"
-            match: line
-          loop: "{{ trap_receivers }}"
-          register: trap_host_result
-          retries: "{{ config_retries }}"
-          delay: "{{ config_retry_delay }}"
-          until: trap_host_result is not failed
+              - "router bgp {{ bgp_local_as }}"
+            parents: []
+          register: bgp_process_result
 
-        - name: Bind SNMP traps to source interface
+        - name: Configure each BGP peer
           cisco.ios.ios_config:
-            lines:
-              - "snmp-server trap-source {{ trap_source_interface }}"
-          register: trap_source_result
+            lines: "{{ bgp_peer_config_lines }}"
+            parents: "router bgp {{ bgp_local_as }}"
+          vars:
+            bgp_peer_config_lines: >-
+              {{
+                bgp_peers | map(attribute='neighbor_ip') | map('regex_replace', '^(.*)$',
+                  'neighbor \1 remote-as ' ) | zip(bgp_peers | map(attribute='remote_as'))
+                | map('join') | list
+                + bgp_peers | selectattr('description', 'defined')
+                | map('community.general.dict_to_jinja2', 'neighbor {neighbor_ip} description {description}')
+                | list
+                + bgp_peers | selectattr('update_source', 'defined')
+                | map('community.general.dict_to_jinja2', 'neighbor {neighbor_ip} update-source {update_source}')
+                | list
+                + bgp_peers | selectattr('password', 'defined')
+                | map('community.general.dict_to_jinja2', 'neighbor {neighbor_ip} password {password}')
+                | list
+              }}
+          loop: "{{ bgp_peers }}"
+          loop_control:
+            label: "{{ item.neighbor_ip }} (AS {{ item.remote_as }})"
+          register: bgp_peer_results
 
-        - name: Enable SNMP notification categories
-          cisco.ios.ios_config:
-            lines:
-              - "snmp-server enable traps {{ item }}"
-          loop: "{{ trap_categories }}"
+        - name: Wait for BGP sessions to establish
+          ansible.builtin.pause:
+            seconds: "{{ bgp_convergence_wait }}"
+          when: bgp_peer_results.changed
 
-        - name: Verify SNMP trap configuration
+        - name: Check BGP neighbor summary
           cisco.ios.ios_command:
             commands:
-              - "show snmp host"
-              - "show snmp trap"
-          register: snmp_verify
+              - show bgp summary
+              - show bgp neighbors
+            retries: 3
+            interval: 10
+            wait_for:
+              - result[0] contains "Established"
+          register: bgp_summary
           failed_when:
-            - snmp_verify.stdout[0] is not defined or snmp_verify.stdout[0] | length == 0
+            - bgp_summary.failed is defined
+            - bgp_summary.failed
+
+        - name: Verify each peer reached Established state
+          ansible.builtin.assert:
+            that:
+              - "'Established' in bgp_summary.stdout[0]"
+            fail_msg: "BGP peers have not reached Established state on {{ inventory_hostname }}"
+            success_msg: "All BGP peers are Established on {{ inventory_hostname }}"
 
       rescue:
-        - name: Report configuration failure
+        - name: Capture current BGP state on failure
+          cisco.ios.ios_command:
+            commands:
+              - show bgp summary
+              - show log | include BGP
+          register: bgp_failure_state
+          ignore_errors: true
+
+        - name: Report BGP configuration failure
           ansible.builtin.debug:
-            msg: >
-              SNMP trap config failed on {{ inventory_hostname }}.
-              Failed task: {{ ansible_failed_task.name }}.
-              Error: {{ ansible_failed_result.msg | default('No error detail available') }}
+            msg:
+              - "BGP configuration failed on {{ inventory_hostname }}"
+              - "BGP Summary: {{ bgp_failure_state.stdout[0] | default('unavailable') }}"
+              - "Recent BGP log entries: {{ bgp_failure_state.stdout[1] | default('unavailable') }}"
 
-        - name: Abort play for failed host
+        - name: Fail the play after collecting diagnostics
           ansible.builtin.fail:
-            msg: "SNMP trap configuration incomplete on {{ inventory_hostname }} — manual review required."
+            msg: "BGP neighbor configuration failed on {{ inventory_hostname }} — see debug output above"
 
-    - name: Display SNMP trap verification summary
+    - name: Display BGP neighbor summary
       ansible.builtin.debug:
-        msg:
-          - "=== {{ inventory_hostname }} SNMP Trap Summary ==="
-          - "Trap receivers : {{ trap_receivers | map(attribute='host') | join(', ') }}"
-          - "Source interface: {{ trap_source_interface }}"
-          - "--- show snmp host ---"
-          - "{{ snmp_verify.stdout[0] }}"
-          - "--- show snmp trap ---"
-          - "{{ snmp_verify.stdout[1] }}
+        msg: "{{ bgp_summary.stdout_lines[0] }}"
+
+    - name: Save configuration if changes were made
+      cisco.ios.ios_command:
+        commands:
+          - write memory
+      when: bgp_peer_results.changed
+      register: save_result
+
+    - name: Confirm running config saved
+      ansible.builtin.debug:
+        msg: "Configuration saved on {{ inventory_hostname }}: {{ save_result.stdout[0] | default('no save needed') }}"
+      when: bgp_peer_results.changed
+```
