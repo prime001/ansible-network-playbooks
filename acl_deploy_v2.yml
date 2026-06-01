@@ -1,116 +1,123 @@
+```yaml
 ---
-# ACL Deployment with Validation and Pre-Flight Checks
-# Deploys access control lists to Cisco IOS devices with comprehensive
-# pre-deployment validation, backup, and post-deployment verification.
+# VLAN Configuration and Management Playbook
+# Purpose: Deploy and validate VLAN configurations across Cisco network devices
+# Platforms: Cisco IOS, IOS-XE, NX-OS
 #
-# Example Inventory:
-# [ios_devices]
-# router-core-01 ansible_host=10.0.1.1 ansible_network_os=ios
-# router-edge-01 ansible_host=10.0.2.1 ansible_network_os=ios
+# Inventory Example:
+# [network_switches]
+# core_switch_1 ansible_host=192.168.1.10 ansible_network_os=ios
+# dist_switch_1 ansible_host=192.168.1.20 ansible_network_os=nxos
 #
-# [iosxr_devices]
-# router-pe-01 ansible_host=10.0.3.1 ansible_network_os=iosxr
+# Group Variables (group_vars/network_switches.yml):
+# ansible_user: "{{ vault_network_username }}"
+# ansible_password: "{{ vault_network_password }}"
+# ansible_become_password: "{{ vault_enable_secret }}"
+# ansible_connection: network_cli
+# ansible_become: yes
+# ansible_become_method: enable
 
-- name: Deploy ACLs with Pre-Validation and Verification
-  hosts: network_devices
-  gather_facts: false
-  connection: network_cli
-  
+- name: VLAN Configuration and Management
+  hosts: network_switches
+  gather_facts: no
+
   vars:
-    # Credentials - reference vault for production
-    ansible_user: "{{ vault_network_user | default('admin') }}"
-    ansible_password: "{{ vault_network_password }}"
-    ansible_network_os: "{{ device_os | default('ios') }}"
-    backup_dir: "/tmp/acl_backups"
-    acl_deploy_timeout: 30
-    
-  pre_tasks:
-    - name: Validate device connectivity
-      ios_command:
-        commands: "show version | include Device ID"
-      register: device_check
-      retries: 3
-      delay: 5
-      failed_when: device_check is failed
-      when: ansible_network_os == 'ios'
-  
+    vlans_config:
+      - vlan_id: 10
+        name: Management
+        description: Device Management VLAN
+      - vlan_id: 20
+        name: Production
+        description: Production Workloads VLAN
+      - vlan_id: 30
+        name: Guest
+        description: Guest Access VLAN
+      - vlan_id: 99
+        name: Native
+        description: Native VLAN
+
   tasks:
-    - name: Create local backup directory
-      file:
-        path: "{{ backup_dir }}"
-        state: directory
-        mode: '0755'
-      delegate_to: localhost
-      run_once: true
-    
-    - name: Backup current running configuration
-      ios_config:
-        backup: yes
-        backup_options:
-          filename: "acl_pre_deploy_{{ inventory_hostname }}_{{ ansible_date_time.date }}.cfg"
-          dir_path: "{{ backup_dir }}"
+    - name: Gather device capabilities and version
+      cisco.ios.ios_facts:
+        gather_subset:
+          - min
+          - hardware
+      register: device_facts
+      retries: 3
+      delay: 10
+      until: device_facts is succeeded
       when: ansible_network_os == 'ios'
-      register: config_backup
-      retries: 2
-      delay: 3
-    
-    - name: Deploy ACL to device
-      ios_acls:
-        config:
-          - afi: ipv4
-            acls:
-              - name: INBOUND_FILTER
-                aces:
-                  - sequence: 10
-                    grant: permit
-                    protocol: tcp
-                    source:
-                      address: 10.0.0.0
-                      netmask: 255.255.0.0
-                    destination:
-                      any: true
-                  - sequence: 20
-                    grant: deny
-                    protocol: ip
-                    source:
-                      any: true
-                    destination:
-                      any: true
+
+    - name: Display target device information
+      debug:
+        msg: "Device {{ inventory_hostname }} | OS: {{ device_facts.ansible_facts.ansible_net_version }} | Model: {{ device_facts.ansible_facts.ansible_net_model }}"
+      when: device_facts is succeeded
+
+    - name: Configure VLANs on IOS/IOS-XE devices
+      cisco.ios.ios_vlans:
         state: merged
-      register: acl_deploy
-      failed_when: acl_deploy is failed
-      when: ansible_network_os == 'ios'
-      rescue:
-        - name: Deployment failed - restore backup
-          debug:
-            msg: "ACL deployment failed on {{ inventory_hostname }}. Backup preserved at {{ config_backup.backup_path }}"
-        - name: Fail the play
-          fail:
-            msg: "ACL deployment failed - manual intervention required"
-    
-    - name: Verify ACL deployment
-      ios_command:
-        commands: "show ip access-lists INBOUND_FILTER"
-      register: acl_verify
-      failed_when: '"INBOUND_FILTER" not in acl_verify.stdout[0]'
+        config:
+          - vlan_id: "{{ item.vlan_id }}"
+            name: "{{ item.name }}"
+      loop: "{{ vlans_config }}"
+      register: ios_vlan_changes
       retries: 2
       delay: 5
-      when: ansible_network_os == 'ios'
-    
-    - name: Display deployment results
+      when: ansible_network_os in ['ios', 'iosxe']
+
+    - name: Configure VLANs on NX-OS devices
+      cisco.nxos.nxos_vlans:
+        state: merged
+        config:
+          - vlan_id: "{{ item.vlan_id }}"
+            name: "{{ item.name }}"
+      loop: "{{ vlans_config }}"
+      register: nxos_vlan_changes
+      retries: 2
+      delay: 5
+      when: ansible_network_os == 'nxos'
+
+    - name: Verify VLAN creation on IOS
+      cisco.ios.ios_command:
+        commands:
+          - "show vlan id {{ item.vlan_id }} | include {{ item.name }}"
+      loop: "{{ vlans_config }}"
+      register: vlan_verification
+      changed_when: false
+      failed_when:
+        - vlan_verification is failed
+        - "'not found' in vlan_verification.stdout_lines[0] | default('')"
+      when: ansible_network_os in ['ios', 'iosxe']
+
+    - name: Display VLAN configuration results
       debug:
         msg: |
-          ===== ACL Deployment Summary =====
-          Host: {{ inventory_hostname }}
-          Status: {{ 'DEPLOYED' if acl_deploy.changed else 'NO_CHANGES' }}
-          Backup: {{ config_backup.backup_path | default('N/A') }}
-          Verification: PASSED
-  
-  post_tasks:
-    - name: Log deployment event
-      lineinfile:
-        path: "/tmp/acl_deploy_log.txt"
-        line: "{{ ansible_date_time.iso8601 }} - {{ inventory_hostname }} - {{ acl_deploy.changed | ternary('SUCCESS', 'NO_CHANGE') }}"
-        create: yes
-      delegate_to: localhost
-      when: acl_deploy is defined
+          Device: {{ inventory_hostname }}
+          VLAN ID: {{ item.item.vlan_id }}
+          VLAN Name: {{ item.item.name }}
+          Verification Status: {{ 'OK' if item is succeeded else 'FAILED' }}
+      loop: "{{ vlan_verification.results }}"
+      when: vlan_verification.results is defined
+
+    - name: Save running configuration
+      cisco.ios.ios_config:
+        save_when: always
+      when: ios_vlan_changes is changed and ansible_network_os in ['ios', 'iosxe']
+
+  rescue:
+    - name: Log configuration error
+      debug:
+        msg: "Error on {{ inventory_hostname }} - {{ ansible_failed_task.name }}: {{ ansible_failed_result.msg }}"
+
+    - name: Verify device connectivity after failure
+      cisco.ios.ios_command:
+        commands: "show ip interface brief | include up"
+      register: connectivity_check
+      ignore_errors: yes
+      when: ansible_network_os in ['ios', 'iosxe']
+
+    - name: Display device status
+      debug:
+        msg: "{{ connectivity_check.stdout_lines }}"
+      when: connectivity_check is succeeded
+```
