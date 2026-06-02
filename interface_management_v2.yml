@@ -1,115 +1,124 @@
 ---
-# ospf_config.yml
-# Deploys OSPFv2 process, area assignments, stub areas, MD5 authentication,
-# and passive interfaces on Cisco IOS routers.
+# vlan_management.yml
+# Provisions VLANs and assigns Layer-2 port modes (access + trunk) on Cisco IOS switches.
+# Requires: cisco.ios collection — ansible-galaxy collection install cisco.ios
+# Credentials: store switch and enable passwords via ansible-vault
 #
-# Credentials: ansible-vault encrypted in group_vars/ospf_routers/vault.yml
-#   vault_ansible_user: netadmin
-#   vault_ansible_password: <vault-encrypted>
-#
-# Inventory example (inventory/network.yml):
-# ---
-# all:
-#   children:
-#     ospf_routers:
-#       hosts:
-#         rtr-core-01:
-#           ansible_host: 10.0.1.1
-#           ospf_process_id: 1
-#           ospf_router_id: 1.1.1.1
-#         rtr-branch-01:
-#           ansible_host: 10.0.1.2
-#           ospf_process_id: 1
-#           ospf_router_id: 2.2.2.2
-#       vars:
-#         ansible_network_os: ios
-#         ansible_connection: network_cli
-#         ansible_user: "{{ vault_ansible_user }}"
-#         ansible_password: "{{ vault_ansible_password }}"
+# Inventory example:
+#   [network_switches]
+#   sw-core-01   ansible_host=10.0.1.1
+#   sw-access-01 ansible_host=10.0.1.10
+#   [network_switches:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user=netadmin
+#   ansible_password={{ vault_switch_password }}
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_enable_password }}
 
-- name: Configure OSPFv2 Process, Areas, and Authentication
-  hosts: ospf_routers
+- name: VLAN Provisioning and Layer-2 Port Assignment
+  hosts: network_switches
   gather_facts: false
 
   vars:
-    ospf_areas:
-      - area_id: 0
-        networks:
-          - { address: 10.0.0.0, wildcard: 0.0.0.255 }
-          - { address: 10.0.1.0, wildcard: 0.0.0.255 }
-        authentication: message-digest
-      - area_id: 10
-        networks:
-          - { address: 192.168.10.0, wildcard: 0.0.0.255 }
-        stub: true
-    ospf_passive_interfaces:
-      - Loopback0
-      - GigabitEthernet0/2
+    vlans:
+      - vlan_id: 10
+        name: USERS
+        state: active
+      - vlan_id: 20
+        name: SERVERS
+        state: active
+      - vlan_id: 30
+        name: MANAGEMENT
+        state: active
+      - vlan_id: 99
+        name: NATIVE_TRUNK
+        state: active
+
+    access_ports:
+      - name: GigabitEthernet0/1
+        vlan: 10
+      - name: GigabitEthernet0/2
+        vlan: 20
+      - name: GigabitEthernet0/3
+        vlan: 30
+
+    trunk_ports:
+      - name: GigabitEthernet0/24
+        allowed_vlans: "10,20,30,99"
+        native_vlan: 99
 
   tasks:
-    - name: Deploy OSPFv2 configuration
+    - name: Provision VLANs and port assignments
       block:
-        - name: Apply OSPF process, areas, and passive interfaces
-          ansible.netcommon.cli_config:
-            config: |
-              router ospf {{ ospf_process_id }}
-               router-id {{ ospf_router_id }}
-               {% for area in ospf_areas %}
-               {% if area.stub | default(false) %}
-               area {{ area.area_id }} stub
-               {% endif %}
-               {% if area.authentication is defined %}
-               area {{ area.area_id }} authentication {{ area.authentication }}
-               {% endif %}
-               {% for net in area.networks %}
-               network {{ net.address }} {{ net.wildcard }} area {{ area.area_id }}
-               {% endfor %}
-               {% endfor %}
-               {% for intf in ospf_passive_interfaces %}
-               passive-interface {{ intf }}
-               {% endfor %}
-          register: ospf_push
+        - name: Create and activate VLANs
+          cisco.ios.ios_vlans:
+            config: "{{ vlans }}"
+            state: merged
+          register: vlan_result
+
+        - name: Configure access port VLAN assignments
+          cisco.ios.ios_l2_interfaces:
+            config:
+              - name: "{{ item.name }}"
+                mode: access
+                access:
+                  vlan: "{{ item.vlan }}"
+            state: merged
+          loop: "{{ access_ports }}"
+          register: access_result
+
+        - name: Configure trunk ports with allowed VLANs
+          cisco.ios.ios_l2_interfaces:
+            config:
+              - name: "{{ item.name }}"
+                mode: trunk
+                trunk:
+                  allowed_vlans: "{{ item.allowed_vlans }}"
+                  native_vlan: "{{ item.native_vlan }}"
+            state: merged
+          loop: "{{ trunk_ports }}"
+          register: trunk_result
+
+        - name: Verify VLAN database and trunk state
+          cisco.ios.ios_command:
+            commands:
+              - show vlan brief
+              - show interfaces trunk
+          register: vlan_verify
           retries: 2
-          delay: 5
-          until: ospf_push is not failed
-
-        - name: Verify OSPF neighbor adjacencies
-          ansible.netcommon.cli_command:
-            command: show ip ospf neighbor
-          register: ospf_neighbors
-          retries: 3
-          delay: 10
-          until: ospf_neighbors is not failed
-
-        - name: Collect OSPF process summary
-          ansible.netcommon.cli_command:
-            command: show ip ospf
-          register: ospf_summary
-
-        - name: Display neighbor table
-          ansible.builtin.debug:
-            msg: "{{ ospf_neighbors.stdout_lines }}"
-
-        - name: Warn if no FULL adjacencies detected
-          ansible.builtin.debug:
-            msg: "WARNING: No FULL adjacencies on {{ inventory_hostname }} — verify area IDs, auth keys, and MTU"
-          when: "'FULL' not in ospf_neighbors.stdout"
+          delay: 3
+          until: vlan_verify is not failed
 
       rescue:
-        - name: Pull current OSPF config for diagnostics
-          ansible.netcommon.cli_command:
-            command: show running-config | section router ospf
-          register: ospf_diag
-          failed_when: false
+        - name: Capture VLAN config on failure
+          cisco.ios.ios_command:
+            commands:
+              - show running-config | section vlan
+          register: failure_config
 
-        - name: Log failure with context
+        - name: Report failure with context
           ansible.builtin.debug:
             msg:
-              - "OSPFv2 deployment failed on {{ inventory_hostname }}"
-              - "Existing config: {{ ospf_diag.stdout | default('unavailable') }}"
+              - "VLAN provisioning failed on {{ inventory_hostname }}"
+              - "Current VLAN config: {{ failure_config.stdout[0] }}"
 
-        - name: Abort with descriptive error
+        - name: Abort with clear error
           ansible.builtin.fail:
-            msg: >
-              OSPFv2 configuration failed on {{ inventory_hostname }}.
-              Check for process ID conflicts, mismatched area types, or authentication mismatch.
+            msg: "VLAN provisioning failed on {{ inventory_hostname }} — see rescue output above."
+
+    - name: Display VLAN table and trunk summary
+      ansible.builtin.debug:
+        msg:
+          - "=== {{ inventory_hostname }} ==="
+          - "VLAN table: {{ vlan_verify.stdout[0] }}"
+          - "Trunk interfaces: {{ vlan_verify.stdout[1] }}"
+
+    - name: Assert all target VLANs present in VLAN table
+      ansible.builtin.assert:
+        that:
+          - "item.vlan_id | string in vlan_verify.stdout[0]"
+        fail_msg: "VLAN {{ item.vlan_id }} ({{ item.name }}) missing on {{ inventory_hostname }}"
+        success_msg: "VLAN {{ item.vlan_id }} confirmed active on {{ inventory_hostname }}"
+      loop: "{{ vlans }}
