@@ -1,105 +1,118 @@
-The user's instruction is explicit: output only YAML. The requirements are fully prescribed — no design exploration needed. Proceeding directly.
-
 ---
-# BGP Neighbor State and Prefix Count Audit
-# Collects BGP summary, per-neighbor adjacency state, and received prefix counts
-# from Cisco IOS/IOS-XE routers. Run after topology changes or for periodic health checks.
+# routing_protocol_status.yml
+#
+# Collects BGP peer adjacencies, OSPF neighbor states, and IP route summary
+# from Cisco IOS devices. Complements general facts_gathering by focusing on
+# Layer 3 routing protocol health — useful for pre/post-change validation
+# and periodic network state audits.
+#
+# Credentials: ansible_user, ansible_password, and ansible_become_password
+# must be stored in Ansible Vault.
+# Run: ansible-playbook routing_protocol_status.yml --ask-vault-pass
 #
 # Inventory example:
 #   [core_routers]
-#   core-r1  ansible_host=10.0.0.1
-#   core-r2  ansible_host=10.0.0.2
+#   rtr-core-01 ansible_host=10.0.0.1
+#   rtr-core-02 ansible_host=10.0.0.2
 #
-#   [edge_routers]
-#   edge-r1  ansible_host=10.0.1.1
-#
-#   [bgp_devices:children]
-#   core_routers
-#   edge_routers
-#
-#   [bgp_devices:vars]
+#   [core_routers:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_user={{ vault_net_user }}
+#   ansible_user={{ vault_net_username }}
 #   ansible_password={{ vault_net_password }}
 #   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_password }}
+#   ansible_become_password={{ vault_net_enable_password }}
 
-- name: BGP Neighbor State and Prefix Count Audit
-  hosts: bgp_devices
+- name: Gather routing protocol neighbor status and route summary
+  hosts: core_routers
   gather_facts: false
+  connection: network_cli
 
   vars:
-    # Defined in group_vars/all/vault.yml — encrypt with: ansible-vault encrypt vault.yml
-    ansible_user: "{{ vault_net_user }}"
-    ansible_password: "{{ vault_net_password }}"
-    ansible_become_password: "{{ vault_enable_password }}"
+    output_dir: "./routing_reports"
+    report_timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
 
   tasks:
-    - name: Collect BGP neighbor data
-      block:
-        - name: Retrieve BGP IPv4 unicast summary
-          cisco.ios.ios_command:
-            commands:
-              - show ip bgp summary
-          register: bgp_ipv4_summary
-          retries: 3
-          delay: 5
-          until: bgp_ipv4_summary is not failed
 
-        - name: Retrieve BGP IPv4 neighbor detail (state and prefix counts)
+    - name: Create output directory for routing reports
+      ansible.builtin.file:
+        path: "{{ output_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      run_once: true
+
+    - name: Collect routing protocol state
+      block:
+
+        - name: Get BGP summary
           cisco.ios.ios_command:
             commands:
-              - show ip bgp neighbors | include BGP neighbor|BGP state|Prefixes current|Up/Down
-          register: bgp_neighbor_detail
+              - show bgp all summary
+          register: bgp_summary
           retries: 2
           delay: 5
-          until: bgp_neighbor_detail is not failed
-
-        - name: Retrieve BGP IPv6 unicast summary
-          cisco.ios.ios_command:
-            commands:
-              - show bgp ipv6 unicast summary
-          register: bgp_ipv6_summary
           failed_when: false
 
-        - name: Display BGP IPv4 summary table
-          ansible.builtin.debug:
-            msg: "{{ inventory_hostname }} BGP IPv4 Summary:\n{{ bgp_ipv4_summary.stdout[0] }}"
+        - name: Get OSPF neighbor table
+          cisco.ios.ios_command:
+            commands:
+              - show ip ospf neighbor
+          register: ospf_neighbors
+          retries: 2
+          delay: 5
+          failed_when: false
 
-        - name: Display BGP neighbor state and prefix detail
-          ansible.builtin.debug:
-            msg: "{{ inventory_hostname }} BGP Neighbor Detail:\n{{ bgp_neighbor_detail.stdout[0] }}"
-
-        - name: Display BGP IPv6 summary when present
-          ansible.builtin.debug:
-            msg: "{{ inventory_hostname }} BGP IPv6 Summary:\n{{ bgp_ipv6_summary.stdout[0] }}"
-          when:
-            - bgp_ipv6_summary.stdout is defined
-            - bgp_ipv6_summary.stdout[0] | length > 10
-
-        - name: Alert on non-Established BGP sessions
-          ansible.builtin.debug:
-            msg: "WARNING: {{ inventory_hostname }} has BGP session(s) not in Established state — review output above"
-          when: >
-            bgp_ipv4_summary.stdout[0] | regex_search('Idle|Active|Connect') is not none
-
-        - name: Store BGP audit result for post-play summary
-          ansible.builtin.set_fact:
-            bgp_audit_result:
-              host: "{{ inventory_hostname }}"
-              ipv4_summary: "{{ bgp_ipv4_summary.stdout[0] }}"
-              degraded: "{{ bgp_ipv4_summary.stdout[0] | regex_search('Idle|Active|Connect') is not none }}"
+        - name: Get IP route summary
+          cisco.ios.ios_command:
+            commands:
+              - show ip route summary
+          register: route_summary
+          retries: 2
+          delay: 5
 
       rescue:
-        - name: Report BGP collection failure
-          ansible.builtin.debug:
-            msg: "ERROR: BGP audit failed on {{ inventory_hostname }} — {{ ansible_failed_result.msg | default('check SSH connectivity and BGP configuration') }}"
 
-        - name: Flag host for post-play review
-          ansible.builtin.set_fact:
-            bgp_audit_result:
-              host: "{{ inventory_hostname }}"
-              degraded: true
-              error: "{{ ansible_failed_result.msg | default('collection failed') }}
+        - name: Log collection failure
+          ansible.builtin.debug:
+            msg: >
+              Routing data collection failed for {{ inventory_hostname }}.
+              Verify SSH connectivity, credentials, and that the device is reachable.
+
+        - name: Abort play for unreachable host
+          ansible.builtin.fail:
+            msg: "Aborting routing status collection for {{ inventory_hostname }}"
+
+    - name: Display BGP neighbor summary
+      ansible.builtin.debug:
+        msg: "{{ bgp_summary.stdout_lines | default(['BGP not configured or no peers found']) }}"
+
+    - name: Display OSPF neighbor table
+      ansible.builtin.debug:
+        msg: "{{ ospf_neighbors.stdout_lines | default(['OSPF not configured or no active neighbors']) }}"
+
+    - name: Display IP route summary
+      ansible.builtin.debug:
+        msg: "{{ route_summary.stdout_lines }}"
+
+    - name: Save routing status report to local file
+      ansible.builtin.copy:
+        content: |
+          ============================================================
+          Routing Protocol Status Report
+          Device   : {{ inventory_hostname }} ({{ ansible_host }})
+          Collected: {{ report_timestamp }}
+          ============================================================
+
+          [BGP Summary]
+          {{ bgp_summary.stdout | default('Not configured or unavailable') }}
+
+          [OSPF Neighbors]
+          {{ ospf_neighbors.stdout | default('Not configured or no neighbors') }}
+
+          [IP Route Summary]
+          {{ route_summary.stdout | default('Unavailable') }}
+        dest: "{{ output_dir }}/{{ inventory_hostname }}_routing_{{ report_timestamp }}.txt"
+        mode: '0644'
+      delegate_to: localhost
