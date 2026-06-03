@@ -1,141 +1,123 @@
+Writing a VLAN provisioning playbook — distinct from all existing playbooks in the repo.
+
 ---
-# 135_banner_deploy_multiplatform.yml
-# Deploys MOTD and login banners across heterogeneous platforms (IOS, NX-OS, JunOS)
-# with per-platform conditional tasks and post-deploy verification.
-# Credentials sourced from Ansible Vault — see group_vars/all/vault.yml.
+# vlan_provisioning.yml
+#
+# Provisions and verifies VLANs on Cisco IOS and NX-OS switches.
+# Uses merged state: non-destructive, existing VLANs are preserved.
+#
+# Credentials (use ansible-vault for production):
+#   ansible_user        — vault ref: {{ vault_network_user }}
+#   ansible_password    — vault ref: {{ vault_network_password }}
+#   ansible_become_pass — vault ref: {{ vault_enable_password }}
 #
 # Inventory example:
-#   [cisco_ios]
-#   rtr-core-01 ansible_host=10.0.1.1
-#   rtr-core-02 ansible_host=10.0.1.2
+#   [ios_switches]
+#   sw-access-01  ansible_host=10.0.1.11  ansible_network_os=ios
+#   sw-access-02  ansible_host=10.0.1.12  ansible_network_os=ios
 #
-#   [cisco_nxos]
-#   sw-dist-01 ansible_host=10.0.2.1
+#   [nxos_switches]
+#   sw-dc-01  ansible_host=10.0.2.11  ansible_network_os=nxos
 #
-#   [juniper]
-#   fw-edge-01 ansible_host=10.0.3.1
+#   [campus_switches:children]
+#   ios_switches
+#   nxos_switches
 #
-#   [network:children]
-#   cisco_ios
-#   cisco_nxos
-#   juniper
-#
-#   [network:vars]
-#   ansible_user={{ vault_net_user }}
-#   ansible_password={{ vault_net_password }}
-#   ansible_become=yes
-#   ansible_become_method=enable
-#   ansible_become_password={{ vault_net_enable_password }}
+#   [campus_switches:vars]
+#   ansible_connection=network_cli
+#   ansible_user="{{ vault_network_user }}"
+#   ansible_password="{{ vault_network_password }}"
 
-- name: Deploy MOTD and login banners across multi-vendor network devices
-  hosts: network
+- name: Provision VLANs on campus and data-center switches
+  hosts: campus_switches
   gather_facts: false
-  connection: network_cli
 
   vars:
-    ansible_user: "{{ vault_net_user }}"
-    ansible_password: "{{ vault_net_password }}"
-    ansible_become_password: "{{ vault_net_enable_password }}"
-
-    motd_banner: |
-      ******************************************************************
-      *  AUTHORIZED ACCESS ONLY                                        *
-      *  Unauthorized access is prohibited and will be prosecuted.     *
-      *  All sessions are monitored and logged.                        *
-      ******************************************************************
-    login_banner: |
-      WARNING: This system is restricted to authorized users only.
-      Disconnect immediately if you are not an authorized user.
+    vlans_to_provision:
+      - vlan_id: 10
+        name: USERS
+        state: active
+      - vlan_id: 20
+        name: SERVERS
+        state: active
+      - vlan_id: 30
+        name: MANAGEMENT
+        state: active
+      - vlan_id: 99
+        name: NATIVE_UNUSED
+        state: active
 
   tasks:
-    - name: Deploy banners on Cisco IOS/IOS-XE
+    - name: Verify SSH connectivity before making changes
+      ansible.netcommon.cli_command:
+        command: show version
+      register: connectivity_check
+      retries: 2
+      delay: 5
+      until: connectivity_check is not failed
+
+    - name: Capture pre-change VLAN state (IOS)
+      cisco.ios.ios_vlans:
+        state: gathered
+      register: vlans_before
+      when: ansible_network_os == 'ios'
+
+    - name: Capture pre-change VLAN state (NX-OS)
+      cisco.nxos.nxos_vlans:
+        state: gathered
+      register: vlans_before
+      when: ansible_network_os == 'nxos'
+
+    - name: Apply VLAN configuration
       block:
-        - name: Set MOTD banner (IOS)
-          cisco.ios.ios_banner:
-            banner: motd
-            text: "{{ motd_banner }}"
-            state: present
-          register: ios_motd
-          retries: 3
-          delay: 5
-          until: ios_motd is not failed
 
-        - name: Set login banner (IOS)
-          cisco.ios.ios_banner:
-            banner: login
-            text: "{{ login_banner }}"
-            state: present
-          register: ios_login
+        - name: Provision VLANs (IOS)
+          cisco.ios.ios_vlans:
+            config: "{{ vlans_to_provision }}"
+            state: merged
+          register: vlan_result
+          when: ansible_network_os == 'ios'
 
-        - name: Verify banners in running config (IOS)
-          cisco.ios.ios_command:
-            commands: show running-config | section banner
-          register: ios_verify
-          failed_when: "'AUTHORIZED ACCESS' not in ios_verify.stdout[0]"
+        - name: Provision VLANs (NX-OS)
+          cisco.nxos.nxos_vlans:
+            config: "{{ vlans_to_provision }}"
+            state: merged
+          register: vlan_result
+          when: ansible_network_os == 'nxos'
 
       rescue:
-        - name: Report IOS banner failure
+        - name: Report provisioning failure
           ansible.builtin.debug:
-            msg: "Banner deploy failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown') }}"
+            msg: "VLAN provisioning failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
 
-      when: ansible_network_os == 'cisco.ios.ios'
+        - name: Halt play for failed host
+          ansible.builtin.fail:
+            msg: "Stopping play for {{ inventory_hostname }} — manual intervention required"
 
-    - name: Deploy banners on Cisco NX-OS
-      block:
-        - name: Set MOTD banner (NX-OS)
-          cisco.nxos.nxos_banner:
-            banner: motd
-            text: "{{ motd_banner }}"
-            state: present
-          register: nxos_result
-          retries: 3
-          delay: 5
-          until: nxos_result is not failed
+    - name: Gather post-change VLAN state (IOS)
+      cisco.ios.ios_vlans:
+        state: gathered
+      register: vlans_after
+      when: ansible_network_os == 'ios'
 
-        - name: Verify MOTD banner (NX-OS)
-          cisco.nxos.nxos_command:
-            commands: show banner motd
-          register: nxos_verify
-          failed_when: "'AUTHORIZED ACCESS' not in nxos_verify.stdout[0]"
+    - name: Gather post-change VLAN state (NX-OS)
+      cisco.nxos.nxos_vlans:
+        state: gathered
+      register: vlans_after
+      when: ansible_network_os == 'nxos'
 
-      rescue:
-        - name: Report NX-OS banner failure
-          ansible.builtin.debug:
-            msg: "Banner deploy failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown') }}"
+    - name: Verify each target VLAN is present after provisioning
+      ansible.builtin.assert:
+        that:
+          - vlans_after.gathered | selectattr('vlan_id', 'equalto', item.vlan_id) | list | length > 0
+        fail_msg: "VLAN {{ item.vlan_id }} ({{ item.name }}) missing on {{ inventory_hostname }} after provisioning"
+        success_msg: "VLAN {{ item.vlan_id }} ({{ item.name }}) confirmed on {{ inventory_hostname }}"
+      loop: "{{ vlans_to_provision }}"
 
-      when: ansible_network_os == 'cisco.nxos.nxos'
-
-    - name: Deploy banners on Juniper JunOS
-      block:
-        - name: Set login announcement and message (JunOS)
-          junipernetworks.junos.junos_config:
-            lines:
-              - "set system login announcement \"{{ login_banner | replace('\n', '\\n') }}\""
-              - "set system login message \"{{ motd_banner | replace('\n', '\\n') }}\""
-          register: junos_result
-          retries: 2
-          delay: 10
-          until: junos_result is not failed
-
-        - name: Verify login config (JunOS)
-          junipernetworks.junos.junos_command:
-            commands: show system login
-          register: junos_verify
-          failed_when: junos_verify.stdout | length == 0
-
-      rescue:
-        - name: Report JunOS banner failure
-          ansible.builtin.debug:
-            msg: "Banner deploy failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown') }}"
-
-      when: ansible_network_os == 'junipernetworks.junos.junos'
-
-    - name: Summarize banner deployment results
+    - name: Display provisioning summary
       ansible.builtin.debug:
         msg:
-          - "Host      : {{ inventory_hostname }}"
-          - "Platform  : {{ ansible_network_os | default('unknown') }}"
-          - "MOTD changed (IOS)  : {{ ios_motd.changed | default('N/A') }}"
-          - "Login changed (IOS) : {{ ios_login.changed | default('N/A') }}"
-          - "Changed (NX-OS)     : {{ nxos_result.changed | default('N/A') }}"
-          - "Changed (JunOS)     : {{ junos_result.changed | default('N/A') }}
+          - "Device: {{ inventory_hostname }} ({{ ansible_network_os }})"
+          - "VLANs targeted: {{ vlans_to_provision | map(attribute='vlan_id') | list }}"
+          - "Configuration changed: {{ vlan_result.changed | default(false) }}"
+          - "Commands issued: {{ vlan_result.commands | default([]) }}
