@@ -1,101 +1,122 @@
 ---
-# bgp_neighbor_config.yml
-# Configures BGP neighbors (eBGP/iBGP) on Cisco IOS/IOS-XE routers.
-# Supports MD5 authentication, update-source binding, and soft-reconfiguration.
+# vlan_management.yml
+#
+# Manages the VLAN database on Cisco IOS/IOS-XE switches:
+# creates VLANs, assigns names, and verifies active state.
 #
 # Inventory example:
-#   [core_routers]
-#   rtr-01 ansible_host=10.0.1.1 device_bgp_as=65001 device_router_id=10.255.0.1
-#   rtr-02 ansible_host=10.0.1.2 device_bgp_as=65001 device_router_id=10.255.0.2
+#   [switches]
+#   sw-core-01  ansible_host=10.0.1.1
+#   sw-access-01 ansible_host=10.0.1.2
 #
-#   [core_routers:vars]
+#   [switches:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_user={{ vault_net_user }}          # ansible-vault encrypted
-#   ansible_password={{ vault_net_password }}  # ansible-vault encrypted
-#   ansible_become=true
+#   ansible_user={{ vault_network_user }}
+#   ansible_password={{ vault_network_password }}
+#   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_become_pass={{ vault_enable_pass }} # ansible-vault encrypted
+#   ansible_become_password={{ vault_enable_password }}
 #
-#   device_bgp_neighbors:
-#     - peer_ip: 10.0.0.2
-#       remote_as: 65002
-#       description: "upstream-isp-01"
-#       update_source: Loopback0
-#       soft_reconfig: true
+# Vault usage: ansible-vault encrypt_string 'secret' --name 'vault_network_password'
+# Run: ansible-playbook vlan_management.yml -i inventory/switches.ini --ask-vault-pass
 
-- name: Configure BGP neighbors on Cisco IOS/IOS-XE
-  hosts: core_routers
+- name: VLAN Database Management on Cisco IOS Switches
+  hosts: switches
   gather_facts: false
 
   vars:
-    bgp_local_as: "{{ device_bgp_as }}"
-    bgp_router_id: "{{ device_router_id | default(ansible_host) }}"
-    bgp_neighbors: "{{ device_bgp_neighbors | default([]) }}"
+    ansible_user: "{{ vault_network_user }}"
+    ansible_password: "{{ vault_network_password }}"
+    ansible_become_password: "{{ vault_enable_password }}"
+    vlans:
+      - vlan_id: 10
+        name: CORP_USERS
+      - vlan_id: 20
+        name: CORP_SERVERS
+      - vlan_id: 30
+        name: MANAGEMENT
+      - vlan_id: 40
+        name: GUEST_WIFI
+      - vlan_id: 99
+        name: NATIVE_UNUSED
 
   tasks:
-    - name: Capture pre-change BGP state
+    - name: Capture VLAN database before changes
       cisco.ios.ios_command:
         commands:
-          - show ip bgp summary
-      register: bgp_pre_state
-      failed_when: false
+          - show vlan brief
+      register: vlan_before
+      retries: 3
+      delay: 5
+      until: vlan_before is not failed
 
-    - name: Configure BGP process and neighbors
+    - name: Display pre-change VLAN state
+      ansible.builtin.debug:
+        var: vlan_before.stdout_lines
+
+    - name: Apply VLAN configuration
       block:
-        - name: Apply BGP router-id and base settings
-          cisco.ios.ios_config:
-            lines:
-              - "bgp router-id {{ bgp_router_id }}"
-              - "bgp log-neighbor-changes"
-            parents: "router bgp {{ bgp_local_as }}"
-          register: bgp_base_result
-          retries: 2
-          delay: 5
-          until: bgp_base_result is not failed
+        - name: Create and name VLANs
+          cisco.ios.ios_vlans:
+            config: "{{ vlans }}"
+            state: merged
+          register: vlan_result
 
-        - name: Configure each BGP neighbor
-          cisco.ios.ios_config:
-            lines:
-              - "neighbor {{ item.peer_ip }} remote-as {{ item.remote_as }}"
-              - "neighbor {{ item.peer_ip }} description {{ item.description | default('bgp-peer') }}"
-              - "neighbor {{ item.peer_ip }} update-source {{ item.update_source | default('Loopback0') }}"
-              - "{% if item.soft_reconfig | default(false) %}neighbor {{ item.peer_ip }} soft-reconfiguration inbound{% endif %}"
-            parents: "router bgp {{ bgp_local_as }}"
-          loop: "{{ bgp_neighbors }}"
-          when: bgp_neighbors | length > 0
-          register: neighbor_results
+        - name: Verify each VLAN reached active state
+          cisco.ios.ios_command:
+            commands:
+              - "show vlan id {{ item.vlan_id }}"
+          loop: "{{ vlans }}"
+          register: vlan_verify
+          failed_when: "'active' not in vlan_verify.stdout[0]"
+          loop_control:
+            label: "VLAN {{ item.vlan_id }} - {{ item.name }}"
+
+        - name: Report configuration outcome
+          ansible.builtin.debug:
+            msg: "VLAN {{ item.item.vlan_id }} ({{ item.item.name }}) verified active on {{ inventory_hostname }}"
+          loop: "{{ vlan_verify.results }}"
+          loop_control:
+            label: "VLAN {{ item.item.vlan_id }}"
 
       rescue:
-        - name: Report configuration failure
+        - name: Collect diagnostic state after failure
+          cisco.ios.ios_command:
+            commands:
+              - show vlan brief
+              - show interfaces trunk
+          register: rescue_diag
+
+        - name: Display failure diagnostics
           ansible.builtin.debug:
-            msg: >
-              BGP configuration failed on {{ inventory_hostname }}:
-              {{ ansible_failed_result.msg | default('unknown error') }}
+            msg:
+              - "VLAN config failed on {{ inventory_hostname }}"
+              - "{{ rescue_diag.stdout_lines }}"
 
-        - name: Abort play for this host
+        - name: Abort with descriptive message
           ansible.builtin.fail:
-            msg: "BGP config aborted for {{ inventory_hostname }} — see rescue output above."
+            msg: >
+              VLAN deployment failed on {{ inventory_hostname }}.
+              Failed task: {{ ansible_failed_task.name }}.
+              Error: {{ ansible_failed_result.msg | default('see diagnostics above') }}
 
-    - name: Verify BGP neighbor adjacencies
-      cisco.ios.ios_command:
-        commands:
-          - show ip bgp neighbors | include BGP neighbor|BGP state|remote AS
-      register: bgp_neighbor_detail
-      retries: 3
-      delay: 10
-      until: bgp_neighbor_detail is not failed
+      always:
+        - name: Capture VLAN database after changes
+          cisco.ios.ios_command:
+            commands:
+              - show vlan brief
+          register: vlan_after
 
-    - name: Capture post-change BGP summary
-      cisco.ios.ios_command:
-        commands:
-          - show ip bgp summary
-      register: bgp_post_state
+        - name: Save running config to startup
+          cisco.ios.ios_command:
+            commands:
+              - write memory
+          register: save_result
+          failed_when:
+            - "'OK' not in save_result.stdout[0]"
+            - "'Building configuration' not in save_result.stdout[0]"
 
-    - name: Display BGP summary
-      ansible.builtin.debug:
-        var: bgp_post_state.stdout_lines
-
-    - name: Display neighbor adjacency detail
-      ansible.builtin.debug:
-        var: bgp_neighbor_detail.stdout_lines
+        - name: Confirm save succeeded
+          ansible.builtin.debug:
+            msg: "Configuration saved on {{ inventory_hostname }}: {{ save_result.stdout[0] | trim }}
