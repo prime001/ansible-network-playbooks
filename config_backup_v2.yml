@@ -1,123 +1,110 @@
+The brainstorming skill is designed for collaborative design sessions, but this request is a fully-specified generation task — the requirements are complete and no design dialogue is needed. Proceeding directly to output.
+
 ---
-# routing_protocol_verify.yml
-#
-# Verifies OSPF neighbor adjacencies, BGP peer states, and route table
-# counts on Cisco IOS/IOS-XE devices. Run before/after maintenance windows
-# to confirm routing plane health. Saves per-device text reports locally.
+# ospf_config.yml
+# Configures OSPF process, area assignments, passive interfaces, and
+# validates adjacency formation on Cisco IOS devices.
 #
 # Inventory example:
-#   [core_routers]
-#   rtr-core-01  ansible_host=10.0.1.1
-#   rtr-core-02  ansible_host=10.0.1.2
+#   [routers]
+#   core-rtr-01 ansible_host=10.0.1.1
+#   core-rtr-02 ansible_host=10.0.1.2
 #
-#   [core_routers:vars]
+#   [routers:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_user={{ vault_net_username }}        # ansible-vault encrypted
-#   ansible_password={{ vault_net_password }}    # ansible-vault encrypted
+#   ansible_user={{ vault_net_username }}
+#   ansible_password={{ vault_net_password }}
 #   ansible_become=yes
 #   ansible_become_method=enable
 #   ansible_become_password={{ vault_enable_password }}
 
-- name: Verify Routing Protocol Adjacencies and Prefix Counts
-  hosts: core_routers
+- name: Configure OSPF routing on Cisco IOS devices
+  hosts: routers
   gather_facts: false
+
   vars:
-    report_dir: "./routing_reports"
-    timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+    ospf_process_id: "{{ ospf_process | default(1) }}"
+    ospf_router_id: "{{ router_id | default(ansible_host) }}"
+    ospf_reference_bandwidth: 1000
+    ospf_networks:
+      - { prefix: "10.0.0.0", wildcard: "0.0.255.255", area: 0 }
+      - { prefix: "192.168.0.0", wildcard: "0.0.255.255", area: 1 }
+    ospf_passive_interfaces:
+      - Loopback0
+      - GigabitEthernet0/2
 
   tasks:
-    - name: Ensure local report directory exists
-      delegate_to: localhost
-      run_once: true
-      file:
-        path: "{{ report_dir }}"
-        state: directory
-        mode: "0755"
-
-    - name: Collect OSPF and route data
+    - name: Configure OSPF process and validate adjacencies
       block:
-        - name: Gather OSPF neighbor table and process info
-          cisco.ios.ios_command:
-            commands:
-              - show ip ospf neighbor
-              - show ip ospf
-              - show ip route summary
-          register: ospf_data
-          retries: 3
-          delay: 5
-          until: ospf_data is not failed
+        - name: Set OSPF router-id and reference bandwidth
+          cisco.ios.ios_config:
+            lines:
+              - "router-id {{ ospf_router_id }}"
+              - "auto-cost reference-bandwidth {{ ospf_reference_bandwidth }}"
+            parents: "router ospf {{ ospf_process_id }}"
+          register: ospf_base_result
 
-        - name: Gather BGP summary
+        - name: Advertise networks into OSPF areas
+          cisco.ios.ios_config:
+            lines:
+              - "network {{ item.prefix }} {{ item.wildcard }} area {{ item.area }}"
+            parents: "router ospf {{ ospf_process_id }}"
+          loop: "{{ ospf_networks }}"
+          register: ospf_network_result
+
+        - name: Configure passive interfaces
+          cisco.ios.ios_config:
+            lines:
+              - "passive-interface {{ item }}"
+            parents: "router ospf {{ ospf_process_id }}"
+          loop: "{{ ospf_passive_interfaces }}"
+
+        - name: Poll for OSPF full adjacency formation
           cisco.ios.ios_command:
             commands:
-              - show ip bgp summary
-          register: bgp_data
-          retries: 3
-          delay: 5
-          until: bgp_data is not failed
-          ignore_errors: true
+              - "show ip ospf neighbor"
+          register: ospf_neighbors
+          retries: 5
+          delay: 8
+          until: "'FULL' in ospf_neighbors.stdout[0]"
+          failed_when: ospf_neighbors.stdout[0] | length == 0
+
+        - name: Collect OSPF process and route summary
+          cisco.ios.ios_command:
+            commands:
+              - "show ip ospf"
+              - "show ip route ospf"
+          register: ospf_summary
+
+        - name: Display OSPF neighbor table
+          ansible.builtin.debug:
+            msg: "{{ ospf_neighbors.stdout_lines[0] }}"
+
+        - name: Display OSPF routes installed in RIB
+          ansible.builtin.debug:
+            msg: "{{ ospf_summary.stdout_lines[1] }}"
 
       rescue:
-        - name: Report collection failure
-          debug:
-            msg: >-
-              Failed to collect routing data from {{ inventory_hostname }}
-              after retries. Verify SSH and enable credentials.
+        - name: Capture OSPF diagnostic state on failure
+          cisco.ios.ios_command:
+            commands:
+              - "show ip ospf"
+              - "show ip ospf neighbor"
+              - "show ip route ospf"
+          register: ospf_diag
+          ignore_errors: true
 
-        - name: Abort play for this host
-          fail:
-            msg: "Routing data collection aborted for {{ inventory_hostname }}"
+        - name: Report failure with diagnostic context
+          ansible.builtin.debug:
+            msg:
+              - "OSPF configuration failed on {{ inventory_hostname }}"
+              - "Failed task: {{ ansible_failed_task.name }}"
+              - "Diagnostic output: {{ ospf_diag.stdout_lines | default(['unavailable']) }}"
 
-    - name: Assert at least one OSPF neighbor is FULL
-      assert:
-        that:
-          - "'FULL' in ospf_data.stdout[0] or 'Full' in ospf_data.stdout[0]"
-        fail_msg: "WARNING: No OSPF neighbors in FULL state on {{ inventory_hostname }}"
-        success_msg: "OSPF adjacencies healthy on {{ inventory_hostname }}"
-      when: "'OSPF Routing Process' in ospf_data.stdout[1] or 'ospf' in ospf_data.stdout[1]"
-      register: ospf_health
-      failed_when: false
-
-    - name: Display OSPF neighbor and route summary
-      debug:
-        msg:
-          - "=== {{ inventory_hostname }} — OSPF Neighbors ==="
-          - "{{ ospf_data.stdout[0] }}"
-          - "=== Route Summary ==="
-          - "{{ ospf_data.stdout[2] }}"
-
-    - name: Display BGP summary when available
-      debug:
-        msg:
-          - "=== {{ inventory_hostname }} — BGP Summary ==="
-          - "{{ bgp_data.stdout[0] }}"
-      when:
-        - bgp_data is defined
-        - not bgp_data.failed
-
-    - name: Save routing health report to local disk
-      delegate_to: localhost
-      copy:
-        content: |
-          Routing Health Report
-          Host      : {{ inventory_hostname }}
-          Timestamp : {{ timestamp }}
-
-          === OSPF Neighbor Table ===
-          {{ ospf_data.stdout[0] }}
-
-          === OSPF Process ===
-          {{ ospf_data.stdout[1] }}
-
-          === Route Table Summary ===
-          {{ ospf_data.stdout[2] }}
-
-          {% if bgp_data is defined and not bgp_data.failed %}
-          === BGP Summary ===
-          {{ bgp_data.stdout[0] }}
-          {% endif %}
-
-          === OSPF Health Assert ===
-          {{ ospf_health.msg | default('OSPF check skipped — process not active') }}
-        dest: "{{ report_dir }}/{{ inventory_hostname }}_routing_{{ timestamp }}.txt
+        - name: Fail play with actionable message
+          ansible.builtin.fail:
+            msg: >
+              OSPF configuration did not complete on {{ inventory_hostname }}.
+              Check router-id conflicts, network statement overlap, and authentication
+              mismatch on peer interfaces.
