@@ -1,124 +1,128 @@
 ---
-# vlan_management.yml
-# Provisions VLANs and assigns Layer-2 port modes (access + trunk) on Cisco IOS switches.
-# Requires: cisco.ios collection — ansible-galaxy collection install cisco.ios
-# Credentials: store switch and enable passwords via ansible-vault
+# qos_deploy.yml
+# Deploys QoS class-maps, policy-maps, and egress service-policies on Cisco IOS/IOS-XE devices.
+# Credentials are stored in Ansible Vault — see group_vars/all/vault.yml
 #
 # Inventory example:
-#   [network_switches]
-#   sw-core-01   ansible_host=10.0.1.1
-#   sw-access-01 ansible_host=10.0.1.10
-#   [network_switches:vars]
+#   [wan_edge]
+#   rtr-edge-01 ansible_host=10.0.0.1
+#   rtr-edge-02 ansible_host=10.0.0.2
+#
+#   [wan_edge:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_user=netadmin
-#   ansible_password={{ vault_switch_password }}
+#   ansible_user={{ vault_net_user }}
+#   ansible_password={{ vault_net_password }}
 #   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_password }}
+#   ansible_become_password={{ vault_net_enable_password }}
 
-- name: VLAN Provisioning and Layer-2 Port Assignment
-  hosts: network_switches
+- name: Deploy QoS class-maps, policy-map, and service-policy on WAN edge devices
+  hosts: wan_edge
   gather_facts: false
 
   vars:
-    vlans:
-      - vlan_id: 10
-        name: USERS
-        state: active
-      - vlan_id: 20
-        name: SERVERS
-        state: active
-      - vlan_id: 30
-        name: MANAGEMENT
-        state: active
-      - vlan_id: 99
-        name: NATIVE_TRUNK
-        state: active
+    net_user: "{{ vault_net_user }}"
+    net_password: "{{ vault_net_password }}"
+    net_enable_password: "{{ vault_net_enable_password }}"
 
-    access_ports:
-      - name: GigabitEthernet0/1
-        vlan: 10
-      - name: GigabitEthernet0/2
-        vlan: 20
-      - name: GigabitEthernet0/3
-        vlan: 30
+    policy_name: WAN-EDGE-EGRESS
+    wan_interface: GigabitEthernet0/0/0
 
-    trunk_ports:
-      - name: GigabitEthernet0/24
-        allowed_vlans: "10,20,30,99"
-        native_vlan: 99
+    qos_classes:
+      - name: VOIP
+        match: "dscp ef"
+        action: "priority percent 20"
+      - name: VIDEO
+        match: "dscp af41"
+        action: "bandwidth percent 20"
+      - name: CRITICAL-DATA
+        match: "dscp af31"
+        action: "bandwidth percent 30"
+      - name: SCAVENGER
+        match: "dscp cs1"
+        action: "bandwidth percent 5"
 
   tasks:
-    - name: Provision VLANs and port assignments
+    - name: Verify device is reachable before making changes
+      cisco.ios.ios_command:
+        commands:
+          - show version
+      register: device_version
+      retries: 3
+      delay: 10
+      until: device_version is not failed
+
+    - name: Display platform info
+      ansible.builtin.debug:
+        msg: "{{ device_version.stdout_lines[0][:3] }}"
+
+    - name: Configure QoS class-maps
       block:
-        - name: Create and activate VLANs
-          cisco.ios.ios_vlans:
-            config: "{{ vlans }}"
-            state: merged
-          register: vlan_result
+        - name: Apply class-map definitions
+          cisco.ios.ios_config:
+            lines:
+              - "class-map match-any {{ item.name }}"
+              - " match {{ item.match }}"
+          loop: "{{ qos_classes }}"
+          register: classmap_result
+          notify: Save running config
 
-        - name: Configure access port VLAN assignments
-          cisco.ios.ios_l2_interfaces:
-            config:
-              - name: "{{ item.name }}"
-                mode: access
-                access:
-                  vlan: "{{ item.vlan }}"
-            state: merged
-          loop: "{{ access_ports }}"
-          register: access_result
+        - name: Build policy-map with per-class actions
+          cisco.ios.ios_config:
+            parents: "policy-map {{ policy_name }}"
+            lines: "{{ qos_class_lines }}"
+          vars:
+            qos_class_lines: >-
+              {{
+                qos_classes | map(attribute='name') | zip(qos_classes | map(attribute='action'))
+                | map('join', '\n ') | map('regex_replace', '^(.*)$', 'class \\1')
+                | list
+                + ['class class-default', ' fair-queue', ' random-detect']
+              }}
+          register: policymap_result
+          notify: Save running config
 
-        - name: Configure trunk ports with allowed VLANs
-          cisco.ios.ios_l2_interfaces:
-            config:
-              - name: "{{ item.name }}"
-                mode: trunk
-                trunk:
-                  allowed_vlans: "{{ item.allowed_vlans }}"
-                  native_vlan: "{{ item.native_vlan }}"
-            state: merged
-          loop: "{{ trunk_ports }}"
-          register: trunk_result
-
-        - name: Verify VLAN database and trunk state
-          cisco.ios.ios_command:
-            commands:
-              - show vlan brief
-              - show interfaces trunk
-          register: vlan_verify
-          retries: 2
-          delay: 3
-          until: vlan_verify is not failed
+        - name: Apply service-policy outbound on WAN interface
+          cisco.ios.ios_config:
+            parents: "interface {{ wan_interface }}"
+            lines:
+              - "service-policy output {{ policy_name }}"
+          register: service_policy_result
+          notify: Save running config
 
       rescue:
-        - name: Capture VLAN config on failure
-          cisco.ios.ios_command:
-            commands:
-              - show running-config | section vlan
-          register: failure_config
-
-        - name: Report failure with context
+        - name: Report failure details
           ansible.builtin.debug:
-            msg:
-              - "VLAN provisioning failed on {{ inventory_hostname }}"
-              - "Current VLAN config: {{ failure_config.stdout[0] }}"
+            msg: >
+              QoS deployment FAILED on {{ inventory_hostname }}.
+              Task: {{ ansible_failed_task.name }}.
+              Error: {{ ansible_failed_result.msg | default('see stdout') }}.
 
-        - name: Abort with clear error
+        - name: Abort with actionable message
           ansible.builtin.fail:
-            msg: "VLAN provisioning failed on {{ inventory_hostname }} — see rescue output above."
+            msg: "QoS policy rollout aborted on {{ inventory_hostname }} — manual review required before retry."
 
-    - name: Display VLAN table and trunk summary
+    - name: Verify policy-map is active on interface
+      cisco.ios.ios_command:
+        commands:
+          - "show policy-map interface {{ wan_interface }} output"
+          - "show class-map"
+      register: qos_verify
+      failed_when: >
+        policy_name not in qos_verify.stdout[0] or
+        qos_verify.stdout[0] == ''
+
+    - name: Display per-class QoS statistics
       ansible.builtin.debug:
-        msg:
-          - "=== {{ inventory_hostname }} ==="
-          - "VLAN table: {{ vlan_verify.stdout[0] }}"
-          - "Trunk interfaces: {{ vlan_verify.stdout[1] }}"
+        msg: "{{ qos_verify.stdout_lines[0] }}"
 
-    - name: Assert all target VLANs present in VLAN table
-      ansible.builtin.assert:
-        that:
-          - "item.vlan_id | string in vlan_verify.stdout[0]"
-        fail_msg: "VLAN {{ item.vlan_id }} ({{ item.name }}) missing on {{ inventory_hostname }}"
-        success_msg: "VLAN {{ item.vlan_id }} confirmed active on {{ inventory_hostname }}"
-      loop: "{{ vlans }}
+  handlers:
+    - name: Save running config
+      cisco.ios.ios_command:
+        commands:
+          - write memory
+      register: save_result
+      failed_when: >
+        'OK' not in save_result.stdout[0] and
+        '[OK]' not in save_result.stdout[0]
