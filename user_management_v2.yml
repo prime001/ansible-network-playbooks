@@ -1,127 +1,121 @@
 ---
-# AAA and TACACS+ Configuration Playbook
-# Configures centralized authentication via TACACS+, local fallback,
-# login security hardening, and command accounting on Cisco IOS/IOS-XE.
+# AAA / RADIUS-TACACS+ Server Configuration Playbook
+# Configures external authentication servers, AAA groups, and method lists.
+# Complements local user_management.yml by adding centralized AAA integration.
 #
-# Credentials (store in Ansible Vault — group_vars/network/vault.yml):
-#   ansible_user:             "{{ vault_net_user }}"
-#   ansible_password:         "{{ vault_net_password }}"
-#   ansible_become_password:  "{{ vault_enable_password }}"
-#   tacacs_key:               "{{ vault_tacacs_key }}"
+# Credentials stored in Ansible Vault — see group_vars/network/vault.yml
+# Encrypt secrets: ansible-vault encrypt_string --vault-id network@vault_pass
 #
 # Inventory example:
-#   [routers]
-#   rtr-core-01 ansible_host=10.0.0.1
-#   rtr-core-02 ansible_host=10.0.0.2
-#   [switches]
-#   sw-dist-01  ansible_host=10.0.1.1
-#   [network:children]
-#   routers
-#   switches
-#   [network:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_become=yes
-#   ansible_become_method=enable
+# [cisco_ios]
+# rtr-core-01 ansible_host=10.0.1.1
+# rtr-core-02 ansible_host=10.0.1.2
+#
+# [cisco_ios:vars]
+# ansible_network_os=ios
+# ansible_connection=network_cli
+# ansible_user={{ vault_ansible_user }}
+# ansible_password={{ vault_ansible_password }}
+# ansible_become=true
+# ansible_become_method=enable
+# ansible_become_password={{ vault_enable_password }}
 
-- name: Configure AAA and TACACS+ centralized authentication on Cisco IOS
-  hosts: network
+- name: Configure AAA RADIUS/TACACS+ Authentication
+  hosts: cisco_ios
   gather_facts: false
+
   vars:
-    tacacs_servers:
-      - name: TACACS-PRIMARY
-        host: 10.0.100.10
-        timeout: 5
-      - name: TACACS-SECONDARY
-        host: 10.0.100.11
-        timeout: 5
-    tacacs_source_interface: Loopback0
-    login_retry_limit: 3
-    login_quiet_mode_seconds: 60
-    exec_timeout_minutes: 10
-    min_password_length: 12
+    tacacs_server_ip: "{{ vault_tacacs_host }}"
+    tacacs_key: "{{ vault_tacacs_key }}"
+    radius_server_ip: "{{ vault_radius_host }}"
+    radius_key: "{{ vault_radius_key }}"
+    aaa_tacacs_group: "CORP-TACACS"
+    aaa_radius_group: "CORP-RADIUS"
+    aaa_method_list: "CORP-AUTH"
 
   tasks:
-    - name: Verify device is reachable and capture IOS version
-      ios_command:
-        commands:
-          - show version | include ^Cisco IOS
-      register: device_version
-      retries: 3
-      delay: 5
-      until: not device_version.failed
-
-    - name: Display target device version
-      debug:
-        msg: "{{ inventory_hostname }}: {{ device_version.stdout[0] | default('version unknown') }}"
-
-    - name: Apply TACACS+ server definitions, AAA model, and accounting
+    - name: Configure TACACS+ and RADIUS servers
       block:
-        - name: Define TACACS+ servers and server group
-          ios_config:
+        - name: Define TACACS+ server object
+          cisco.ios.ios_config:
             lines:
-              - "tacacs server {{ item.name }}"
-              - " address ipv4 {{ item.host }}"
+              - "tacacs server CORP-TACACS-01"
+              - " address ipv4 {{ tacacs_server_ip }}"
               - " key {{ tacacs_key }}"
-              - " timeout {{ item.timeout }}"
-          loop: "{{ tacacs_servers }}"
-          register: tacacs_server_result
+              - " timeout 5"
+          register: tacacs_cfg
+          retries: 3
+          delay: 5
+          until: tacacs_cfg is not failed
 
-        - name: Configure AAA server group and authentication policies
-          ios_config:
+        - name: Define RADIUS server object
+          cisco.ios.ios_config:
             lines:
-              - "aaa group server tacacs+ TACACS-GROUP"
-              - " server name TACACS-PRIMARY"
-              - " server name TACACS-SECONDARY"
-              - " ip tacacs source-interface {{ tacacs_source_interface }}"
+              - "radius server CORP-RADIUS-01"
+              - " address ipv4 {{ radius_server_ip }} auth-port 1812 acct-port 1813"
+              - " key {{ radius_key }}"
+              - " timeout 5"
+              - " retransmit 2"
+
+        - name: Configure AAA server groups
+          cisco.ios.ios_config:
+            lines:
+              - "aaa group server tacacs+ {{ aaa_tacacs_group }}"
+              - " server name CORP-TACACS-01"
+              - "aaa group server radius {{ aaa_radius_group }}"
+              - " server name CORP-RADIUS-01"
+
+        - name: Enable AAA new-model and configure method lists
+          cisco.ios.ios_config:
+            lines:
               - "aaa new-model"
-              - "aaa authentication login default group TACACS-GROUP local"
-              - "aaa authentication enable default group TACACS-GROUP enable"
-              - "aaa authorization exec default group TACACS-GROUP local if-authenticated"
-              - "aaa authorization commands 15 default group TACACS-GROUP local if-authenticated"
-              - "aaa accounting exec default start-stop group TACACS-GROUP"
-              - "aaa accounting commands 15 default start-stop group TACACS-GROUP"
-            save_when: changed
-          register: aaa_policy_result
+              - "aaa authentication login {{ aaa_method_list }} group {{ aaa_tacacs_group }} group {{ aaa_radius_group }} local"
+              - "aaa authorization exec {{ aaa_method_list }} group {{ aaa_tacacs_group }} local if-authenticated"
+              - "aaa accounting exec default start-stop group {{ aaa_tacacs_group }}"
+              - "aaa accounting commands 15 default start-stop group {{ aaa_tacacs_group }}"
+            match: line
 
-        - name: Configure login security hardening and password policy
-          ios_config:
-            lines:
-              - "login block-for {{ login_quiet_mode_seconds }} attempts {{ login_retry_limit }} within 30"
-              - "login on-failure log"
-              - "login on-success log"
-              - "security passwords min-length {{ min_password_length }}"
-              - "service password-encryption"
-            save_when: changed
-
-        - name: Set exec timeout on console and VTY lines
-          ios_config:
-            lines:
-              - "exec-timeout {{ exec_timeout_minutes }} 0"
+        - name: Apply AAA method list to VTY and console lines
+          cisco.ios.ios_config:
             parents: "{{ item }}"
-            save_when: changed
+            lines:
+              - "login authentication {{ aaa_method_list }}"
+              - "authorization exec {{ aaa_method_list }}"
           loop:
-            - line con 0
-            - line vty 0 4
-            - line vty 5 15
+            - "line vty 0 15"
+            - "line con 0"
 
       rescue:
-        - name: Log configuration failure details
-          debug:
-            msg: "AAA config FAILED on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('see above') }}"
+        - name: Report failure details
+          ansible.builtin.debug:
+            msg: >
+              AAA configuration failed on {{ inventory_hostname }}:
+              {{ ansible_failed_result.msg | default('unknown error') }}
 
-        - name: Abort with descriptive error
-          fail:
-            msg: "Halting — AAA configuration error on {{ inventory_hostname }}. Verify TACACS+ reachability and vault key."
+        - name: Abort with actionable message
+          ansible.builtin.fail:
+            msg: "{{ inventory_hostname }}: AAA config failed — verify server reachability and vault credentials"
 
-    - name: Validate AAA configuration is present in running config
-      ios_command:
+    - name: Verify AAA servers appear in running config
+      cisco.ios.ios_command:
         commands:
-          - show running-config | section ^aaa
-          - show aaa servers
-      register: aaa_validation
-      failed_when: "'TACACS-GROUP' not in aaa_validation.stdout[0]"
+          - "show run | section ^aaa"
+          - "show aaa servers"
+          - "show tacacs"
+      register: aaa_verify
+      failed_when: >
+        aaa_method_list not in aaa_verify.stdout[0] or
+        'aaa new-model' not in aaa_verify.stdout[0]
 
-    - name: Report AAA server connectivity status
-      debug:
-        msg: "{{ inventory_hostname }} AAA servers:\n{{ aaa_validation.stdout[1] }}
+    - name: Display AAA configuration summary
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "AAA method list applied: {{ aaa_method_list }}"
+          - "TACACS group: {{ aaa_tacacs_group }}"
+          - "RADIUS group: {{ aaa_radius_group }}"
+          - "Server reachability: {{ aaa_verify.stdout[1] | truncate(200) }}"
+
+    - name: Save configuration if changed
+      cisco.ios.ios_config:
+        save_when: changed
