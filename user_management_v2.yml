@@ -1,123 +1,127 @@
 ---
-# ospf_config.yml
-# Configures OSPF routing protocol on Cisco IOS routers.
-# Handles process setup, router-id, network advertisements, and neighbor verification.
+# AAA and TACACS+ Configuration Playbook
+# Configures centralized authentication via TACACS+, local fallback,
+# login security hardening, and command accounting on Cisco IOS/IOS-XE.
 #
-# Credentials must be stored in Ansible Vault:
-#   ansible_user: "{{ vault_net_user }}"
-#   ansible_password: "{{ vault_net_password }}"
-#   ansible_become_password: "{{ vault_enable_password }}"
+# Credentials (store in Ansible Vault — group_vars/network/vault.yml):
+#   ansible_user:             "{{ vault_net_user }}"
+#   ansible_password:         "{{ vault_net_password }}"
+#   ansible_become_password:  "{{ vault_enable_password }}"
+#   tacacs_key:               "{{ vault_tacacs_key }}"
 #
 # Inventory example:
-#   [core_routers]
-#   rtr-core-01 ansible_host=10.0.1.1 ospf_router_id=1.1.1.1
-#   rtr-core-02 ansible_host=10.0.1.2 ospf_router_id=2.2.2.2
-#
-#   [core_routers:vars]
-#   ospf_process_id=1
-#   ospf_area=0
+#   [routers]
+#   rtr-core-01 ansible_host=10.0.0.1
+#   rtr-core-02 ansible_host=10.0.0.2
+#   [switches]
+#   sw-dist-01  ansible_host=10.0.1.1
+#   [network:children]
+#   routers
+#   switches
+#   [network:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
+#   ansible_become=yes
+#   ansible_become_method=enable
 
-- name: Configure OSPF Routing Protocol on Cisco IOS Devices
-  hosts: core_routers
+- name: Configure AAA and TACACS+ centralized authentication on Cisco IOS
+  hosts: network
   gather_facts: false
-
   vars:
-    ospf_process_id: "{{ ospf_process_id | default(1) }}"
-    ospf_area: "{{ ospf_area | default(0) }}"
-    ospf_reference_bandwidth: 10000
-    ospf_networks:
-      - network: 10.0.0.0
-        wildcard: 0.0.255.255
-        area: "{{ ospf_area }}"
-    ospf_passive_interfaces:
-      - Loopback0
+    tacacs_servers:
+      - name: TACACS-PRIMARY
+        host: 10.0.100.10
+        timeout: 5
+      - name: TACACS-SECONDARY
+        host: 10.0.100.11
+        timeout: 5
+    tacacs_source_interface: Loopback0
+    login_retry_limit: 3
+    login_quiet_mode_seconds: 60
+    exec_timeout_minutes: 10
+    min_password_length: 12
 
   tasks:
-    - name: Capture pre-change routing state
-      cisco.ios.ios_command:
+    - name: Verify device is reachable and capture IOS version
+      ios_command:
         commands:
-          - show ip protocols
-          - show ip route summary
-      register: pre_state
-      retries: 2
+          - show version | include ^Cisco IOS
+      register: device_version
+      retries: 3
       delay: 5
+      until: not device_version.failed
 
-    - name: Display pre-change routing state
-      ansible.builtin.debug:
-        msg: "{{ pre_state.stdout_lines }}"
+    - name: Display target device version
+      debug:
+        msg: "{{ inventory_hostname }}: {{ device_version.stdout[0] | default('version unknown') }}"
 
-    - name: Apply OSPF configuration
+    - name: Apply TACACS+ server definitions, AAA model, and accounting
       block:
-        - name: Configure OSPF process, router-id, and reference bandwidth
-          cisco.ios.ios_config:
+        - name: Define TACACS+ servers and server group
+          ios_config:
             lines:
-              - "router ospf {{ ospf_process_id }}"
-              - " router-id {{ ospf_router_id }}"
-              - " auto-cost reference-bandwidth {{ ospf_reference_bandwidth }}"
-              - " passive-interface default"
+              - "tacacs server {{ item.name }}"
+              - " address ipv4 {{ item.host }}"
+              - " key {{ tacacs_key }}"
+              - " timeout {{ item.timeout }}"
+          loop: "{{ tacacs_servers }}"
+          register: tacacs_server_result
+
+        - name: Configure AAA server group and authentication policies
+          ios_config:
+            lines:
+              - "aaa group server tacacs+ TACACS-GROUP"
+              - " server name TACACS-PRIMARY"
+              - " server name TACACS-SECONDARY"
+              - " ip tacacs source-interface {{ tacacs_source_interface }}"
+              - "aaa new-model"
+              - "aaa authentication login default group TACACS-GROUP local"
+              - "aaa authentication enable default group TACACS-GROUP enable"
+              - "aaa authorization exec default group TACACS-GROUP local if-authenticated"
+              - "aaa authorization commands 15 default group TACACS-GROUP local if-authenticated"
+              - "aaa accounting exec default start-stop group TACACS-GROUP"
+              - "aaa accounting commands 15 default start-stop group TACACS-GROUP"
+            save_when: changed
+          register: aaa_policy_result
+
+        - name: Configure login security hardening and password policy
+          ios_config:
+            lines:
+              - "login block-for {{ login_quiet_mode_seconds }} attempts {{ login_retry_limit }} within 30"
+              - "login on-failure log"
+              - "login on-success log"
+              - "security passwords min-length {{ min_password_length }}"
+              - "service password-encryption"
             save_when: changed
 
-        - name: Activate OSPF on configured networks
-          cisco.ios.ios_config:
-            parents: "router ospf {{ ospf_process_id }}"
+        - name: Set exec timeout on console and VTY lines
+          ios_config:
             lines:
-              - "network {{ item.network }} {{ item.wildcard }} area {{ item.area }}"
+              - "exec-timeout {{ exec_timeout_minutes }} 0"
+            parents: "{{ item }}"
             save_when: changed
-          loop: "{{ ospf_networks }}"
-
-        - name: Selectively enable non-passive interfaces
-          cisco.ios.ios_config:
-            parents: "router ospf {{ ospf_process_id }}"
-            lines:
-              - "no passive-interface {{ item }}"
-            save_when: changed
-          loop: "{{ ospf_active_interfaces | default([]) }}"
-          when: ospf_active_interfaces is defined
-
-        - name: Set passive interfaces explicitly
-          cisco.ios.ios_config:
-            parents: "router ospf {{ ospf_process_id }}"
-            lines:
-              - "passive-interface {{ item }}"
-            save_when: changed
-          loop: "{{ ospf_passive_interfaces }}"
+          loop:
+            - line con 0
+            - line vty 0 4
+            - line vty 5 15
 
       rescue:
-        - name: Report OSPF configuration failure
-          ansible.builtin.debug:
-            msg: "OSPF config failed on {{ inventory_hostname }} — check privilege level and connectivity."
+        - name: Log configuration failure details
+          debug:
+            msg: "AAA config FAILED on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('see above') }}"
 
-        - name: Abort play on configuration error
-          ansible.builtin.fail:
-            msg: "Halting: OSPF configuration error on {{ inventory_hostname }}"
+        - name: Abort with descriptive error
+          fail:
+            msg: "Halting — AAA configuration error on {{ inventory_hostname }}. Verify TACACS+ reachability and vault key."
 
-    - name: Wait for OSPF adjacencies to form
-      cisco.ios.ios_command:
+    - name: Validate AAA configuration is present in running config
+      ios_command:
         commands:
-          - show ip ospf neighbor
-          - show ip ospf
-      register: ospf_state
-      retries: 4
-      delay: 15
-      failed_when:
-        - ospf_state.stdout[1] is defined
-        - "'Routing Process' not in ospf_state.stdout[1]"
+          - show running-config | section ^aaa
+          - show aaa servers
+      register: aaa_validation
+      failed_when: "'TACACS-GROUP' not in aaa_validation.stdout[0]"
 
-    - name: Display OSPF neighbor and process state
-      ansible.builtin.debug:
-        msg: "{{ ospf_state.stdout_lines }}"
-
-    - name: Verify OSPF routes present in routing table
-      cisco.ios.ios_command:
-        commands:
-          - show ip route ospf
-      register: ospf_routes
-      failed_when:
-        - ospf_routes.stdout[0] | length == 0
-        - inventory_hostname not in groups['ospf_seed_routers'] | default([])
-
-    - name: Display OSPF-learned routes
-      ansible.builtin.debug:
-        msg: "{{ ospf_routes.stdout_lines }}
+    - name: Report AAA server connectivity status
+      debug:
+        msg: "{{ inventory_hostname }} AAA servers:\n{{ aaa_validation.stdout[1] }}
