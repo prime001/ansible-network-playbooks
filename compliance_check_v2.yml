@@ -1,118 +1,120 @@
 ---
-# routing_protocol_check.yml
+# qos_policy.yml
+# Deploys QoS class maps, policy maps, and service policies on Cisco IOS WAN devices.
+# Applies DSCP-based traffic classification and bandwidth guarantees on egress interfaces.
 #
-# Verifies BGP and OSPF neighbor/adjacency health on Cisco IOS core routers.
-# Detects peers not in Established/FULL state and flags stuck adjacencies.
+# Credentials: ansible-vault encrypted vars in group_vars/network/vault.yml
+#   vault_network_user, vault_network_pass, vault_enable_pass
 #
 # Inventory example:
-#   [core_routers]
-#   router1  ansible_host=10.0.1.1
-#   router2  ansible_host=10.0.1.2
+#   [wan_routers]
+#   rtr-core-01 ansible_host=10.0.0.1
+#   rtr-core-02 ansible_host=10.0.0.2
 #
-#   [core_routers:vars]
+#   [wan_routers:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_user={{ vault_net_user }}           # ansible-vault encrypted
-#   ansible_password={{ vault_net_password }}    # ansible-vault encrypted
+#   ansible_user={{ vault_network_user }}
+#   ansible_password={{ vault_network_pass }}
 #   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_password }}
-#
-# Usage:
-#   ansible-playbook -i inventory/hosts routing_protocol_check.yml \
-#     --vault-password-file ~/.vault_pass
+#   ansible_become_pass={{ vault_enable_pass }}
 
-- name: Routing Protocol Health Check — BGP and OSPF neighbor verification
-  hosts: core_routers
+- name: Deploy QoS policies on Cisco IOS WAN devices
+  hosts: wan_routers
   gather_facts: false
 
   vars:
-    # Credentials from ansible-vault — never hardcode in playbooks
-    ansible_user: "{{ vault_net_user }}"
-    ansible_password: "{{ vault_net_password }}"
-    ansible_become_password: "{{ vault_enable_password }}"
-    ospf_stuck_states: "INIT|EXSTART|EXCHANGE|LOADING"
+    qos_voice_class: VOICE-EF
+    qos_business_class: BUSINESS-AF
+    qos_policy_name: WAN-EGRESS-POLICY
+    qos_voice_bw_pct: 30
+    qos_business_bw_pct: 40
+    qos_egress_interface: GigabitEthernet0/0/1
 
   tasks:
+    - name: Verify device is reachable and running IOS
+      cisco.ios.ios_command:
+        commands:
+          - show version | include IOS
+      register: ios_version_check
+      retries: 3
+      delay: 5
+      until: ios_version_check is not failed
 
-    - name: Check BGP neighbor summary
-      block:
+    - name: Capture pre-change policy state
+      cisco.ios.ios_command:
+        commands:
+          - show policy-map {{ qos_policy_name }}
+      register: pre_change_policy
+      failed_when: false
 
-        - name: Gather BGP summary from device
-          cisco.ios.ios_command:
-            commands:
-              - show bgp summary
-          register: bgp_summary
-          retries: 2
-          delay: 5
-          until: bgp_summary is not failed
-
-        - name: Flag BGP peers not in Established state
-          ansible.builtin.assert:
-            that:
-              - "'Established' in bgp_summary.stdout[0]"
-            fail_msg: "No BGP peers in Established state on {{ inventory_hostname }}"
-            success_msg: "BGP neighbors verified on {{ inventory_hostname }}"
-          ignore_errors: true
-
-        - name: Display BGP summary
-          ansible.builtin.debug:
-            var: bgp_summary.stdout_lines[0]
-
-      rescue:
-
-        - name: Record BGP check failure
-          ansible.builtin.debug:
-            msg: >
-              BGP check failed on {{ inventory_hostname }} — device may not run BGP
-              or the command timed out after retries.
-
-    - name: Check OSPF neighbor states
-      block:
-
-        - name: Gather OSPF neighbor details
-          cisco.ios.ios_command:
-            commands:
-              - show ip ospf neighbor detail
-          register: ospf_output
-          retries: 2
-          delay: 5
-          until: ospf_output is not failed
-
-        - name: Identify stuck OSPF adjacencies
-          ansible.builtin.set_fact:
-            ospf_stuck: "{{ ospf_output.stdout[0] | regex_findall('State:\\s+(' + ospf_stuck_states + ')') }}"
-
-        - name: Alert on stuck OSPF adjacencies
-          ansible.builtin.debug:
-            msg: "ALERT: Stuck OSPF adjacency states detected on {{ inventory_hostname }}: {{ ospf_stuck }}"
-          when: ospf_stuck | length > 0
-
-        - name: Verify at least one OSPF neighbor is FULL
-          ansible.builtin.assert:
-            that:
-              - "'FULL' in ospf_output.stdout[0]"
-            fail_msg: "No OSPF neighbors in FULL state on {{ inventory_hostname }}"
-            success_msg: "OSPF FULL adjacency confirmed on {{ inventory_hostname }}"
-          ignore_errors: true
-          failed_when: false
-
-        - name: Display OSPF neighbor output
-          ansible.builtin.debug:
-            var: ospf_output.stdout_lines[0]
-
-      rescue:
-
-        - name: Record OSPF check failure
-          ansible.builtin.debug:
-            msg: >
-              OSPF check failed on {{ inventory_hostname }} — device may not run OSPF
-              or the command timed out after retries.
-
-    - name: Routing protocol health summary
+    - name: Display pre-change policy state
       ansible.builtin.debug:
-        msg:
-          - "Host: {{ inventory_hostname }}"
-          - "BGP data collected  : {{ bgp_summary is defined and (bgp_summary.failed is not defined or not bgp_summary.failed) }}"
-          - "OSPF data collected : {{ ospf_output is defined and (ospf_output.failed is not defined or not ospf_output.failed) }}"
-          - "Stuck OSPF states   : {{ ospf_stuck | default([]) }}
+        msg: "Pre-change: {{ pre_change_policy.stdout[0] | default('No existing policy found') }}"
+
+    - block:
+        - name: Configure DSCP EF class map for voice
+          cisco.ios.ios_config:
+            lines:
+              - class-map match-any {{ qos_voice_class }}
+              - " match dscp ef"
+              - " match dscp cs5"
+
+        - name: Configure DSCP AF class map for business data
+          cisco.ios.ios_config:
+            lines:
+              - class-map match-any {{ qos_business_class }}
+              - " match dscp af31"
+              - " match dscp af32"
+              - " match dscp af33"
+
+        - name: Build policy map with bandwidth guarantees
+          cisco.ios.ios_config:
+            lines:
+              - policy-map {{ qos_policy_name }}
+              - " class {{ qos_voice_class }}"
+              - "  priority percent {{ qos_voice_bw_pct }}"
+              - " class {{ qos_business_class }}"
+              - "  bandwidth percent {{ qos_business_bw_pct }}"
+              - " class class-default"
+              - "  fair-queue"
+
+        - name: Apply policy map to egress interface
+          cisco.ios.ios_config:
+            lines:
+              - service-policy output {{ qos_policy_name }}
+            parents: interface {{ qos_egress_interface }}
+
+        - name: Write memory after successful deployment
+          cisco.ios.ios_command:
+            commands:
+              - write memory
+          register: save_result
+
+      rescue:
+        - name: Log failure details
+          ansible.builtin.debug:
+            msg: "QoS deployment failed on {{ inventory_hostname }} — manual review of 'show policy-map' required before retry"
+
+        - name: Abort with descriptive error
+          ansible.builtin.fail:
+            msg: "QoS policy deployment failed on {{ inventory_hostname }}. Correct errors and re-run."
+
+    - name: Verify policy applied to interface
+      cisco.ios.ios_command:
+        commands:
+          - show policy-map interface {{ qos_egress_interface }}
+          - show policy-map {{ qos_policy_name }}
+      register: post_change_verify
+
+    - name: Display post-deployment policy statistics
+      ansible.builtin.debug:
+        msg: "{{ post_change_verify.stdout[0] }}"
+
+    - name: Assert policy map is present after deployment
+      ansible.builtin.assert:
+        that:
+          - qos_policy_name in post_change_verify.stdout[1]
+        fail_msg: "Policy {{ qos_policy_name }} missing from device output on {{ inventory_hostname }}"
+        success_msg: "QoS policy {{ qos_policy_name }} confirmed on {{ inventory_hostname }}
