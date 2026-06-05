@@ -1,110 +1,117 @@
-The brainstorming skill is designed for collaborative design sessions, but this request is a fully-specified generation task — the requirements are complete and no design dialogue is needed. Proceeding directly to output.
-
 ---
 # ospf_config.yml
-# Configures OSPF process, area assignments, passive interfaces, and
-# validates adjacency formation on Cisco IOS devices.
+# Configures OSPFv2 routing process, network advertisements, and passive interfaces
+# on Cisco IOS devices. Verifies adjacency formation post-change.
+#
+# Credentials: encrypt with ansible-vault
+#   ansible-vault encrypt_string 'secret' --name 'vault_net_password'
 #
 # Inventory example:
-#   [routers]
-#   core-rtr-01 ansible_host=10.0.1.1
-#   core-rtr-02 ansible_host=10.0.1.2
+#   [core_routers]
+#   r1 ansible_host=10.0.1.1 ospf_router_id=1.1.1.1
+#   r2 ansible_host=10.0.1.2 ospf_router_id=2.2.2.2
 #
-#   [routers:vars]
+#   [core_routers:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
 #   ansible_user={{ vault_net_username }}
 #   ansible_password={{ vault_net_password }}
 #   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_password }}
+#   ansible_become_password={{ vault_net_enable_password }}
 
-- name: Configure OSPF routing on Cisco IOS devices
-  hosts: routers
+- name: Deploy OSPFv2 configuration on Cisco IOS core routers
+  hosts: core_routers
   gather_facts: false
 
   vars:
-    ospf_process_id: "{{ ospf_process | default(1) }}"
-    ospf_router_id: "{{ router_id | default(ansible_host) }}"
-    ospf_reference_bandwidth: 1000
+    ansible_user: "{{ vault_net_username }}"
+    ansible_password: "{{ vault_net_password }}"
+    ansible_become_password: "{{ vault_net_enable_password }}"
+    ospf_process_id: 1
+    ospf_reference_bandwidth_mbps: 10000
     ospf_networks:
-      - { prefix: "10.0.0.0", wildcard: "0.0.255.255", area: 0 }
-      - { prefix: "192.168.0.0", wildcard: "0.0.255.255", area: 1 }
-    ospf_passive_interfaces:
-      - Loopback0
-      - GigabitEthernet0/2
+      - { prefix: "10.0.0.0", wildcard: "0.0.255.255", area: "0" }
+      - { prefix: "172.16.0.0", wildcard: "0.0.255.255", area: "1" }
+    ospf_active_interfaces:
+      - GigabitEthernet0/0
+      - GigabitEthernet0/1
 
   tasks:
-    - name: Configure OSPF process and validate adjacencies
+    - name: Capture pre-change OSPF neighbor state
+      cisco.ios.ios_command:
+        commands:
+          - show ip ospf neighbor
+          - show ip ospf
+      register: pre_change_state
+      failed_when: false
+
+    - name: Display pre-change OSPF state
+      ansible.builtin.debug:
+        var: pre_change_state.stdout_lines
+
+    - name: Apply OSPF configuration
       block:
-        - name: Set OSPF router-id and reference bandwidth
+        - name: Configure OSPF process global settings
           cisco.ios.ios_config:
             lines:
               - "router-id {{ ospf_router_id }}"
-              - "auto-cost reference-bandwidth {{ ospf_reference_bandwidth }}"
+              - "auto-cost reference-bandwidth {{ ospf_reference_bandwidth_mbps }}"
+              - "passive-interface default"
             parents: "router ospf {{ ospf_process_id }}"
-          register: ospf_base_result
+          register: ospf_global_result
+          retries: 2
+          delay: 5
+          until: ospf_global_result is not failed
 
-        - name: Advertise networks into OSPF areas
+        - name: Activate OSPF on routed interfaces
           cisco.ios.ios_config:
-            lines:
-              - "network {{ item.prefix }} {{ item.wildcard }} area {{ item.area }}"
+            lines: "no passive-interface {{ item }}"
+            parents: "router ospf {{ ospf_process_id }}"
+          loop: "{{ ospf_active_interfaces }}"
+
+        - name: Advertise networks into OSPF
+          cisco.ios.ios_config:
+            lines: "network {{ item.prefix }} {{ item.wildcard }} area {{ item.area }}"
             parents: "router ospf {{ ospf_process_id }}"
           loop: "{{ ospf_networks }}"
           register: ospf_network_result
 
-        - name: Configure passive interfaces
+        - name: Persist configuration to NVRAM
           cisco.ios.ios_config:
-            lines:
-              - "passive-interface {{ item }}"
-            parents: "router ospf {{ ospf_process_id }}"
-          loop: "{{ ospf_passive_interfaces }}"
-
-        - name: Poll for OSPF full adjacency formation
-          cisco.ios.ios_command:
-            commands:
-              - "show ip ospf neighbor"
-          register: ospf_neighbors
-          retries: 5
-          delay: 8
-          until: "'FULL' in ospf_neighbors.stdout[0]"
-          failed_when: ospf_neighbors.stdout[0] | length == 0
-
-        - name: Collect OSPF process and route summary
-          cisco.ios.ios_command:
-            commands:
-              - "show ip ospf"
-              - "show ip route ospf"
-          register: ospf_summary
-
-        - name: Display OSPF neighbor table
-          ansible.builtin.debug:
-            msg: "{{ ospf_neighbors.stdout_lines[0] }}"
-
-        - name: Display OSPF routes installed in RIB
-          ansible.builtin.debug:
-            msg: "{{ ospf_summary.stdout_lines[1] }}"
+            save_when: changed
 
       rescue:
-        - name: Capture OSPF diagnostic state on failure
-          cisco.ios.ios_command:
-            commands:
-              - "show ip ospf"
-              - "show ip ospf neighbor"
-              - "show ip route ospf"
-          register: ospf_diag
-          ignore_errors: true
-
-        - name: Report failure with diagnostic context
+        - name: Report configuration failure
           ansible.builtin.debug:
-            msg:
-              - "OSPF configuration failed on {{ inventory_hostname }}"
-              - "Failed task: {{ ansible_failed_task.name }}"
-              - "Diagnostic output: {{ ospf_diag.stdout_lines | default(['unavailable']) }}"
+            msg: "OSPF configuration failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
 
-        - name: Fail play with actionable message
+        - name: Abort with actionable error
           ansible.builtin.fail:
-            msg: >
-              OSPF configuration did not complete on {{ inventory_hostname }}.
-              Check router-id conflicts, network statement overlap, and authentication
-              mismatch on peer interfaces.
+            msg: "Manual intervention required on {{ inventory_hostname }} — OSPF config did not apply cleanly"
+
+    - name: Wait for OSPF process to initialize
+      cisco.ios.ios_command:
+        commands: show ip ospf
+      register: ospf_process_check
+      retries: 4
+      delay: 8
+      until: "'OSPF Router with ID' in ospf_process_check.stdout[0]"
+      failed_when: "'OSPF Router with ID' not in ospf_process_check.stdout[0]"
+
+    - name: Capture post-change OSPF neighbor and route tables
+      cisco.ios.ios_command:
+        commands:
+          - show ip ospf neighbor
+          - show ip route ospf
+      register: post_change_state
+
+    - name: Display OSPF adjacency and learned routes
+      ansible.builtin.debug:
+        var: post_change_state.stdout_lines
+
+    - name: Summarize result
+      ansible.builtin.debug:
+        msg: >
+          OSPFv2 process {{ ospf_process_id }} deployed on {{ inventory_hostname }}
+          (router-id {{ ospf_router_id }}) — {{ ospf_networks | length }} network(s) advertised.
