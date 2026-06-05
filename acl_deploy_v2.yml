@@ -1,123 +1,96 @@
-```yaml
 ---
-# VLAN Configuration and Management Playbook
-# Purpose: Deploy and validate VLAN configurations across Cisco network devices
-# Platforms: Cisco IOS, IOS-XE, NX-OS
-#
-# Inventory Example:
-# [network_switches]
-# core_switch_1 ansible_host=192.168.1.10 ansible_network_os=ios
-# dist_switch_1 ansible_host=192.168.1.20 ansible_network_os=nxos
-#
-# Group Variables (group_vars/network_switches.yml):
-# ansible_user: "{{ vault_network_username }}"
-# ansible_password: "{{ vault_network_password }}"
-# ansible_become_password: "{{ vault_enable_secret }}"
-# ansible_connection: network_cli
-# ansible_become: yes
-# ansible_become_method: enable
-
-- name: VLAN Configuration and Management
-  hosts: network_switches
+- name: Configure HSRP Gateway Redundancy on Network Devices
+  hosts: network_devices
   gather_facts: no
 
   vars:
-    vlans_config:
-      - vlan_id: 10
-        name: Management
-        description: Device Management VLAN
-      - vlan_id: 20
-        name: Production
-        description: Production Workloads VLAN
-      - vlan_id: 30
-        name: Guest
-        description: Guest Access VLAN
-      - vlan_id: 99
-        name: Native
-        description: Native VLAN
+    hsrp_interface: "{{ hsrp_if | default('GigabitEthernet0/0/1') }}"
+    hsrp_group: "{{ hsrp_grp | default(1) }}"
+    hsrp_virtual_ip: "{{ hsrp_vip | default('10.0.0.254') }}"
+    hsrp_timers_hello: 3
+    hsrp_timers_hold: 10
+    # Credentials stored in vault: ansible-vault view group_vars/network_devices/credentials.yml
+    ansible_user: "{{ vault_network_user }}"
+    ansible_password: "{{ vault_network_password }}"
+    ansible_network_os: ios
+    ansible_connection: network_cli
 
   tasks:
-    - name: Gather device capabilities and version
-      cisco.ios.ios_facts:
-        gather_subset:
-          - min
-          - hardware
-      register: device_facts
+    - name: Gather device facts for configuration context
+      ios_facts:
+      register: device_info
+      retries: 2
+      delay: 5
+      until: device_info is succeeded
+
+    - name: Configure HSRP protocol parameters on interface
+      ios_config:
+        lines:
+          - "standby {{ hsrp_group }} ip {{ hsrp_virtual_ip }}"
+          - "standby {{ hsrp_group }} priority {{ hsrp_priority }}"
+          - "standby {{ hsrp_group }} preempt delay minimum 30"
+          - "standby {{ hsrp_group }} timers {{ hsrp_timers_hello }} {{ hsrp_timers_hold }}"
+        parents: "interface {{ hsrp_interface }}"
+        save_when: changed
+        backup: yes
+      register: hsrp_config
       retries: 3
       delay: 10
-      until: device_facts is succeeded
-      when: ansible_network_os == 'ios'
+      until: hsrp_config is succeeded
 
-    - name: Display target device information
-      debug:
-        msg: "Device {{ inventory_hostname }} | OS: {{ device_facts.ansible_facts.ansible_net_version }} | Model: {{ device_facts.ansible_facts.ansible_net_model }}"
-      when: device_facts is succeeded
-
-    - name: Configure VLANs on IOS/IOS-XE devices
-      cisco.ios.ios_vlans:
-        state: merged
-        config:
-          - vlan_id: "{{ item.vlan_id }}"
-            name: "{{ item.name }}"
-      loop: "{{ vlans_config }}"
-      register: ios_vlan_changes
-      retries: 2
-      delay: 5
-      when: ansible_network_os in ['ios', 'iosxe']
-
-    - name: Configure VLANs on NX-OS devices
-      cisco.nxos.nxos_vlans:
-        state: merged
-        config:
-          - vlan_id: "{{ item.vlan_id }}"
-            name: "{{ item.name }}"
-      loop: "{{ vlans_config }}"
-      register: nxos_vlan_changes
-      retries: 2
-      delay: 5
-      when: ansible_network_os == 'nxos'
-
-    - name: Verify VLAN creation on IOS
-      cisco.ios.ios_command:
-        commands:
-          - "show vlan id {{ item.vlan_id }} | include {{ item.name }}"
-      loop: "{{ vlans_config }}"
-      register: vlan_verification
-      changed_when: false
+    - name: Verify HSRP configuration was applied
+      ios_command:
+        commands: "show standby brief"
+      register: hsrp_status
       failed_when:
-        - vlan_verification is failed
-        - "'not found' in vlan_verification.stdout_lines[0] | default('')"
-      when: ansible_network_os in ['ios', 'iosxe']
+        - hsrp_status.stdout[0] | length == 0
 
-    - name: Display VLAN configuration results
+    - name: Retrieve detailed HSRP group information
+      ios_command:
+        commands:
+          - "show standby {{ hsrp_group }}"
+      register: hsrp_details
+
+    - name: Display HSRP configuration summary
       debug:
         msg: |
+          ========== HSRP Configuration Report ==========
           Device: {{ inventory_hostname }}
-          VLAN ID: {{ item.item.vlan_id }}
-          VLAN Name: {{ item.item.name }}
-          Verification Status: {{ 'OK' if item is succeeded else 'FAILED' }}
-      loop: "{{ vlan_verification.results }}"
-      when: vlan_verification.results is defined
-
-    - name: Save running configuration
-      cisco.ios.ios_config:
-        save_when: always
-      when: ios_vlan_changes is changed and ansible_network_os in ['ios', 'iosxe']
+          Model: {{ device_info.ansible_net_model }}
+          Serial: {{ device_info.ansible_net_serialnum }}
+          
+          HSRP Parameters:
+          - Group: {{ hsrp_group }}
+          - Virtual IP: {{ hsrp_virtual_ip }}
+          - Interface: {{ hsrp_interface }}
+          - Priority: {{ hsrp_priority }}
+          
+          Current Status:
+          {{ hsrp_details.stdout[0] }}
 
   rescue:
-    - name: Log configuration error
+    - name: Log configuration failure with details
       debug:
-        msg: "Error on {{ inventory_hostname }} - {{ ansible_failed_task.name }}: {{ ansible_failed_result.msg }}"
+        msg: |
+          HSRP configuration failed on {{ inventory_hostname }}
+          Error: {{ ansible_failed_result.msg }}
+          Failed Task: {{ ansible_failed_task.name }}
 
-    - name: Verify device connectivity after failure
-      cisco.ios.ios_command:
-        commands: "show ip interface brief | include up"
-      register: connectivity_check
-      ignore_errors: yes
-      when: ansible_network_os in ['ios', 'iosxe']
+    - name: Rollback HSRP configuration on failure
+      ios_config:
+        lines:
+          - "no standby {{ hsrp_group }}"
+        parents: "interface {{ hsrp_interface }}"
+      when: hsrp_config is defined and hsrp_config.failed
 
-    - name: Display device status
-      debug:
-        msg: "{{ connectivity_check.stdout_lines }}"
-      when: connectivity_check is succeeded
-```
+# Inventory Example:
+# [network_devices]
+# core-switch-1 ansible_host=10.1.1.10 hsrp_priority=110
+# core-switch-2 ansible_host=10.1.1.11 hsrp_priority=100
+#
+# [network_devices:vars]
+# ansible_network_os=ios
+# ansible_connection=network_cli
+# hsrp_group=1
+# hsrp_virtual_ip=10.0.0.254
+# hsrp_interface=GigabitEthernet0/0/1
