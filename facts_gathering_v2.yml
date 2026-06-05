@@ -1,118 +1,112 @@
 ---
-# routing_protocol_status.yml
+# CDP/LLDP Neighbor Discovery and Topology Documentation
 #
-# Collects BGP peer adjacencies, OSPF neighbor states, and IP route summary
-# from Cisco IOS devices. Complements general facts_gathering by focusing on
-# Layer 3 routing protocol health — useful for pre/post-change validation
-# and periodic network state audits.
-#
-# Credentials: ansible_user, ansible_password, and ansible_become_password
-# must be stored in Ansible Vault.
-# Run: ansible-playbook routing_protocol_status.yml --ask-vault-pass
+# Collects CDP and LLDP neighbor tables from IOS/IOS-XE devices,
+# correlates with interface status, and saves per-device topology reports.
+# Useful for network audits, documentation, and change-window pre-checks.
 #
 # Inventory example:
-#   [core_routers]
-#   rtr-core-01 ansible_host=10.0.0.1
-#   rtr-core-02 ansible_host=10.0.0.2
+#   [core]
+#   core-sw01 ansible_host=10.0.1.1
+#   core-sw02 ansible_host=10.0.1.2
 #
-#   [core_routers:vars]
+#   [distribution]
+#   dist-sw01 ansible_host=10.0.2.1
+#
+#   [all:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_user={{ vault_net_username }}
-#   ansible_password={{ vault_net_password }}
+#   ansible_user={{ vault_net_username }}          # ansible-vault encrypted
+#   ansible_password={{ vault_net_password }}      # ansible-vault encrypted
 #   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_become_password={{ vault_net_enable_password }}
+#   ansible_become_password={{ vault_enable_password }}
 
-- name: Gather routing protocol neighbor status and route summary
-  hosts: core_routers
+- name: CDP/LLDP Neighbor Discovery and Topology Documentation
+  hosts: network_devices
   gather_facts: false
-  connection: network_cli
 
   vars:
-    output_dir: "./routing_reports"
-    report_timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+    output_dir: "{{ playbook_dir }}/reports/neighbor_discovery"
+    report_date: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
 
   tasks:
-
-    - name: Create output directory for routing reports
+    - name: Create report output directory
       ansible.builtin.file:
         path: "{{ output_dir }}"
         state: directory
-        mode: '0755'
+        mode: "0755"
       delegate_to: localhost
       run_once: true
 
-    - name: Collect routing protocol state
+    - name: Collect CDP and LLDP neighbor tables
       block:
-
-        - name: Get BGP summary
+        - name: Gather CDP neighbor detail
           cisco.ios.ios_command:
             commands:
-              - show bgp all summary
-          register: bgp_summary
+              - show cdp neighbors detail
+          register: cdp_neighbors
           retries: 2
           delay: 5
-          failed_when: false
+          until: cdp_neighbors is not failed
 
-        - name: Get OSPF neighbor table
+        - name: Gather LLDP neighbor detail
           cisco.ios.ios_command:
             commands:
-              - show ip ospf neighbor
-          register: ospf_neighbors
+              - show lldp neighbors detail
+          register: lldp_neighbors
           retries: 2
           delay: 5
-          failed_when: false
+          until: lldp_neighbors is not failed
 
-        - name: Get IP route summary
+        - name: Gather interface status for neighbor correlation
           cisco.ios.ios_command:
             commands:
-              - show ip route summary
-          register: route_summary
+              - show interfaces status
+          register: intf_status
           retries: 2
           delay: 5
+          until: intf_status is not failed
 
       rescue:
+        - name: Record collection failure and continue
+          ansible.builtin.set_fact:
+            collection_failed: true
+            failure_reason: "{{ ansible_failed_result.msg | default('unknown error') }}"
 
-        - name: Log collection failure
+        - name: Log failed device
           ansible.builtin.debug:
-            msg: >
-              Routing data collection failed for {{ inventory_hostname }}.
-              Verify SSH connectivity, credentials, and that the device is reachable.
+            msg: "WARN: neighbor collection failed on {{ inventory_hostname }} — {{ failure_reason }}"
 
-        - name: Abort play for unreachable host
-          ansible.builtin.fail:
-            msg: "Aborting routing status collection for {{ inventory_hostname }}"
-
-    - name: Display BGP neighbor summary
+    - name: Display CDP neighbor summary
       ansible.builtin.debug:
-        msg: "{{ bgp_summary.stdout_lines | default(['BGP not configured or no peers found']) }}"
+        msg: "{{ cdp_neighbors.stdout_lines[0] }}"
+      when:
+        - collection_failed is not defined
+        - cdp_neighbors.stdout[0] | length > 0
 
-    - name: Display OSPF neighbor table
-      ansible.builtin.debug:
-        msg: "{{ ospf_neighbors.stdout_lines | default(['OSPF not configured or no active neighbors']) }}"
-
-    - name: Display IP route summary
-      ansible.builtin.debug:
-        msg: "{{ route_summary.stdout_lines }}"
-
-    - name: Save routing status report to local file
+    - name: Save neighbor topology report
       ansible.builtin.copy:
         content: |
-          ============================================================
-          Routing Protocol Status Report
-          Device   : {{ inventory_hostname }} ({{ ansible_host }})
-          Collected: {{ report_timestamp }}
-          ============================================================
+          ========================================
+          Neighbor Topology Report
+          Device    : {{ inventory_hostname }}
+          Timestamp : {{ report_date }}
+          ========================================
 
-          [BGP Summary]
-          {{ bgp_summary.stdout | default('Not configured or unavailable') }}
+          --- CDP Neighbors ---
+          {{ cdp_neighbors.stdout[0] | default('CDP not enabled or no neighbors') }}
 
-          [OSPF Neighbors]
-          {{ ospf_neighbors.stdout | default('Not configured or no neighbors') }}
+          --- LLDP Neighbors ---
+          {{ lldp_neighbors.stdout[0] | default('LLDP not enabled or no neighbors') }}
 
-          [IP Route Summary]
-          {{ route_summary.stdout | default('Unavailable') }}
-        dest: "{{ output_dir }}/{{ inventory_hostname }}_routing_{{ report_timestamp }}.txt"
-        mode: '0644'
+          --- Interface Status ---
+          {{ intf_status.stdout[0] | default('Not collected') }}
+        dest: "{{ output_dir }}/{{ inventory_hostname }}_neighbors_{{ report_date }}.txt"
       delegate_to: localhost
+      when: collection_failed is not defined
+
+    - name: Warn on skipped devices
+      ansible.builtin.debug:
+        msg: "SKIP: {{ inventory_hostname }} — neighbor data not saved due to collection failure"
+      when: collection_failed is defined
