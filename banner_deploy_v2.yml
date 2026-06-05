@@ -1,123 +1,130 @@
-Writing a VLAN provisioning playbook — distinct from all existing playbooks in the repo.
-
 ---
-# vlan_provisioning.yml
+# banner_deploy_v3.yml
 #
-# Provisions and verifies VLANs on Cisco IOS and NX-OS switches.
-# Uses merged state: non-destructive, existing VLANs are preserved.
-#
-# Credentials (use ansible-vault for production):
-#   ansible_user        — vault ref: {{ vault_network_user }}
-#   ansible_password    — vault ref: {{ vault_network_password }}
-#   ansible_become_pass — vault ref: {{ vault_enable_password }}
+# Vendor-agnostic banner deployment using ansible.netcommon cli_command/cli_config.
+# Adds pre-flight compliance check, per-device rollback snapshots, retry logic,
+# and post-deployment verification — distinct from ios_banner-based v1/v2 playbooks.
 #
 # Inventory example:
-#   [ios_switches]
-#   sw-access-01  ansible_host=10.0.1.11  ansible_network_os=ios
-#   sw-access-02  ansible_host=10.0.1.12  ansible_network_os=ios
+#   [wan_routers]
+#   rtr-wan-01 ansible_host=10.1.0.1 ansible_network_os=ios  site=NYC tier=core
+#   rtr-wan-02 ansible_host=10.1.0.2 ansible_network_os=eos  site=LAX tier=edge
+#   rtr-wan-03 ansible_host=10.1.0.3 ansible_network_os=nxos site=CHI tier=core
 #
-#   [nxos_switches]
-#   sw-dc-01  ansible_host=10.0.2.11  ansible_network_os=nxos
-#
-#   [campus_switches:children]
-#   ios_switches
-#   nxos_switches
-#
-#   [campus_switches:vars]
-#   ansible_connection=network_cli
-#   ansible_user="{{ vault_network_user }}"
-#   ansible_password="{{ vault_network_password }}"
+# Vault: group_vars/all/vault.yml (ansible-vault encrypted)
+#   vault_net_username, vault_net_password, vault_net_enable_password
 
-- name: Provision VLANs on campus and data-center switches
-  hosts: campus_switches
+- name: Deploy security banners — compliance-first with rollback (vendor-agnostic)
+  hosts: network_devices
   gather_facts: false
+  connection: network_cli
 
   vars:
-    vlans_to_provision:
-      - vlan_id: 10
-        name: USERS
-        state: active
-      - vlan_id: 20
-        name: SERVERS
-        state: active
-      - vlan_id: 30
-        name: MANAGEMENT
-        state: active
-      - vlan_id: 99
-        name: NATIVE_UNUSED
-        state: active
+    ansible_user: "{{ vault_net_username }}"
+    ansible_password: "{{ vault_net_password }}"
+    ansible_become: true
+    ansible_become_method: enable
+    ansible_become_password: "{{ vault_net_enable_password }}"
+
+    compliance_marker: "AUTHORIZED USE ONLY"
+    rollback_dir: "/tmp/banner_rollback"
+    organization: "{{ org_name | default('Network Operations') }}"
+    noc_email: "{{ noc_contact | default('noc@example.com') }}"
+    abuse_email: "{{ security_contact | default('security@example.com') }}"
+
+    login_banner_config: |
+      banner login ^
+      =============================================================
+        {{ organization }} — AUTHORIZED USE ONLY
+        Site: {{ site | default('UNKNOWN') }} | Tier: {{ tier | default('N/A') }}
+        Unauthorized access is prohibited and subject to prosecution.
+        All sessions are monitored and logged.
+        Contact: {{ noc_email }}
+      =============================================================
+      ^
+
+    motd_banner_config: |
+      banner motd ^
+      WARNING: Managed infrastructure — authorized personnel only.
+      Report security incidents to: {{ abuse_email }}
+      ^
 
   tasks:
-    - name: Verify SSH connectivity before making changes
+    - name: Ensure local rollback directory exists
+      ansible.builtin.file:
+        path: "{{ rollback_dir }}"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Capture pre-change banner section
       ansible.netcommon.cli_command:
-        command: show version
-      register: connectivity_check
-      retries: 2
-      delay: 5
-      until: connectivity_check is not failed
+        command: show running-config | section banner
+      register: pre_banner
+      failed_when: false
 
-    - name: Capture pre-change VLAN state (IOS)
-      cisco.ios.ios_vlans:
-        state: gathered
-      register: vlans_before
-      when: ansible_network_os == 'ios'
+    - name: Save pre-change snapshot for rollback
+      ansible.builtin.copy:
+        content: "{{ pre_banner.stdout | default('') }}"
+        dest: "{{ rollback_dir }}/{{ inventory_hostname }}_banner_pre.txt"
+        mode: "0600"
+      delegate_to: localhost
 
-    - name: Capture pre-change VLAN state (NX-OS)
-      cisco.nxos.nxos_vlans:
-        state: gathered
-      register: vlans_before
-      when: ansible_network_os == 'nxos'
+    - name: Determine current compliance state
+      ansible.builtin.set_fact:
+        is_compliant: "{{ compliance_marker in (pre_banner.stdout | default('')) }}"
 
-    - name: Apply VLAN configuration
+    - name: Report already-compliant devices
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} banner already compliant — skipping deployment"
+      when: is_compliant
+
+    - name: Deploy login and MOTD banners
+      when: not is_compliant
       block:
+        - name: Apply login banner
+          ansible.netcommon.cli_config:
+            config: "{{ login_banner_config }}"
+          register: login_result
+          retries: 3
+          delay: 10
+          until: login_result is not failed
 
-        - name: Provision VLANs (IOS)
-          cisco.ios.ios_vlans:
-            config: "{{ vlans_to_provision }}"
-            state: merged
-          register: vlan_result
-          when: ansible_network_os == 'ios'
-
-        - name: Provision VLANs (NX-OS)
-          cisco.nxos.nxos_vlans:
-            config: "{{ vlans_to_provision }}"
-            state: merged
-          register: vlan_result
-          when: ansible_network_os == 'nxos'
+        - name: Apply MOTD banner
+          ansible.netcommon.cli_config:
+            config: "{{ motd_banner_config }}"
+          register: motd_result
+          retries: 3
+          delay: 10
+          until: motd_result is not failed
 
       rescue:
-        - name: Report provisioning failure
-          ansible.builtin.debug:
-            msg: "VLAN provisioning failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
+        - name: Attempt rollback from pre-change snapshot
+          ansible.netcommon.cli_config:
+            config: "{{ lookup('file', rollback_dir + '/' + inventory_hostname + '_banner_pre.txt') }}"
+          when: (pre_banner.stdout | default('')) != ''
+          ignore_errors: true
 
-        - name: Halt play for failed host
+        - name: Fail with rollback notice
           ansible.builtin.fail:
-            msg: "Stopping play for {{ inventory_hostname }} — manual intervention required"
+            msg: >
+              Banner deployment failed on {{ inventory_hostname }}.
+              Rollback attempted from snapshot at
+              {{ rollback_dir }}/{{ inventory_hostname }}_banner_pre.txt.
+              Original error: {{ ansible_failed_result.msg | default('see task output') }}
 
-    - name: Gather post-change VLAN state (IOS)
-      cisco.ios.ios_vlans:
-        state: gathered
-      register: vlans_after
-      when: ansible_network_os == 'ios'
+    - name: Verify compliance post-deployment
+      ansible.netcommon.cli_command:
+        command: show running-config | section banner
+      register: post_banner
+      failed_when: compliance_marker not in post_banner.stdout
 
-    - name: Gather post-change VLAN state (NX-OS)
-      cisco.nxos.nxos_vlans:
-        state: gathered
-      register: vlans_after
-      when: ansible_network_os == 'nxos'
-
-    - name: Verify each target VLAN is present after provisioning
-      ansible.builtin.assert:
-        that:
-          - vlans_after.gathered | selectattr('vlan_id', 'equalto', item.vlan_id) | list | length > 0
-        fail_msg: "VLAN {{ item.vlan_id }} ({{ item.name }}) missing on {{ inventory_hostname }} after provisioning"
-        success_msg: "VLAN {{ item.vlan_id }} ({{ item.name }}) confirmed on {{ inventory_hostname }}"
-      loop: "{{ vlans_to_provision }}"
-
-    - name: Display provisioning summary
+    - name: Report final deployment status
       ansible.builtin.debug:
         msg:
-          - "Device: {{ inventory_hostname }} ({{ ansible_network_os }})"
-          - "VLANs targeted: {{ vlans_to_provision | map(attribute='vlan_id') | list }}"
-          - "Configuration changed: {{ vlan_result.changed | default(false) }}"
-          - "Commands issued: {{ vlan_result.commands | default([]) }}
+          host: "{{ inventory_hostname }}"
+          platform: "{{ ansible_network_os | default('unknown') }}"
+          pre_compliant: "{{ is_compliant }}"
+          change_applied: "{{ not is_compliant }}"
+          post_compliant: "{{ compliance_marker in post_banner.stdout }}
