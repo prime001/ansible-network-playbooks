@@ -1,128 +1,117 @@
 ---
-# qos_deploy.yml
-# Deploys QoS class-maps, policy-maps, and egress service-policies on Cisco IOS/IOS-XE devices.
-# Credentials are stored in Ansible Vault — see group_vars/all/vault.yml
+# OSPF Routing Configuration Playbook
+# Configures OSPFv2 process, area assignments, passive interfaces, and authentication
+# on Cisco IOS routers.
 #
-# Inventory example:
-#   [wan_edge]
-#   rtr-edge-01 ansible_host=10.0.0.1
-#   rtr-edge-02 ansible_host=10.0.0.2
+# Credentials: store ansible_user / ansible_password / ansible_become_password
+# in an Ansible Vault file (e.g. group_vars/routers/vault.yml) and reference
+# with --ask-vault-pass or a vault password file.
 #
-#   [wan_edge:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user={{ vault_net_user }}
-#   ansible_password={{ vault_net_password }}
-#   ansible_become=yes
-#   ansible_become_method=enable
-#   ansible_become_password={{ vault_net_enable_password }}
+# Inventory example (inventory/routers.yml):
+# ---
+# all:
+#   children:
+#     routers:
+#       hosts:
+#         rtr-core-01:
+#           ansible_host: 192.168.1.1
+#           ospf_router_id: 1.1.1.1
+#           ospf_networks:
+#             - prefix: 10.0.0.0
+#               wildcard: 0.0.0.255
+#               area: 0
+#             - prefix: 172.16.1.0
+#               wildcard: 0.0.0.3
+#               area: 1
+#           ospf_passive_interfaces:
+#             - Loopback0
+#             - GigabitEthernet0/2
+#         rtr-edge-01:
+#           ansible_host: 192.168.1.2
+#           ospf_router_id: 2.2.2.2
+#           ospf_networks:
+#             - prefix: 172.16.1.0
+#               wildcard: 0.0.0.3
+#               area: 1
 
-- name: Deploy QoS class-maps, policy-map, and service-policy on WAN edge devices
-  hosts: wan_edge
+- name: Configure OSPFv2 routing process on Cisco IOS routers
+  hosts: routers
   gather_facts: false
-
+  connection: network_cli
   vars:
-    net_user: "{{ vault_net_user }}"
-    net_password: "{{ vault_net_password }}"
-    net_enable_password: "{{ vault_net_enable_password }}"
-
-    policy_name: WAN-EDGE-EGRESS
-    wan_interface: GigabitEthernet0/0/0
-
-    qos_classes:
-      - name: VOIP
-        match: "dscp ef"
-        action: "priority percent 20"
-      - name: VIDEO
-        match: "dscp af41"
-        action: "bandwidth percent 20"
-      - name: CRITICAL-DATA
-        match: "dscp af31"
-        action: "bandwidth percent 30"
-      - name: SCAVENGER
-        match: "dscp cs1"
-        action: "bandwidth percent 5"
+    ansible_network_os: ios
+    # ansible_user, ansible_password, ansible_become_password loaded from vault
+    ospf_process_id: "{{ ospf_pid | default(1) }}"
+    ospf_auth_key: "{{ vault_ospf_auth_key | default('') }}"
+    ospf_reference_bw: 10000
 
   tasks:
-    - name: Verify device is reachable before making changes
+    - name: Verify device reachability before making changes
       cisco.ios.ios_command:
         commands:
           - show version
-      register: device_version
+      register: version_output
       retries: 3
-      delay: 10
-      until: device_version is not failed
+      delay: 5
+      until: version_output is not failed
 
-    - name: Display platform info
+    - name: Display IOS version for audit trail
       ansible.builtin.debug:
-        msg: "{{ device_version.stdout_lines[0][:3] }}"
+        msg: "{{ version_output.stdout_lines[0][:5] }}"
 
-    - name: Configure QoS class-maps
+    - name: Apply OSPF process configuration
       block:
-        - name: Apply class-map definitions
+        - name: Configure OSPF process, router-id, and reference bandwidth
           cisco.ios.ios_config:
             lines:
-              - "class-map match-any {{ item.name }}"
-              - " match {{ item.match }}"
-          loop: "{{ qos_classes }}"
-          register: classmap_result
-          notify: Save running config
+              - "router-id {{ ospf_router_id }}"
+              - "auto-cost reference-bandwidth {{ ospf_reference_bw }}"
+              - "passive-interface default"
+            parents: "router ospf {{ ospf_process_id }}"
+          register: ospf_base_result
 
-        - name: Build policy-map with per-class actions
+        - name: Activate OSPF on network ranges
           cisco.ios.ios_config:
-            parents: "policy-map {{ policy_name }}"
-            lines: "{{ qos_class_lines }}"
-          vars:
-            qos_class_lines: >-
-              {{
-                qos_classes | map(attribute='name') | zip(qos_classes | map(attribute='action'))
-                | map('join', '\n ') | map('regex_replace', '^(.*)$', 'class \\1')
-                | list
-                + ['class class-default', ' fair-queue', ' random-detect']
-              }}
-          register: policymap_result
-          notify: Save running config
-
-        - name: Apply service-policy outbound on WAN interface
-          cisco.ios.ios_config:
-            parents: "interface {{ wan_interface }}"
             lines:
-              - "service-policy output {{ policy_name }}"
-          register: service_policy_result
-          notify: Save running config
+              - "network {{ item.prefix }} {{ item.wildcard }} area {{ item.area }}"
+            parents: "router ospf {{ ospf_process_id }}"
+          loop: "{{ ospf_networks }}"
+          register: ospf_network_result
+
+        - name: Re-enable OSPF on active (non-passive) interfaces
+          cisco.ios.ios_config:
+            lines:
+              - "no passive-interface {{ item }}"
+            parents: "router ospf {{ ospf_process_id }}"
+          loop: "{{ ospf_passive_interfaces | default([]) }}"
+          when: ospf_passive_interfaces is defined
 
       rescue:
-        - name: Report failure details
+        - name: Log OSPF configuration failure
           ansible.builtin.debug:
             msg: >
-              QoS deployment FAILED on {{ inventory_hostname }}.
-              Task: {{ ansible_failed_task.name }}.
-              Error: {{ ansible_failed_result.msg | default('see stdout') }}.
+              OSPF configuration failed on {{ inventory_hostname }}.
+              Check OSPF process ID conflicts or overlapping network statements.
 
-        - name: Abort with actionable message
+        - name: Fail with actionable message
           ansible.builtin.fail:
-            msg: "QoS policy rollout aborted on {{ inventory_hostname }} — manual review required before retry."
+            msg: "OSPF config aborted on {{ inventory_hostname }} — manual review required."
 
-    - name: Verify policy-map is active on interface
+    - name: Verify OSPF process is running
       cisco.ios.ios_command:
         commands:
-          - "show policy-map interface {{ wan_interface }} output"
-          - "show class-map"
-      register: qos_verify
-      failed_when: >
-        policy_name not in qos_verify.stdout[0] or
-        qos_verify.stdout[0] == ''
+          - "show ip ospf {{ ospf_process_id }}"
+          - "show ip ospf neighbor"
+      register: ospf_verify
+      failed_when: "'OSPF Router with ID' not in ospf_verify.stdout[0]"
 
-    - name: Display per-class QoS statistics
+    - name: Display OSPF neighbor table
       ansible.builtin.debug:
-        msg: "{{ qos_verify.stdout_lines[0] }}"
+        msg: "{{ ospf_verify.stdout_lines[1] }}"
 
-  handlers:
-    - name: Save running config
+    - name: Save running configuration to startup
       cisco.ios.ios_command:
         commands:
           - write memory
       register: save_result
-      failed_when: >
-        'OK' not in save_result.stdout[0] and
-        '[OK]' not in save_result.stdout[0]
+      failed_when: "'OK' not in save_result.stdout[0]
