@@ -1,108 +1,95 @@
 ---
-# ntp_auth_config.yml
-# Hardens NTP by enabling MD5 authentication, configuring trusted keys,
-# and binding NTP server associations to authenticated keys on Cisco IOS/IOS-XE.
-# Complements ntp_config.yml (basic server config) with cryptographic peer validation.
-#
-# Credentials: store in Ansible Vault — never in plaintext
-#   ansible-vault create group_vars/all/vault.yml
-#   vault_ntp_auth_key: "your-shared-secret"
-#   vault_net_user: "admin"
-#   vault_net_pass: "password"
-#   vault_enable_pass: "enable-secret"
-#
-# Inventory example:
-#   [core_routers]
-#   core-rtr1 ansible_host=10.0.0.1
-#   core-rtr2 ansible_host=10.0.0.2
-#
-#   [core_routers:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user={{ vault_net_user }}
-#   ansible_password={{ vault_net_pass }}
-#   ansible_become=yes
-#   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_pass }}
-
-- name: Configure NTP MD5 Authentication on Cisco IOS/IOS-XE
-  hosts: core_routers
-  gather_facts: false
-
+- name: Configure VLANs on Network Devices
+  hosts: network_devices
+  gather_facts: no
   vars:
-    ntp_key_id: 1
-    ntp_key_type: md5
-    # vault_ntp_auth_key must be defined in encrypted group_vars/all/vault.yml
-    ntp_key_string: "{{ vault_ntp_auth_key }}"
-    ntp_servers:
-      - address: "10.0.0.100"
-        prefer: true
-      - address: "10.0.0.101"
-        prefer: false
+    vlan_configs:
+      - vlan_id: 10
+        name: Management
+        description: "Management VLAN"
+      - vlan_id: 20
+        name: Data
+        description: "Data Traffic"
+      - vlan_id: 30
+        name: Voice
+        description: "Voice Traffic"
+      - vlan_id: 40
+        name: Guest
+        description: "Guest Network"
+    
+    device_username: "{{ vault_device_username }}"
+    device_password: "{{ vault_device_password }}"
 
   tasks:
-    - name: Apply NTP authentication hardening
-      block:
-        - name: Enable NTP authentication and register trusted key
-          cisco.ios.ios_config:
-            lines:
-              - ntp authenticate
-              - "ntp authentication-key {{ ntp_key_id }} {{ ntp_key_type }} {{ ntp_key_string }}"
-              - "ntp trusted-key {{ ntp_key_id }}"
-          register: ntp_auth_result
-          retries: 2
-          delay: 5
-          until: ntp_auth_result is not failed
+    - name: Gather network device facts
+      ios_facts:
+        gather_subset: all
+      register: device_facts
+      ignore_errors: yes
 
-        - name: Bind NTP server associations to authentication key
-          cisco.ios.ios_config:
-            lines:
-              - "ntp server {{ item.address }} key {{ ntp_key_id }}{{ ' prefer' if item.prefer else '' }}"
-          loop: "{{ ntp_servers }}"
-          register: ntp_server_result
-          failed_when:
-            - ntp_server_result.failed
-            - "'already configured' not in (ntp_server_result.msg | default(''))"
+    - name: Display device OS version
+      debug:
+        msg: "Device {{ inventory_hostname }} running {{ device_facts.ansible_facts.ansible_net_version }}"
 
-        - name: Retrieve NTP association and status details
-          cisco.ios.ios_command:
-            commands:
-              - show ntp associations detail
-              - show ntp status
-          register: ntp_status
-          retries: 3
-          delay: 10
-          until: ntp_status is not failed
-
-        - name: Assert authenticated NTP peer is present
-          ansible.builtin.assert:
-            that:
-              - >
-                'authenticated' in ntp_status.stdout[0] | lower
-                or 'auth' in ntp_status.stdout[0] | lower
-            fail_msg: "No authenticated NTP peers found on {{ inventory_hostname }}"
-            success_msg: "NTP authentication verified on {{ inventory_hostname }}"
-
-        - name: Display NTP authentication status
-          ansible.builtin.debug:
-            msg: "{{ ntp_status.stdout_lines }}"
-
+    - name: Configure VLANs on Cisco IOS devices
+      ios_vlans:
+        config: "{{ vlan_configs }}"
+        state: merged
+      register: vlan_result
+      retries: 3
+      delay: 5
+      until: vlan_result is succeeded
+      when: device_facts.ansible_facts.ansible_net_os == 'ios'
       rescue:
-        - name: Capture current NTP state for diagnostics
-          cisco.ios.ios_command:
-            commands:
-              - show running-config | include ntp
-              - show ntp associations
-          register: ntp_diag
-          ignore_errors: true
+        - name: Fallback to CLI-based VLAN configuration
+          ios_config:
+            lines:
+              - "vlan {{ item.vlan_id }}"
+              - "name {{ item.name }}"
+              - "description {{ item.description }}"
+            parents: "vlan {{ item.vlan_id }}"
+          loop: "{{ vlan_configs }}"
+          register: cli_result
 
-        - name: Report failure with diagnostic context
-          ansible.builtin.debug:
-            msg:
-              - "NTP auth configuration FAILED on {{ inventory_hostname }}"
-              - "Error: {{ ansible_failed_result.msg | default('unknown error') }}"
-              - "Current NTP state: {{ ntp_diag.stdout_lines | default([]) }}"
+    - name: Verify VLAN configuration
+      ios_command:
+        commands:
+          - "show vlan brief"
+      register: vlan_verify
+      failed_when: '"VLAN" not in vlan_verify.stdout[0]'
+      retries: 2
+      delay: 3
+      when: device_facts.ansible_facts.ansible_net_os == 'ios'
 
-        - name: Fail the play for this host
-          ansible.builtin.fail:
-            msg: "NTP authentication setup failed on {{ inventory_hostname }} — review debug output above
+    - name: Display VLAN verification
+      debug:
+        var: vlan_verify.stdout_lines[0]
+      when: vlan_verify is defined
+
+    - name: Save running configuration
+      ios_command:
+        commands:
+          - "write memory"
+      register: save_result
+      when: vlan_result is changed or cli_result is changed
+
+    - name: Configuration status report
+      debug:
+        msg: |
+          Configuration Summary:
+          - Device: {{ inventory_hostname }}
+          - VLANs Configured: {{ vlan_configs | length }}
+          - Status: {% if save_result is changed %}Saved{% else %}Verified{% endif %}
+          - Timestamp: {{ ansible_date_time.iso8601 }}
+
+# Inventory Example:
+# [network_devices]
+# switch1 ansible_host=192.168.1.10 ansible_network_os=ios device_type=cisco_ios
+# switch2 ansible_host=192.168.1.11 ansible_network_os=ios device_type=cisco_ios
+# router1 ansible_host=192.168.1.20 ansible_network_os=iosxr device_type=cisco_iosxr
+#
+# [network_devices:vars]
+# ansible_connection=network_cli
+# ansible_user=admin
+# vault_device_username=admin
+# vault_device_password=<encrypted_password>
