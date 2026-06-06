@@ -1,151 +1,103 @@
-Writing the BGP neighbor management playbook now.
-
-```yaml
 ---
-# BGP Neighbor Configuration and Validation
-# Configures iBGP/eBGP peers on Cisco IOS devices and validates adjacency state.
+# snmp_v3_hardening.yml
 #
-# Inventory example (inventory/network.yml):
-# ---
-# all:
-#   children:
-#     routers:
-#       hosts:
-#         core-rtr-01:
-#           ansible_host: 10.0.0.1
-#           bgp_local_as: 65001
-#           bgp_peers:
-#             - neighbor_ip: 10.0.0.2
-#               remote_as: 65001
-#               description: "iBGP to core-rtr-02"
-#               update_source: Loopback0
-#             - neighbor_ip: 203.0.113.1
-#               remote_as: 65100
-#               description: "eBGP to upstream-isp"
-#               password: "{{ vault_bgp_peer_password }}"
-#         core-rtr-02:
-#           ansible_host: 10.0.0.2
-#           bgp_local_as: 65001
-#           bgp_peers:
-#             - neighbor_ip: 10.0.0.1
-#               remote_as: 65001
-#               description: "iBGP to core-rtr-01"
-#               update_source: Loopback0
+# Migrates devices from legacy SNMPv1/v2c community strings to SNMPv3
+# authPriv (SHA + AES-128). Fills the gap left by snmp_config.yml
+# (community-based v1/v2c) and snmp_config_v2.yml (location/contact
+# metadata). Targets IOS/IOS-XE; adjust module namespace for NX-OS.
 #
-# Credentials stored in Ansible Vault — reference with:
-#   ansible_user: "{{ vault_net_username }}"
-#   ansible_password: "{{ vault_net_password }}"
-#   ansible_become_password: "{{ vault_net_enable_password }}"
+# Vault keys expected in group_vars/all/vault.yml:
+#   vault_snmp_auth_password  (min 8 chars, SHA auth)
+#   vault_snmp_priv_password  (min 8 chars, AES-128 priv)
+#
+# Inventory example:
+#   [core_routers]
+#   rtr-core-01  ansible_host=10.0.0.1  ansible_network_os=ios
+#   rtr-core-02  ansible_host=10.0.0.2  ansible_network_os=ios
+#
+#   [core_routers:vars]
+#   ansible_user=netops
+#   ansible_password={{ vault_device_password }}
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_enable_password }}
 
-- name: Configure and validate BGP neighbors on Cisco IOS
-  hosts: routers
+- name: Harden SNMP - replace legacy communities with SNMPv3 authPriv users
+  hosts: "{{ target_hosts | default('core_routers') }}"
   gather_facts: false
   connection: network_cli
 
   vars:
-    ansible_network_os: ios
-    # Credentials sourced from group_vars/all/vault.yml (ansible-vault encrypted)
-    ansible_user: "{{ vault_net_username }}"
-    ansible_password: "{{ vault_net_password }}"
-    ansible_become: true
-    ansible_become_method: enable
-    ansible_become_password: "{{ vault_net_enable_password }}"
-    bgp_convergence_wait: 30
+    snmp_v3_user: "nmsuser"
+    snmp_group_name: "MGMT_GROUP"
+    snmp_view_name: "MGMT_VIEW"
+    snmp_acl_name: "ACL_SNMP_MGMT"
+    snmp_auth_algo: sha
+    snmp_priv_algo: aes 128
+    snmp_auth_password: "{{ vault_snmp_auth_password }}"
+    snmp_priv_password: "{{ vault_snmp_priv_password }}"
+    legacy_communities:
+      - public
+      - private
+      - community
 
   tasks:
-    - name: Apply BGP neighbor configuration
+    - name: Remove legacy SNMPv1/v2c community strings
       block:
-        - name: Configure BGP router process and neighbors
+        - name: Delete insecure community strings
           cisco.ios.ios_config:
             lines:
-              - "router bgp {{ bgp_local_as }}"
-            parents: []
-          register: bgp_process_result
+              - "no snmp-server community {{ item }} RO"
+              - "no snmp-server community {{ item }} RW"
+          loop: "{{ legacy_communities }}"
+          register: community_removal
 
-        - name: Configure each BGP peer
+        - name: Create SNMPv3 MIB view
           cisco.ios.ios_config:
-            lines: "{{ bgp_peer_config_lines }}"
-            parents: "router bgp {{ bgp_local_as }}"
-          vars:
-            bgp_peer_config_lines: >-
-              {{
-                bgp_peers | map(attribute='neighbor_ip') | map('regex_replace', '^(.*)$',
-                  'neighbor \1 remote-as ' ) | zip(bgp_peers | map(attribute='remote_as'))
-                | map('join') | list
-                + bgp_peers | selectattr('description', 'defined')
-                | map('community.general.dict_to_jinja2', 'neighbor {neighbor_ip} description {description}')
-                | list
-                + bgp_peers | selectattr('update_source', 'defined')
-                | map('community.general.dict_to_jinja2', 'neighbor {neighbor_ip} update-source {update_source}')
-                | list
-                + bgp_peers | selectattr('password', 'defined')
-                | map('community.general.dict_to_jinja2', 'neighbor {neighbor_ip} password {password}')
-                | list
-              }}
-          loop: "{{ bgp_peers }}"
-          loop_control:
-            label: "{{ item.neighbor_ip }} (AS {{ item.remote_as }})"
-          register: bgp_peer_results
+            lines:
+              - "snmp-server view {{ snmp_view_name }} iso included"
+          register: view_result
 
-        - name: Wait for BGP sessions to establish
-          ansible.builtin.pause:
-            seconds: "{{ bgp_convergence_wait }}"
-          when: bgp_peer_results.changed
-
-        - name: Check BGP neighbor summary
-          cisco.ios.ios_command:
-            commands:
-              - show bgp summary
-              - show bgp neighbors
-            retries: 3
-            interval: 10
-            wait_for:
-              - result[0] contains "Established"
-          register: bgp_summary
+        - name: Create SNMPv3 group with authPriv and ACL
+          cisco.ios.ios_config:
+            lines:
+              - "snmp-server group {{ snmp_group_name }} v3 priv read {{ snmp_view_name }} access {{ snmp_acl_name }}"
+          register: group_result
           failed_when:
-            - bgp_summary.failed is defined
-            - bgp_summary.failed
+            - group_result.failed is defined
+            - group_result.failed
 
-        - name: Verify each peer reached Established state
-          ansible.builtin.assert:
-            that:
-              - "'Established' in bgp_summary.stdout[0]"
-            fail_msg: "BGP peers have not reached Established state on {{ inventory_hostname }}"
-            success_msg: "All BGP peers are Established on {{ inventory_hostname }}"
+        - name: Create SNMPv3 user with SHA auth and AES-128 privacy
+          cisco.ios.ios_config:
+            lines:
+              - "snmp-server user {{ snmp_v3_user }} {{ snmp_group_name }} v3 auth {{ snmp_auth_algo }} {{ snmp_auth_password }} priv {{ snmp_priv_algo }} {{ snmp_priv_password }}"
+          no_log: true
+          register: user_result
 
       rescue:
-        - name: Capture current BGP state on failure
-          cisco.ios.ios_command:
-            commands:
-              - show bgp summary
-              - show log | include BGP
-          register: bgp_failure_state
-          ignore_errors: true
-
-        - name: Report BGP configuration failure
+        - name: Report configuration failure
           ansible.builtin.debug:
-            msg:
-              - "BGP configuration failed on {{ inventory_hostname }}"
-              - "BGP Summary: {{ bgp_failure_state.stdout[0] | default('unavailable') }}"
-              - "Recent BGP log entries: {{ bgp_failure_state.stdout[1] | default('unavailable') }}"
+            msg: "SNMPv3 hardening FAILED on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
 
-        - name: Fail the play after collecting diagnostics
+        - name: Abort play for this host
           ansible.builtin.fail:
-            msg: "BGP neighbor configuration failed on {{ inventory_hostname }} — see debug output above"
+            msg: "SNMPv3 hardening could not complete on {{ inventory_hostname }}. Manual review required."
 
-    - name: Display BGP neighbor summary
-      ansible.builtin.debug:
-        msg: "{{ bgp_summary.stdout_lines[0] }}"
-
-    - name: Save configuration if changes were made
+    - name: Verify SNMPv3 user and group presence
       cisco.ios.ios_command:
         commands:
-          - write memory
-      when: bgp_peer_results.changed
-      register: save_result
+          - show snmp user
+          - show snmp group
+      register: snmp_verify
+      retries: 3
+      delay: 5
+      until: snmp_verify.stdout[0] is search(snmp_v3_user)
+      failed_when: snmp_verify.stdout[0] is not search(snmp_v3_user)
 
-    - name: Confirm running config saved
+    - name: Display SNMPv3 hardening result
       ansible.builtin.debug:
-        msg: "Configuration saved on {{ inventory_hostname }}: {{ save_result.stdout[0] | default('no save needed') }}"
-      when: bgp_peer_results.changed
-```
+        msg:
+          - "Host         : {{ inventory_hostname }}"
+          - "SNMPv3 user  : {{ snmp_v3_user }} — {{ 'PRESENT' if snmp_verify.stdout[0] is search(snmp_v3_user) else 'MISSING' }}"
+          - "SNMPv3 group : {{ snmp_group_name }} — {{ 'PRESENT' if snmp_verify.stdout[1] is search(snmp_group_name) else 'MISSING' }}"
+          - "Legacy communities targeted for removal: {{ legacy_communities | join(', ') }}
