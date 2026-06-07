@@ -1,96 +1,149 @@
 ---
-- name: Configure HSRP Gateway Redundancy on Network Devices
-  hosts: network_devices
-  gather_facts: no
+# bgp_config.yml
+#
+# Deploys eBGP/iBGP neighbor sessions on Cisco IOS routers.
+# Configures peer authentication, MD5 passwords, update-source, and
+# advertised prefixes. Waits for sessions to reach Established state.
+#
+# Inventory example:
+#   [wan_routers]
+#   core-rtr-01  ansible_host=10.0.0.1  bgp_router_id=10.255.0.1
+#   core-rtr-02  ansible_host=10.0.0.2  bgp_router_id=10.255.0.2
+#
+#   [wan_routers:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_net_user }}          # group_vars/all/vault.yml
+#   ansible_password={{ vault_net_password }}
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_pass={{ vault_enable_pass }}
+
+- name: Configure BGP neighbor sessions on Cisco IOS routers
+  hosts: wan_routers
+  gather_facts: false
 
   vars:
-    hsrp_interface: "{{ hsrp_if | default('GigabitEthernet0/0/1') }}"
-    hsrp_group: "{{ hsrp_grp | default(1) }}"
-    hsrp_virtual_ip: "{{ hsrp_vip | default('10.0.0.254') }}"
-    hsrp_timers_hello: 3
-    hsrp_timers_hold: 10
-    # Credentials stored in vault: ansible-vault view group_vars/network_devices/credentials.yml
-    ansible_user: "{{ vault_network_user }}"
-    ansible_password: "{{ vault_network_password }}"
-    ansible_network_os: ios
-    ansible_connection: network_cli
+    bgp_local_as: "{{ vault_bgp_local_as | default('65000') }}"
+    bgp_keepalive: 30
+    bgp_holdtime: 90
+    bgp_peers:
+      - neighbor: "10.0.1.2"
+        remote_as: "65100"
+        description: "upstream-isp-01"
+        password: "{{ vault_bgp_peer_pass }}"   # ansible-vault encrypted
+        ebgp_multihop: 2
+        update_source: "Loopback0"
+      - neighbor: "10.0.2.2"
+        remote_as: "65000"
+        description: "ibgp-peer-dist-01"
+        update_source: "Loopback0"
+    bgp_advertised_networks:
+      - { prefix: "203.0.113.0", mask: "255.255.255.0" }
 
   tasks:
-    - name: Gather device facts for configuration context
-      ios_facts:
-      register: device_info
-      retries: 2
-      delay: 5
-      until: device_info is succeeded
-
-    - name: Configure HSRP protocol parameters on interface
-      ios_config:
-        lines:
-          - "standby {{ hsrp_group }} ip {{ hsrp_virtual_ip }}"
-          - "standby {{ hsrp_group }} priority {{ hsrp_priority }}"
-          - "standby {{ hsrp_group }} preempt delay minimum 30"
-          - "standby {{ hsrp_group }} timers {{ hsrp_timers_hello }} {{ hsrp_timers_hold }}"
-        parents: "interface {{ hsrp_interface }}"
-        save_when: changed
-        backup: yes
-      register: hsrp_config
-      retries: 3
-      delay: 10
-      until: hsrp_config is succeeded
-
-    - name: Verify HSRP configuration was applied
-      ios_command:
-        commands: "show standby brief"
-      register: hsrp_status
-      failed_when:
-        - hsrp_status.stdout[0] | length == 0
-
-    - name: Retrieve detailed HSRP group information
-      ios_command:
+    - name: Capture pre-change BGP state
+      cisco.ios.ios_command:
         commands:
-          - "show standby {{ hsrp_group }}"
-      register: hsrp_details
+          - show ip bgp summary
+      register: bgp_pre_state
+      failed_when: false
 
-    - name: Display HSRP configuration summary
-      debug:
-        msg: |
-          ========== HSRP Configuration Report ==========
-          Device: {{ inventory_hostname }}
-          Model: {{ device_info.ansible_net_model }}
-          Serial: {{ device_info.ansible_net_serialnum }}
-          
-          HSRP Parameters:
-          - Group: {{ hsrp_group }}
-          - Virtual IP: {{ hsrp_virtual_ip }}
-          - Interface: {{ hsrp_interface }}
-          - Priority: {{ hsrp_priority }}
-          
-          Current Status:
-          {{ hsrp_details.stdout[0] }}
+    - name: Display current BGP summary
+      ansible.builtin.debug:
+        var: bgp_pre_state.stdout_lines
 
-  rescue:
-    - name: Log configuration failure with details
-      debug:
-        msg: |
-          HSRP configuration failed on {{ inventory_hostname }}
-          Error: {{ ansible_failed_result.msg }}
-          Failed Task: {{ ansible_failed_task.name }}
+    - name: Deploy BGP configuration
+      block:
+        - name: Configure BGP process and global parameters
+          cisco.ios.ios_config:
+            lines:
+              - "router bgp {{ bgp_local_as }}"
+              - " bgp router-id {{ bgp_router_id | default(ansible_host) }}"
+              - " bgp log-neighbor-changes"
+              - " timers bgp {{ bgp_keepalive }} {{ bgp_holdtime }}"
+              - " no auto-summary"
 
-    - name: Rollback HSRP configuration on failure
-      ios_config:
-        lines:
-          - "no standby {{ hsrp_group }}"
-        parents: "interface {{ hsrp_interface }}"
-      when: hsrp_config is defined and hsrp_config.failed
+        - name: Configure BGP peer base attributes
+          cisco.ios.ios_config:
+            parents: "router bgp {{ bgp_local_as }}"
+            lines:
+              - "neighbor {{ item.neighbor }} remote-as {{ item.remote_as }}"
+              - "neighbor {{ item.neighbor }} description {{ item.description }}"
+              - "neighbor {{ item.neighbor }} update-source {{ item.update_source }}"
+              - "neighbor {{ item.neighbor }} send-community both"
+          loop: "{{ bgp_peers }}"
+          loop_control:
+            label: "{{ item.neighbor }} (AS{{ item.remote_as }})"
 
-# Inventory Example:
-# [network_devices]
-# core-switch-1 ansible_host=10.1.1.10 hsrp_priority=110
-# core-switch-2 ansible_host=10.1.1.11 hsrp_priority=100
-#
-# [network_devices:vars]
-# ansible_network_os=ios
-# ansible_connection=network_cli
-# hsrp_group=1
-# hsrp_virtual_ip=10.0.0.254
-# hsrp_interface=GigabitEthernet0/0/1
+        - name: Configure eBGP multihop where required
+          cisco.ios.ios_config:
+            parents: "router bgp {{ bgp_local_as }}"
+            lines:
+              - "neighbor {{ item.neighbor }} ebgp-multihop {{ item.ebgp_multihop }}"
+          loop: "{{ bgp_peers | selectattr('ebgp_multihop', 'defined') | list }}"
+          loop_control:
+            label: "{{ item.neighbor }}"
+
+        - name: Configure BGP peer MD5 authentication
+          cisco.ios.ios_config:
+            parents: "router bgp {{ bgp_local_as }}"
+            lines:
+              - "neighbor {{ item.neighbor }} password {{ item.password }}"
+          loop: "{{ bgp_peers | selectattr('password', 'defined') | list }}"
+          loop_control:
+            label: "{{ item.neighbor }}"
+          no_log: true
+
+        - name: Advertise local prefixes into BGP
+          cisco.ios.ios_config:
+            parents: "router bgp {{ bgp_local_as }}"
+            lines:
+              - "network {{ item.prefix }} mask {{ item.mask }}"
+          loop: "{{ bgp_advertised_networks }}"
+
+        - name: Write configuration to NVRAM
+          cisco.ios.ios_config:
+            save_when: modified
+
+      rescue:
+        - name: Collect failure diagnostics
+          cisco.ios.ios_command:
+            commands:
+              - show logging | include BGP|CONFIG
+              - show running-config | section router bgp
+          register: failure_diag
+          failed_when: false
+
+        - name: Display failure diagnostics
+          ansible.builtin.debug:
+            var: failure_diag.stdout_lines
+
+        - name: Abort with descriptive message
+          ansible.builtin.fail:
+            msg: "BGP deployment failed on {{ inventory_hostname }} — review diagnostics above"
+
+    - name: Wait for BGP peers to reach Established state
+      cisco.ios.ios_command:
+        commands:
+          - show ip bgp summary
+        wait_for:
+          - result[0] contains Established
+        retries: 12
+        interval: 15
+      register: bgp_verify
+      failed_when: false
+
+    - name: Display post-deployment BGP summary
+      ansible.builtin.debug:
+        var: bgp_verify.stdout_lines
+
+    - name: Assert each expected peer appears in BGP summary
+      ansible.builtin.assert:
+        that:
+          - bgp_verify.stdout[0] is search(item.neighbor)
+        fail_msg: "Peer {{ item.neighbor }} not found in BGP summary on {{ inventory_hostname }}"
+        success_msg: "Peer {{ item.neighbor }} confirmed on {{ inventory_hostname }}"
+      loop: "{{ bgp_peers }}"
+      loop_control:
+        label: "{{ item.neighbor }}
