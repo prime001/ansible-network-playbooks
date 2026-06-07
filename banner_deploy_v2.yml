@@ -1,130 +1,119 @@
 ---
-# banner_deploy_v3.yml
+# banner_deploy_v3.yml - Multi-vendor banner deployment with post-deploy verification
 #
-# Vendor-agnostic banner deployment using ansible.netcommon cli_command/cli_config.
-# Adds pre-flight compliance check, per-device rollback snapshots, retry logic,
-# and post-deployment verification — distinct from ios_banner-based v1/v2 playbooks.
+# Distinct from banner_deploy_v2: adds NX-OS support, post-deploy content verification,
+# and per-platform banner type mapping (exec vs login).
 #
 # Inventory example:
-#   [wan_routers]
-#   rtr-wan-01 ansible_host=10.1.0.1 ansible_network_os=ios  site=NYC tier=core
-#   rtr-wan-02 ansible_host=10.1.0.2 ansible_network_os=eos  site=LAX tier=edge
-#   rtr-wan-03 ansible_host=10.1.0.3 ansible_network_os=nxos site=CHI tier=core
+#   [network_devices]
+#   core-01  ansible_host=10.0.1.1 ansible_network_os=ios
+#   core-02  ansible_host=10.0.1.2 ansible_network_os=ios
+#   dist-01  ansible_host=10.0.2.1 ansible_network_os=nxos
 #
-# Vault: group_vars/all/vault.yml (ansible-vault encrypted)
-#   vault_net_username, vault_net_password, vault_net_enable_password
+#   [network_devices:vars]
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_net_user }}             # ansible-vault encrypted
+#   ansible_password={{ vault_net_password }}      # ansible-vault encrypted
+#   ansible_become=true
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_enable_pass }} # ansible-vault encrypted
 
-- name: Deploy security banners — compliance-first with rollback (vendor-agnostic)
-  hosts: network_devices
+- name: Deploy and verify MOTD and login banners across IOS and NX-OS devices
+  hosts: "{{ target_hosts | default('network_devices') }}"
   gather_facts: false
-  connection: network_cli
-
   vars:
-    ansible_user: "{{ vault_net_username }}"
+    # Vault references — encrypt with: ansible-vault encrypt_string '<secret>'
+    ansible_user: "{{ vault_net_user }}"
     ansible_password: "{{ vault_net_password }}"
-    ansible_become: true
-    ansible_become_method: enable
-    ansible_become_password: "{{ vault_net_enable_password }}"
+    ansible_become_password: "{{ vault_enable_pass | default(vault_net_password) }}"
 
-    compliance_marker: "AUTHORIZED USE ONLY"
-    rollback_dir: "/tmp/banner_rollback"
-    organization: "{{ org_name | default('Network Operations') }}"
-    noc_email: "{{ noc_contact | default('noc@example.com') }}"
-    abuse_email: "{{ security_contact | default('security@example.com') }}"
-
-    login_banner_config: |
-      banner login ^
-      =============================================================
-        {{ organization }} — AUTHORIZED USE ONLY
-        Site: {{ site | default('UNKNOWN') }} | Tier: {{ tier | default('N/A') }}
-        Unauthorized access is prohibited and subject to prosecution.
-        All sessions are monitored and logged.
-        Contact: {{ noc_email }}
-      =============================================================
-      ^
-
-    motd_banner_config: |
-      banner motd ^
-      WARNING: Managed infrastructure — authorized personnel only.
-      Report security incidents to: {{ abuse_email }}
-      ^
+    banner_verification_string: "AUTHORIZED ACCESS ONLY"
+    banner_motd_text: |
+      *************************************************************************
+      *   AUTHORIZED ACCESS ONLY — Activity on this device is monitored       *
+      *   Unauthorized use is prohibited and subject to legal action           *
+      *   Disconnect immediately if you are not an authorized user             *
+      *************************************************************************
+    banner_login_text: |
+      WARNING: This system is restricted to authorized users.
+      All access attempts are logged and reviewed.
 
   tasks:
-    - name: Ensure local rollback directory exists
-      ansible.builtin.file:
-        path: "{{ rollback_dir }}"
-        state: directory
-        mode: "0700"
-      delegate_to: localhost
-      run_once: true
-
-    - name: Capture pre-change banner section
-      ansible.netcommon.cli_command:
-        command: show running-config | section banner
-      register: pre_banner
-      failed_when: false
-
-    - name: Save pre-change snapshot for rollback
-      ansible.builtin.copy:
-        content: "{{ pre_banner.stdout | default('') }}"
-        dest: "{{ rollback_dir }}/{{ inventory_hostname }}_banner_pre.txt"
-        mode: "0600"
-      delegate_to: localhost
-
-    - name: Determine current compliance state
-      ansible.builtin.set_fact:
-        is_compliant: "{{ compliance_marker in (pre_banner.stdout | default('')) }}"
-
-    - name: Report already-compliant devices
-      ansible.builtin.debug:
-        msg: "{{ inventory_hostname }} banner already compliant — skipping deployment"
-      when: is_compliant
-
-    - name: Deploy login and MOTD banners
-      when: not is_compliant
+    - name: Deploy banners on IOS/IOS-XE
       block:
-        - name: Apply login banner
-          ansible.netcommon.cli_config:
-            config: "{{ login_banner_config }}"
-          register: login_result
+        - name: Apply MOTD banner (IOS)
+          cisco.ios.ios_banner:
+            banner: motd
+            text: "{{ banner_motd_text }}"
+            state: present
+          register: ios_motd_result
           retries: 3
-          delay: 10
-          until: login_result is not failed
+          delay: 5
+          until: ios_motd_result is not failed
+          when: ansible_network_os == 'ios'
 
-        - name: Apply MOTD banner
-          ansible.netcommon.cli_config:
-            config: "{{ motd_banner_config }}"
-          register: motd_result
+        - name: Apply login banner (IOS)
+          cisco.ios.ios_banner:
+            banner: login
+            text: "{{ banner_login_text }}"
+            state: present
+          register: ios_login_result
           retries: 3
-          delay: 10
-          until: motd_result is not failed
+          delay: 5
+          until: ios_login_result is not failed
+          when: ansible_network_os == 'ios'
+
+        - name: Apply MOTD banner (NX-OS)
+          cisco.nxos.nxos_banner:
+            banner: motd
+            text: "{{ banner_motd_text }}"
+            state: present
+          register: nxos_motd_result
+          retries: 3
+          delay: 5
+          until: nxos_motd_result is not failed
+          when: ansible_network_os == 'nxos'
+
+        - name: Apply exec banner (NX-OS — login banner equivalent)
+          cisco.nxos.nxos_banner:
+            banner: exec
+            text: "{{ banner_login_text }}"
+            state: present
+          register: nxos_exec_result
+          retries: 3
+          delay: 5
+          until: nxos_exec_result is not failed
+          when: ansible_network_os == 'nxos'
+
+        - name: Verify MOTD banner contains expected content (IOS)
+          cisco.ios.ios_command:
+            commands:
+              - show banner motd
+          register: ios_banner_verify
+          failed_when: banner_verification_string not in ios_banner_verify.stdout[0]
+          when: ansible_network_os == 'ios'
+
+        - name: Verify MOTD banner contains expected content (NX-OS)
+          cisco.nxos.nxos_command:
+            commands:
+              - show banner motd
+          register: nxos_banner_verify
+          failed_when: banner_verification_string not in nxos_banner_verify.stdout[0]
+          when: ansible_network_os == 'nxos'
+
+        - name: Report successful deployment
+          ansible.builtin.debug:
+            msg:
+              - "Host        : {{ inventory_hostname }}"
+              - "Platform    : {{ ansible_network_os }}"
+              - "MOTD banner : deployed and verified"
+              - "Changed     : {{ (ios_motd_result.changed | default(false)) or (nxos_motd_result.changed | default(false)) }}"
 
       rescue:
-        - name: Attempt rollback from pre-change snapshot
-          ansible.netcommon.cli_config:
-            config: "{{ lookup('file', rollback_dir + '/' + inventory_hostname + '_banner_pre.txt') }}"
-          when: (pre_banner.stdout | default('')) != ''
-          ignore_errors: true
+        - name: Report deployment failure
+          ansible.builtin.debug:
+            msg: "Banner deployment FAILED on {{ inventory_hostname }}: {{ ansible_failed_task.name }} — {{ ansible_failed_result.msg | default('check device logs') }}"
 
-        - name: Fail with rollback notice
+        - name: Abort with descriptive error
           ansible.builtin.fail:
-            msg: >
-              Banner deployment failed on {{ inventory_hostname }}.
-              Rollback attempted from snapshot at
-              {{ rollback_dir }}/{{ inventory_hostname }}_banner_pre.txt.
-              Original error: {{ ansible_failed_result.msg | default('see task output') }}
-
-    - name: Verify compliance post-deployment
-      ansible.netcommon.cli_command:
-        command: show running-config | section banner
-      register: post_banner
-      failed_when: compliance_marker not in post_banner.stdout
-
-    - name: Report final deployment status
-      ansible.builtin.debug:
-        msg:
-          host: "{{ inventory_hostname }}"
-          platform: "{{ ansible_network_os | default('unknown') }}"
-          pre_compliant: "{{ is_compliant }}"
-          change_applied: "{{ not is_compliant }}"
-          post_compliant: "{{ compliance_marker in post_banner.stdout }}
+            msg: "Halting play for {{ inventory_hostname }} — banner deploy or verification step failed.
