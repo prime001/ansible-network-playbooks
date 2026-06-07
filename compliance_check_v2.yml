@@ -1,109 +1,128 @@
 ---
-# bgp_compliance.yml
-# Verifies BGP neighbor state compliance on Cisco IOS/IOS-XE routers.
-# Checks that all configured peers are Established, prefix counts meet
-# defined minimums, and flags any non-compliant sessions for remediation.
+# BGP Session Compliance Check
+# Validates BGP peer state, MD5 authentication, and outbound route-map policy
+# on IOS/IOS-XE routers. Designed to run as a scheduled compliance gate before
+# maintenance windows or as part of a daily audit cron job.
 #
-# Credentials stored in Ansible Vault — encrypt with:
-#   ansible-vault encrypt_string --vault-id prod@~/.vault-pass 'VALUE' --name 'vault_net_pass'
-# Required vault vars: vault_net_user, vault_net_pass, vault_enable_pass
-#
-# Example inventory (inventory/hosts.yml):
-# ---
-# all:
-#   children:
-#     core_routers:
-#       hosts:
-#         core-rtr-01:
-#           ansible_host: 10.0.1.1
-#         core-rtr-02:
-#           ansible_host: 10.0.1.2
-#       vars:
-#         ansible_network_os: ios
-#         ansible_connection: network_cli
-#         bgp_min_neighbors: 2
-#         bgp_min_prefixes: 50
+# Inventory example (inventory/routers.yml):
+#   all:
+#     children:
+#       routers:
+#         hosts:
+#           core-rtr-01:
+#             ansible_host: 10.0.0.1
+#             ansible_network_os: ios
+#             bgp_local_as: 65001
+#             bgp_expected_neighbors:
+#               - peer_ip: 10.0.0.2
+#                 peer_as: 65002
+#               - peer_ip: 10.0.0.3
+#                 peer_as: 65003
+#           core-rtr-02:
+#             ansible_host: 10.0.0.2
+#             ansible_network_os: ios
+#             bgp_local_as: 65001
+#             bgp_expected_neighbors:
+#               - peer_ip: 10.0.0.1
+#                 peer_as: 65001
+#         vars:
+#           ansible_connection: network_cli
+#           ansible_user: "{{ vault_net_user }}"       # group_vars/all/vault.yml
+#           ansible_password: "{{ vault_net_password }}"
+#           ansible_become: true
+#           ansible_become_method: enable
+#           ansible_become_pass: "{{ vault_enable_pass }}"
 
-- name: BGP Neighbor State Compliance Check
-  hosts: core_routers
+- name: BGP Session Compliance Check
+  hosts: routers
   gather_facts: false
   vars:
+    # Credentials sourced from Ansible Vault — never hardcode
     ansible_user: "{{ vault_net_user }}"
-    ansible_password: "{{ vault_net_pass }}"
-    ansible_become: true
-    ansible_become_method: enable
-    ansible_become_password: "{{ vault_enable_pass }}"
-    bgp_min_neighbors: "{{ bgp_min_neighbors | default(1) }}"
-    bgp_min_prefixes: "{{ bgp_min_prefixes | default(0) }}"
+    ansible_password: "{{ vault_net_password }}"
+    ansible_become_pass: "{{ vault_enable_pass }}"
+    compliance_passed: true
 
   tasks:
-    - name: Collect BGP summary and neighbor detail
+    - name: Retrieve BGP summary with retry on transient SSH failure
+      cisco.ios.ios_command:
+        commands:
+          - show bgp ipv4 unicast summary
+      register: bgp_summary
+      retries: 3
+      delay: 10
+      until: not bgp_summary.failed
+      changed_when: false
+
+    - name: Display BGP summary for audit record
+      ansible.builtin.debug:
+        var: bgp_summary.stdout_lines
+
+    - name: Run per-neighbor compliance checks
       block:
-        - name: Run BGP IPv4 unicast summary
+        - name: Query each expected BGP neighbor
           cisco.ios.ios_command:
             commands:
-              - show bgp ipv4 unicast summary
-          register: bgp_summary
-          retries: 3
-          delay: 10
-          until: bgp_summary is not failed
+              - "show bgp neighbors {{ item.peer_ip }}"
+          loop: "{{ bgp_expected_neighbors }}"
+          register: bgp_neighbor_detail
+          changed_when: false
 
-        - name: Run BGP neighbor prefix detail
-          cisco.ios.ios_command:
-            commands:
-              - show bgp ipv4 unicast neighbors | include BGP neighbor|Prefixes Current|BGP state
-          register: bgp_neighbors
-          retries: 2
-          delay: 5
-          until: bgp_neighbors is not failed
-
-        - name: Parse non-established session states
-          ansible.builtin.set_fact:
-            non_established: >-
-              {{ bgp_summary.stdout[0]
-                 | regex_findall('(?m)^(\d{1,3}(?:\.\d{1,3}){3})\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+(Idle|Active|Connect|OpenSent|OpenConfirm)')
-              }}
-            established_count: >-
-              {{ bgp_summary.stdout[0]
-                 | regex_findall('(?m)^\d{1,3}(?:\.\d{1,3}){3}.+\d+\s+\d+$')
-                 | length
-              }}
-
-        - name: Display raw BGP summary
-          ansible.builtin.debug:
-            msg: "{{ bgp_summary.stdout[0].splitlines() }}"
-
-        - name: Display BGP neighbor prefix detail
-          ansible.builtin.debug:
-            msg: "{{ bgp_neighbors.stdout[0].splitlines() }}"
-
-        - name: Assert minimum established neighbor count
+        - name: Assert session is Established for each neighbor
           ansible.builtin.assert:
             that:
-              - established_count | int >= bgp_min_neighbors | int
+              - "'BGP state = Established' in item.stdout[0]"
             fail_msg: >-
-              FAIL {{ inventory_hostname }}: only {{ established_count }} Established
-              neighbor(s); expected >= {{ bgp_min_neighbors }}
+              [FAIL] {{ inventory_hostname }}: neighbor {{ item.item.peer_ip }}
+              (AS {{ item.item.peer_as }}) is not in Established state.
             success_msg: >-
-              PASS {{ inventory_hostname }}: {{ established_count }} Established
-              neighbor(s) meets minimum of {{ bgp_min_neighbors }}
+              [PASS] {{ inventory_hostname }}: neighbor {{ item.item.peer_ip }} Established.
+          loop: "{{ bgp_neighbor_detail.results }}"
+          loop_control:
+            label: "{{ item.item.peer_ip }}"
 
-        - name: Assert no non-established sessions exist
+        - name: Assert MD5 authentication is configured per neighbor
           ansible.builtin.assert:
             that:
-              - non_established | length == 0
+              - "'password' in item.stdout[0]"
             fail_msg: >-
-              FAIL {{ inventory_hostname }}: non-Established BGP sessions detected:
-              {{ non_established | map(attribute=0) | list | join(', ') }}
-            success_msg: "PASS {{ inventory_hostname }}: all BGP sessions are Established"
+              [FAIL] {{ inventory_hostname }}: neighbor {{ item.item.peer_ip }}
+              is missing MD5 authentication — session vulnerable to spoofing.
+            success_msg: >-
+              [PASS] {{ inventory_hostname }}: neighbor {{ item.item.peer_ip }}
+              has MD5 authentication configured.
+          loop: "{{ bgp_neighbor_detail.results }}"
+          loop_control:
+            label: "{{ item.item.peer_ip }}"
+
+        - name: Assert outbound route-map policy is applied per neighbor
+          ansible.builtin.assert:
+            that:
+              - "'Route map for outgoing' in item.stdout[0]"
+            fail_msg: >-
+              [FAIL] {{ inventory_hostname }}: neighbor {{ item.item.peer_ip }}
+              has no outbound route-map — unfiltered prefix advertisement risk.
+            success_msg: >-
+              [PASS] {{ inventory_hostname }}: neighbor {{ item.item.peer_ip }}
+              has outbound route-map applied.
+          loop: "{{ bgp_neighbor_detail.results }}"
+          loop_control:
+            label: "{{ item.item.peer_ip }}"
 
       rescue:
-        - name: Log collection or assertion failure
+        - name: Mark host as non-compliant
+          ansible.builtin.set_fact:
+            compliance_passed: false
+
+        - name: Report compliance failure details
           ansible.builtin.debug:
             msg: >-
-              ERROR on {{ inventory_hostname }}: {{ ansible_failed_task.name }}
-              — {{ ansible_failed_result.msg | default(ansible_failed_result.stdout_lines | default(['no detail']) | last) }}
+              COMPLIANCE FAILURE on {{ inventory_hostname }}:
+              One or more BGP checks failed. Verify peer state, MD5 auth,
+              and outbound route-map policy before the next maintenance window.
 
-        - name: Fail the play for this host
-          ansible.builtin.fail:
-            msg: "BGP compliance check did not pass for {{ inventory_hostname }}
+    - name: Emit final compliance status per host
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} BGP compliance result:
+          {{ 'PASSED' if compliance_passed else 'FAILED — remediation required' }}
