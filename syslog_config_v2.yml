@@ -1,126 +1,106 @@
 ---
-# ospf_config.yml
-# Deploys OSPFv2: process, router-id, network statements, passive interfaces,
-# and area 0 MD5 authentication on Cisco IOS/IOS-XE routers.
-#
-# Credentials sourced from group_vars/all/vault.yml (ansible-vault encrypted):
-#   vault_net_user, vault_net_pass, vault_ospf_md5_key
-#
 # Inventory example:
-#   [core_routers]
-#   rtr-core-01  ansible_host=10.0.1.1  ospf_router_id=1.1.1.1
-#   rtr-core-02  ansible_host=10.0.1.2  ospf_router_id=2.2.2.2
+# [network_devices]
+# core-rtr-01   ansible_host=10.0.1.1  ansible_network_os=ios
+# dist-sw-01    ansible_host=10.0.1.2  ansible_network_os=nxos
 #
-#   [core_routers:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user={{ vault_net_user }}
-#   ansible_password={{ vault_net_pass }}
-#   ansible_become=yes
-#   ansible_become_method=enable
+# [network_devices:vars]
+# ansible_user="{{ vault_net_user }}"        # ansible-vault encrypted
+# ansible_password="{{ vault_net_password }}" # ansible-vault encrypted
+# ansible_become=true
+# ansible_become_method=enable
+# ansible_connection=network_cli
 
-- name: Configure OSPFv2 on Cisco IOS/IOS-XE core routers
-  hosts: core_routers
+- name: Harden logging buffer, timestamps, rate-limiting, and source-interface on network devices
+  hosts: network_devices
   gather_facts: false
 
   vars:
-    ospf_process_id: 1
-    ospf_reference_bandwidth: 10000
-    ospf_networks:
-      - { prefix: "10.0.0.0", wildcard: "0.0.255.255", area: 0 }
-      - { prefix: "192.168.100.0", wildcard: "0.0.0.255", area: 1 }
-    ospf_passive_interfaces:
-      - Loopback0
-      - GigabitEthernet0/2
-    ospf_backbone_auth: true
-    ospf_md5_key_id: 1
-    ospf_md5_key: "{{ vault_ospf_md5_key }}"  # ansible-vault encrypted
+    # Load credentials from vault: ansible-playbook site.yml --vault-password-file ~/.vault_pass
+    ansible_user: "{{ vault_net_user }}"
+    ansible_password: "{{ vault_net_password }}"
+    log_buffer_size: 131072
+    log_severity: informational
+    log_rate_limit: 30
+    log_source_intf: Loopback0
 
   tasks:
 
-    - name: Verify device is reachable before making changes
+    - name: Capture pre-change logging state (IOS)
       cisco.ios.ios_command:
         commands:
-          - show version | include Software
-      register: pre_check
-      retries: 3
+          - show logging | include Syslog|Buffer|rate-limit|Source
+      register: pre_log_state
+      retries: 2
       delay: 5
-      until: not pre_check.failed
+      when: ansible_network_os == 'ios'
 
-    - name: Deploy OSPFv2 configuration
+    - name: Display pre-change logging state
+      ansible.builtin.debug:
+        var: pre_log_state.stdout_lines
+      when: pre_log_state is not skipped
+
+    - name: Apply logging hardening (IOS / IOS-XE)
       block:
 
-        - name: Configure OSPF process, router-id, and reference bandwidth
+        - name: Configure buffer size, timestamps, rate-limit, and source-interface
           cisco.ios.ios_config:
             lines:
-              - "router-id {{ ospf_router_id }}"
-              - "auto-cost reference-bandwidth {{ ospf_reference_bandwidth }}"
-            parents: "router ospf {{ ospf_process_id }}"
-          register: ospf_base_result
+              - "logging buffered {{ log_buffer_size }} {{ log_severity }}"
+              - logging timestamps log datetime msec
+              - no logging console
+              - "logging monitor {{ log_severity }}"
+              - "logging rate-limit {{ log_rate_limit }}"
+              - "logging source-interface {{ log_source_intf }}"
+            save_when: changed
+          register: ios_result
 
-        - name: Advertise networks into OSPF areas
-          cisco.ios.ios_config:
-            lines:
-              - "network {{ item.prefix }} {{ item.wildcard }} area {{ item.area }}"
-            parents: "router ospf {{ ospf_process_id }}"
-          loop: "{{ ospf_networks }}"
-
-        - name: Suppress OSPF hellos on stub and loopback interfaces
-          cisco.ios.ios_config:
-            lines:
-              - "passive-interface {{ item }}"
-            parents: "router ospf {{ ospf_process_id }}"
-          loop: "{{ ospf_passive_interfaces }}"
-
-        - name: Enable MD5 authentication on backbone area
-          cisco.ios.ios_config:
-            lines:
-              - "area 0 authentication message-digest"
-            parents: "router ospf {{ ospf_process_id }}"
-          when: ospf_backbone_auth | bool
-
-        - name: Persist configuration to NVRAM
-          cisco.ios.ios_config:
-            save_when: modified
-
-        - name: Wait for OSPF adjacencies to converge
+        - name: Verify buffer size was applied
           cisco.ios.ios_command:
             commands:
-              - show ip ospf neighbor
-          register: ospf_neighbor_output
-          retries: 6
-          delay: 10
-          until: "'FULL' in ospf_neighbor_output.stdout[0] or not ospf_neighbor_output.failed"
-          failed_when: false
-
-        - name: Collect OSPF process summary
-          cisco.ios.ios_command:
-            commands:
-              - show ip ospf
-              - show ip ospf neighbor
-          register: ospf_summary
-
-        - name: Display OSPF state post-deployment
-          debug:
-            msg: "{{ ospf_summary.stdout_lines }}"
+              - show logging | include Buffer logging
+          register: verify_buffer
+          failed_when: log_buffer_size | string not in verify_buffer.stdout[0]
 
       rescue:
-        - name: Capture diagnostics on configuration failure
-          cisco.ios.ios_command:
-            commands:
-              - show ip ospf
-              - show ip route ospf
-              - show logging | last 30
-          register: failure_diag
-          ignore_errors: true
 
-        - name: Display failure diagnostics
-          debug:
-            var: failure_diag.stdout_lines
+        - name: Report configuration failure
+          ansible.builtin.debug:
+            msg: "Logging hardening FAILED on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
 
-        - name: Fail with actionable context
-          fail:
-            msg: >
-              OSPFv2 deployment failed on {{ inventory_hostname }}.
-              Failed task: {{ ansible_failed_task.name }}.
-              Error: {{ ansible_failed_result.msg | default('review diagnostics above') }}
+        - name: Abort play for this host
+          ansible.builtin.fail:
+            msg: "Manual review required for {{ inventory_hostname }}"
+
+      when: ansible_network_os == 'ios'
+
+    - name: Apply logging hardening (NX-OS)
+      block:
+
+        - name: Configure buffer logging and timestamps (NX-OS)
+          cisco.nxos.nxos_config:
+            lines:
+              - "logging level all {{ log_severity }}"
+              - logging timestamp milliseconds
+              - no logging console
+          register: nxos_result
+
+      rescue:
+
+        - name: Report NX-OS configuration failure
+          ansible.builtin.debug:
+            msg: "Logging hardening FAILED on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown') }}"
+
+        - name: Abort play for this host
+          ansible.builtin.fail:
+            msg: "Manual review required for {{ inventory_hostname }}"
+
+      when: ansible_network_os == 'nxos'
+
+    - name: Summarize result per host
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: logging hardening
+          {{ 'applied — config changed'
+             if (ios_result.changed | default(false) or nxos_result.changed | default(false))
+             else 'already compliant — no change' }}
