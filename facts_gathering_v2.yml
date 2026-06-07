@@ -1,112 +1,110 @@
 ---
-# CDP/LLDP Neighbor Discovery and Topology Documentation
+# BGP Peer Status Collection
+# Queries BGP neighbor summary and flags non-Established sessions across multi-vendor devices.
+# Saves per-device status reports to the Ansible control node under /tmp.
 #
-# Collects CDP and LLDP neighbor tables from IOS/IOS-XE devices,
-# correlates with interface status, and saves per-device topology reports.
-# Useful for network audits, documentation, and change-window pre-checks.
+# Inventory example (inventory/bgp_routers.yml):
+# ---
+# all:
+#   children:
+#     bgp_routers:
+#       hosts:
+#         core-rtr-01:
+#           ansible_host: 10.0.0.1
+#           ansible_network_os: ios
+#           bgp_asn: 65001
+#         dist-sw-01:
+#           ansible_host: 10.0.1.1
+#           ansible_network_os: nxos
+#           bgp_asn: 65001
+#         edge-rtr-01:
+#           ansible_host: 10.0.2.1
+#           ansible_network_os: iosxr
+#           bgp_asn: 65100
 #
-# Inventory example:
-#   [core]
-#   core-sw01 ansible_host=10.0.1.1
-#   core-sw02 ansible_host=10.0.1.2
-#
-#   [distribution]
-#   dist-sw01 ansible_host=10.0.2.1
-#
-#   [all:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user={{ vault_net_username }}          # ansible-vault encrypted
-#   ansible_password={{ vault_net_password }}      # ansible-vault encrypted
-#   ansible_become=yes
-#   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_password }}
+# Vault (group_vars/all/vault.yml): vault_net_user, vault_net_pass, vault_net_enable
 
-- name: CDP/LLDP Neighbor Discovery and Topology Documentation
-  hosts: network_devices
+- name: Collect BGP peer status and flag non-Established sessions
+  hosts: bgp_routers
   gather_facts: false
+  connection: network_cli
 
   vars:
-    output_dir: "{{ playbook_dir }}/reports/neighbor_discovery"
-    report_date: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+    ansible_user: "{{ vault_net_user }}"
+    ansible_password: "{{ vault_net_pass }}"
+    ansible_become: true
+    ansible_become_method: enable
+    ansible_become_password: "{{ vault_net_enable }}"
+    bgp_summary_cmd:
+      ios: "show ip bgp summary"
+      nxos: "show bgp ipv4 unicast summary"
+      iosxr: "show bgp ipv4 unicast summary"
+    # Regex matches any session not in Established state
+    bgp_down_states: "Idle|Active|Connect|OpenSent|OpenConfirm"
 
   tasks:
-    - name: Create report output directory
-      ansible.builtin.file:
-        path: "{{ output_dir }}"
-        state: directory
-        mode: "0755"
-      delegate_to: localhost
-      run_once: true
-
-    - name: Collect CDP and LLDP neighbor tables
+    - name: Gather BGP neighbor summary
       block:
-        - name: Gather CDP neighbor detail
-          cisco.ios.ios_command:
-            commands:
-              - show cdp neighbors detail
-          register: cdp_neighbors
+        - name: Run platform-appropriate BGP summary command
+          ansible.netcommon.cli_command:
+            command: "{{ bgp_summary_cmd[ansible_network_os] | default('show ip bgp summary') }}"
+          register: bgp_summary
           retries: 2
           delay: 5
-          until: cdp_neighbors is not failed
+          until: bgp_summary is not failed
 
-        - name: Gather LLDP neighbor detail
+        - name: Gather per-neighbor state detail for non-Established peers (IOS)
           cisco.ios.ios_command:
             commands:
-              - show lldp neighbors detail
-          register: lldp_neighbors
-          retries: 2
-          delay: 5
-          until: lldp_neighbors is not failed
-
-        - name: Gather interface status for neighbor correlation
-          cisco.ios.ios_command:
-            commands:
-              - show interfaces status
-          register: intf_status
-          retries: 2
-          delay: 5
-          until: intf_status is not failed
+              - "show ip bgp neighbors | include BGP neighbor is|BGP state"
+          register: bgp_peer_detail
+          failed_when: false
+          when: ansible_network_os == 'ios'
 
       rescue:
-        - name: Record collection failure and continue
+        - name: Record collection failure
           ansible.builtin.set_fact:
-            collection_failed: true
-            failure_reason: "{{ ansible_failed_result.msg | default('unknown error') }}"
+            bgp_collect_failed: true
 
-        - name: Log failed device
+        - name: Log connection error
           ansible.builtin.debug:
-            msg: "WARN: neighbor collection failed on {{ inventory_hostname }} — {{ failure_reason }}"
+            msg: >-
+              Cannot collect BGP data from {{ inventory_hostname }}:
+              {{ ansible_failed_result.msg | default('connection error') }}
 
-    - name: Display CDP neighbor summary
+    - name: Display BGP neighbor summary
       ansible.builtin.debug:
-        msg: "{{ cdp_neighbors.stdout_lines[0] }}"
-      when:
-        - collection_failed is not defined
-        - cdp_neighbors.stdout[0] | length > 0
+        msg:
+          - "=== BGP Status: {{ inventory_hostname }} | AS {{ bgp_asn | default('N/A') }} | {{ ansible_network_os | upper }} ==="
+          - "{{ bgp_summary.stdout }}"
+      when: bgp_collect_failed is not defined
 
-    - name: Save neighbor topology report
+    - name: Alert on non-Established BGP sessions
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: Non-Established BGP peer(s) detected on {{ inventory_hostname }}.
+          Sessions in one of: {{ bgp_down_states }} — investigate immediately.
+      when:
+        - bgp_collect_failed is not defined
+        - bgp_summary.stdout is defined
+        - bgp_summary.stdout | regex_search(bgp_down_states)
+
+    - name: Write per-device BGP status report to control node
       ansible.builtin.copy:
         content: |
-          ========================================
-          Neighbor Topology Report
-          Device    : {{ inventory_hostname }}
-          Timestamp : {{ report_date }}
-          ========================================
+          Device   : {{ inventory_hostname }}
+          BGP AS   : {{ bgp_asn | default('N/A') }}
+          Platform : {{ ansible_network_os }}
 
-          --- CDP Neighbors ---
-          {{ cdp_neighbors.stdout[0] | default('CDP not enabled or no neighbors') }}
-
-          --- LLDP Neighbors ---
-          {{ lldp_neighbors.stdout[0] | default('LLDP not enabled or no neighbors') }}
-
-          --- Interface Status ---
-          {{ intf_status.stdout[0] | default('Not collected') }}
-        dest: "{{ output_dir }}/{{ inventory_hostname }}_neighbors_{{ report_date }}.txt"
+          {{ bgp_summary.stdout }}
+        dest: "/tmp/bgp_status_{{ inventory_hostname }}.txt"
+        mode: '0640'
       delegate_to: localhost
-      when: collection_failed is not defined
+      when: bgp_collect_failed is not defined
 
-    - name: Warn on skipped devices
+    - name: Report devices with failed BGP data collection
       ansible.builtin.debug:
-        msg: "SKIP: {{ inventory_hostname }} — neighbor data not saved due to collection failure"
-      when: collection_failed is defined
+        msg: >-
+          BGP collection FAILED for {{ inventory_hostname }} —
+          verify SSH access and confirm BGP process is running.
+      when: bgp_collect_failed is defined and bgp_collect_failed | bool
