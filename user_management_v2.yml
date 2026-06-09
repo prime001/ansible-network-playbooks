@@ -1,136 +1,117 @@
 ---
-# AAA Authentication and TACACS+ Server Group Configuration
-# Manages AAA new-model, TACACS+ server groups, authentication/authorization/
-# accounting policies, and validates server reachability with local fallback.
+# ssh_key_auth.yml - SSH Public Key Authentication Management for Cisco IOS
+#
+# Configures SSH public key authentication (ip ssh pubkey-chain) for local users,
+# enabling key-based SSH login. Distinct from user_management.yml which handles
+# username/password/privilege-level provisioning.
+#
+# Usage: ansible-playbook ssh_key_auth.yml -i inventory/network.yml --ask-vault-pass
 #
 # Inventory example:
-#   [core_routers]
-#   rtr-core-01 ansible_host=10.0.1.1
-#   rtr-core-02 ansible_host=10.0.1.2
+#   [ios_routers]
+#   core-rtr-01  ansible_host=10.0.1.1
+#   dist-rtr-01  ansible_host=10.0.1.2
 #
-#   [core_routers:vars]
+#   [ios_routers:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_user={{ vault_net_user }}
-#   ansible_password={{ vault_net_password }}
-#   ansible_become=yes
+#   ansible_user={{ vault_net_user }}             # ansible-vault encrypted
+#   ansible_password={{ vault_net_password }}      # ansible-vault encrypted
+#   ansible_become=true
 #   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_password }}
-#
-# Secrets: group_vars/core_routers/vault.yml (ansible-vault encrypted)
-# Encrypt: ansible-vault encrypt_string 'value' --name 'vault_var_name'
+#   ansible_become_password={{ vault_enable_pw }}  # ansible-vault encrypted
 
-- name: Configure AAA new-model with TACACS+ server groups and local fallback
-  hosts: core_routers
+- name: Manage SSH public key authentication on Cisco IOS devices
+  hosts: ios_routers
   gather_facts: false
+
   vars:
-    # All vault_ vars sourced from ansible-vault encrypted group_vars
-    tacacs_group_name: TACACS-PROD
-    tacacs_source_interface: Loopback0
-    tacacs_servers:
-      - name: TACACS-PRIMARY
-        host: "{{ vault_tacacs_primary_ip }}"
-        key: "{{ vault_tacacs_key }}"
-        timeout: 5
-      - name: TACACS-SECONDARY
-        host: "{{ vault_tacacs_secondary_ip }}"
-        key: "{{ vault_tacacs_key }}"
-        timeout: 5
+    ssh_version: 2
+    ssh_timeout: 60
+    ssh_auth_retries: 3
+    # Defined in group_vars/all/vault.yml (ansible-vault encrypted)
+    # Structure: [{username: "netops", public_key: "ssh-rsa AAAA...xyz user@host"}, ...]
+    ssh_key_users: "{{ vault_ssh_key_users | default([]) }}"
 
   tasks:
-    - name: Verify device is reachable before making changes
+    - name: Harden SSH transport settings
+      cisco.ios.ios_config:
+        lines:
+          - "ip ssh version {{ ssh_version }}"
+          - "ip ssh time-out {{ ssh_timeout }}"
+          - "ip ssh authentication-retries {{ ssh_auth_retries }}"
+      register: ssh_base_cfg
+      retries: 2
+      delay: 5
+      until: ssh_base_cfg is not failed
+
+    - name: Gather current SSH and pubkey-chain state
       cisco.ios.ios_command:
-        commands: show clock
-      register: reachability_check
-      retries: 3
-      delay: 10
-      until: reachability_check is not failed
+        commands:
+          - show ip ssh
+          - show ip ssh pubkey-chain
+      register: ssh_state
+      failed_when: ssh_state.stdout | length == 0
 
-    - name: Apply TACACS+ server definitions and AAA group
+    - name: Display current SSH state
+      ansible.builtin.debug:
+        msg: "{{ ssh_state.stdout_lines }}"
+
+    - name: Configure RSA public keys per user
       block:
-        - name: Define TACACS+ servers
+        - name: Push public key into pubkey-chain for each user
           cisco.ios.ios_config:
             lines:
-              - "tacacs server {{ item.name }}"
-              - " address ipv4 {{ item.host }}"
-              - " key {{ item.key }}"
-              - " timeout {{ item.timeout }}"
-          loop: "{{ tacacs_servers }}"
+              - key-string
+              - "{{ item.public_key }}"
+              - exit
+            parents:
+              - ip ssh pubkey-chain
+              - "username {{ item.username }}"
+          loop: "{{ ssh_key_users }}"
           loop_control:
-            label: "{{ item.name }}"
-          register: tacacs_server_result
-          notify: Write memory
-
-        - name: Configure TACACS+ server group with source interface
-          cisco.ios.ios_config:
-            lines:
-              - "server name {{ item.name }}"
-              - "ip tacacs source-interface {{ tacacs_source_interface }}"
-            parents: "aaa group server tacacs+ {{ tacacs_group_name }}"
-          loop: "{{ tacacs_servers }}"
-          loop_control:
-            label: "{{ item.name }}"
-          notify: Write memory
-
-        - name: Enable aaa new-model and apply authentication policies
-          cisco.ios.ios_config:
-            lines:
-              - aaa new-model
-              - "aaa authentication login default group {{ tacacs_group_name }} local"
-              - "aaa authentication enable default group {{ tacacs_group_name }} enable"
-              - "aaa authorization exec default group {{ tacacs_group_name }} local if-authenticated"
-              - "aaa authorization commands 15 default group {{ tacacs_group_name }} local"
-              - "aaa accounting exec default start-stop group {{ tacacs_group_name }}"
-              - "aaa accounting commands 15 default start-stop group {{ tacacs_group_name }}"
-          register: aaa_policy_result
-          notify: Write memory
+            label: "{{ item.username }}"
+          register: pubkey_cfg
+          when: ssh_key_users | length > 0
 
       rescue:
-        - name: Report configuration failure
+        - name: Report pubkey configuration failure
           ansible.builtin.debug:
             msg: >
-              AAA configuration failed on {{ inventory_hostname }}:
-              {{ ansible_failed_result.msg | default('see stdout') }}
+              SSH pubkey config failed on {{ inventory_hostname }}:
+              {{ ansible_failed_result.msg | default('unknown error') }}
 
         - name: Abort with actionable error
           ansible.builtin.fail:
-            msg: "AAA rollback required on {{ inventory_hostname }} — verify TACACS+ reachability and key before retrying"
+            msg: >
+              SSH pubkey-chain configuration failed on {{ inventory_hostname }}.
+              Verify IOS version supports 'ip ssh pubkey-chain' (requires 15.1+).
 
-    - name: Test TACACS+ group reachability from device
+    - name: Verify pubkey-chain reflects configured users
       cisco.ios.ios_command:
         commands:
-          - "test aaa group {{ tacacs_group_name }} {{ vault_net_user }} {{ vault_net_password }} legacy"
-      register: aaa_test_result
-      failed_when: >
-        'successfully' not in (aaa_test_result.stdout[0] | lower) and
-        'pass' not in (aaa_test_result.stdout[0] | lower)
-      ignore_errors: true
+          - show ip ssh pubkey-chain
+      register: pubkey_verify
+      retries: 2
+      delay: 3
+      until: pubkey_verify is not failed
+      when: ssh_key_users | length > 0
 
-    - name: Collect post-change AAA and TACACS+ state for audit
-      cisco.ios.ios_command:
-        commands:
-          - show running-config | section ^aaa
-          - show tacacs
-      register: aaa_audit
+    - name: Assert each user key appears in pubkey-chain output
+      ansible.builtin.assert:
+        that:
+          - "item.username in pubkey_verify.stdout[0]"
+        fail_msg: "Public key for '{{ item.username }}' not found in pubkey-chain on {{ inventory_hostname }}"
+        success_msg: "Public key verified for '{{ item.username }}' on {{ inventory_hostname }}"
+      loop: "{{ ssh_key_users }}"
+      loop_control:
+        label: "{{ item.username }}"
+      when: ssh_key_users | length > 0
 
-    - name: Display AAA configuration audit output
+    - name: Show SSH key authentication summary
       ansible.builtin.debug:
         msg:
-          - "=== AAA CONFIG: {{ inventory_hostname }} ==="
-          - "{{ aaa_audit.stdout_lines[0] }}"
-          - "=== TACACS+ STATUS ==="
-          - "{{ aaa_audit.stdout_lines[1] }}"
-          - "=== SERVER TEST RESULT ==="
-          - "{{ aaa_test_result.stdout[0] | default('test skipped or failed') }}"
-
-  handlers:
-    - name: Write memory
-      cisco.ios.ios_command:
-        commands:
-          - command: write memory
-            prompt: '\[confirm\]'
-            answer: "\r"
-      register: save_output
-      failed_when: >
-        'OK' not in (save_output.stdout[0] | default('')) and
-        'Building' not in (save_output.stdout[0] | default(''))
+          - "Host            : {{ inventory_hostname }}"
+          - "SSH hardening   : {{ 'changed' if ssh_base_cfg.changed else 'already compliant' }}"
+          - "Key auth users  : {{ ssh_key_users | map(attribute='username') | list }}"
+          - "SSH version     : {{ ssh_version }}
