@@ -1,141 +1,95 @@
-The content is ready. Here's the playbook I've written — a `qos_policy_deploy.yml` covering DSCP-based QoS classification and egress queuing, which is distinct from all existing playbooks in the repo:
-
-```yaml
 ---
-# qos_policy_deploy.yml
-# Deploys DSCP-based QoS classification and egress queuing policies to Cisco IOS/IOS-XE WAN routers.
-# Credentials sourced from Ansible Vault — run with: ansible-playbook qos_policy_deploy.yml --ask-vault-pass
+# ospf_config.yml
+# Deploys and validates OSPF routing process configuration on Cisco IOS routers.
+# Manages router-id, reference bandwidth, network statements, and passive interfaces.
 #
 # Inventory example:
-#   [wan_routers]
-#   rtr-core-01 ansible_host=10.0.1.1
-#   rtr-core-02 ansible_host=10.0.1.2
+#   [routers]
+#   core-rtr-01   ansible_host=10.0.1.1  ospf_pid=1
+#   branch-rtr-01 ansible_host=10.0.2.1  ospf_pid=1
 #
-#   [wan_routers:vars]
+#   [routers:vars]
 #   ansible_network_os=ios
-#   ansible_user={{ vault_net_user }}
-#   ansible_password={{ vault_net_pass }}
+#   ansible_connection=network_cli
+#   ansible_user="{{ vault_net_username }}"          # ansible-vault encrypted
+#   ansible_password="{{ vault_net_password }}"      # ansible-vault encrypted
 #   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_become_pass={{ vault_enable_pass }}
+#   ansible_become_password="{{ vault_enable_password }}"  # ansible-vault encrypted
 
-- name: Deploy DSCP QoS Classification and Egress Queuing Policies
-  hosts: wan_routers
+- name: Configure OSPF routing process on Cisco IOS routers
+  hosts: routers
   gather_facts: false
-  connection: network_cli
 
   vars:
-    # Store all credentials in Ansible Vault (vault_net_user, vault_net_pass, vault_enable_pass)
-    qos_policy_name: WAN_EGRESS_QOS
-    wan_interfaces: "{{ target_interfaces | default(['GigabitEthernet0/0/0']) }}"
-    qos_classes:
-      - name: VOICE
-        dscp: ef
-        queue_type: priority
-        percent: 30
-      - name: VIDEO
-        dscp: af41
-        queue_type: bandwidth
-        percent: 20
-      - name: CRITICAL_DATA
-        dscp: af21
-        queue_type: bandwidth
-        percent: 25
-      - name: SCAVENGER
-        dscp: cs1
-        queue_type: bandwidth
-        percent: 5
+    ospf_process_id: "{{ ospf_pid | default(1) }}"
+    ospf_router_id: "{{ ansible_host }}"
+    ospf_reference_bandwidth: 10000
+    ospf_log_adjacency: true
+    ospf_networks:
+      - prefix: "10.0.0.0"
+        wildcard: "0.255.255.255"
+        area: 0
+      - prefix: "192.168.100.0"
+        wildcard: "0.0.0.255"
+        area: 1
+    ospf_passive_interfaces:
+      - Loopback0
 
   tasks:
-    - name: Verify device is reachable before making changes
+    - name: Confirm device reachability before changes
       cisco.ios.ios_command:
-        commands: show version
-      register: version_output
+        commands:
+          - show version
+      register: device_check
       retries: 3
       delay: 10
-      until: version_output is not failed
+      until: device_check is not failed
 
-    - name: Capture pre-change QoS state for audit trail
-      cisco.ios.ios_command:
-        commands:
-          - show class-map
-          - show policy-map
-      register: pre_qos_state
-
-    - name: Deploy QoS class-maps and policy-map
+    - name: Deploy OSPF configuration
       block:
-        - name: Configure DSCP match class-maps
+        - name: Configure OSPF process parameters
           cisco.ios.ios_config:
             lines:
-              - "match dscp {{ item.dscp }}"
-            parents: "class-map match-any {{ item.name }}"
-            save_when: never
-          loop: "{{ qos_classes }}"
-          register: classmap_result
+              - "router-id {{ ospf_router_id }}"
+              - "auto-cost reference-bandwidth {{ ospf_reference_bandwidth }}"
+              - "{{ 'log-adjacency-changes' if ospf_log_adjacency else 'no log-adjacency-changes' }}"
+            parents: "router ospf {{ ospf_process_id }}"
+            save_when: modified
 
-        - name: Configure policy-map with per-class bandwidth allocations
+        - name: Add OSPF network statements
           cisco.ios.ios_config:
             lines:
-              - "class VOICE"
-              - " priority percent 30"
-              - "class VIDEO"
-              - " bandwidth percent 20"
-              - "class CRITICAL_DATA"
-              - " bandwidth percent 25"
-              - "class SCAVENGER"
-              - " bandwidth percent 5"
-              - "class class-default"
-              - " fair-queue"
-              - " bandwidth percent 20"
-            parents: "policy-map {{ qos_policy_name }}"
-            save_when: never
-          register: policymap_result
+              - "network {{ item.prefix }} {{ item.wildcard }} area {{ item.area }}"
+            parents: "router ospf {{ ospf_process_id }}"
+          loop: "{{ ospf_networks }}"
+          loop_control:
+            label: "{{ item.prefix }} area {{ item.area }}"
 
-        - name: Bind service-policy outbound to each WAN interface
+        - name: Configure passive interfaces
           cisco.ios.ios_config:
             lines:
-              - "service-policy output {{ qos_policy_name }}"
-            parents: "interface {{ item }}"
-            save_when: never
-          loop: "{{ wan_interfaces }}"
-          register: interface_policy_result
-
-        - name: Write configuration to NVRAM
-          cisco.ios.ios_config:
-            save_when: always
+              - "passive-interface {{ item }}"
+            parents: "router ospf {{ ospf_process_id }}"
+          loop: "{{ ospf_passive_interfaces }}"
 
       rescue:
-        - name: Attempt rollback — remove partially applied policy-map
-          cisco.ios.ios_config:
-            lines:
-              - "no policy-map {{ qos_policy_name }}"
-          ignore_errors: true
+        - name: Report configuration failure
+          ansible.builtin.debug:
+            msg: "OSPF config failed on {{ inventory_hostname }} at task: {{ ansible_failed_task.name }}"
 
-        - name: Abort with actionable failure message
+        - name: Abort with failure
           ansible.builtin.fail:
-            msg: >
-              QoS deployment failed on {{ inventory_hostname }}.
-              Check class-map DSCP values, policy-map bandwidth totals (must not exceed 100%),
-              and verify interface is not already bound to a conflicting service-policy.
+            msg: "OSPF deployment aborted for {{ inventory_hostname }} — review device logs"
 
-    - name: Verify policy-map is active on each WAN interface
+    - name: Verify OSPF process is running
       cisco.ios.ios_command:
         commands:
-          - "show policy-map interface {{ item }}"
-      loop: "{{ wan_interfaces }}"
-      register: policy_verify
-      failed_when: qos_policy_name not in policy_verify.stdout[0]
+          - "show ip ospf {{ ospf_process_id }}"
+          - show ip ospf neighbor
+      register: ospf_state
+      failed_when: "'OSPF Router with ID' not in ospf_state.stdout[0]"
 
-    - name: Display per-interface QoS queue statistics
+    - name: Show OSPF neighbor summary
       ansible.builtin.debug:
-        msg: "{{ item.stdout[0] }}"
-      loop: "{{ policy_verify.results }}"
-      loop_control:
-        label: "{{ item.item }}"
-```
-
-**What it covers (not duplicated by any existing playbook):**
-- DSCP class-map creation for Voice (EF), Video (AF41), Critical Data (AF21), and Scavenger (CS1) traffic
-- LLQ policy-map with `priority percent` for voice and `bandwidth percent` for other classes
-- `service-policy output` binding to configurable WAN interface list
-- Pre-change state capture, 3-retry reachability check, rescue block with rollback, and post-deploy verification against active `show policy-map interface` output
+        msg: "{{ inventory_hostname }} OSPF neighbors:\n{{ ospf_state.stdout[1] }}
