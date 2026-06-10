@@ -1,149 +1,156 @@
 ---
-# bgp_config.yml
-#
-# Deploys eBGP/iBGP neighbor sessions on Cisco IOS routers.
-# Configures peer authentication, MD5 passwords, update-source, and
-# advertised prefixes. Waits for sessions to reach Established state.
+# acl_deploy_v3.yml
+# Deploys named IP ACLs with pre/post verification and automatic rollback on failure.
+# Credentials stored in Ansible Vault -- see group_vars/all/vault.yml.
 #
 # Inventory example:
-#   [wan_routers]
-#   core-rtr-01  ansible_host=10.0.0.1  bgp_router_id=10.255.0.1
-#   core-rtr-02  ansible_host=10.0.0.2  bgp_router_id=10.255.0.2
+#   [core_routers]
+#   core-rtr-01 ansible_host=10.0.1.1
+#   core-rtr-02 ansible_host=10.0.1.2
 #
-#   [wan_routers:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user={{ vault_net_user }}          # group_vars/all/vault.yml
-#   ansible_password={{ vault_net_password }}
-#   ansible_become=yes
-#   ansible_become_method=enable
-#   ansible_become_pass={{ vault_enable_pass }}
+#   [core_routers:vars]
+#   acl_interface=GigabitEthernet0/0/0
+#   acl_direction=in
+#
+# Usage: ansible-playbook acl_deploy_v3.yml -i inventory/prod --ask-vault-pass
+#        ansible-playbook acl_deploy_v3.yml -i inventory/prod -e "target_hosts=core-rtr-01"
 
-- name: Configure BGP neighbor sessions on Cisco IOS routers
-  hosts: wan_routers
+- name: Stateful ACL deployment with pre/post verification and rollback
+  hosts: "{{ target_hosts | default('core_routers') }}"
   gather_facts: false
+  connection: network_cli
 
   vars:
-    bgp_local_as: "{{ vault_bgp_local_as | default('65000') }}"
-    bgp_keepalive: 30
-    bgp_holdtime: 90
-    bgp_peers:
-      - neighbor: "10.0.1.2"
-        remote_as: "65100"
-        description: "upstream-isp-01"
-        password: "{{ vault_bgp_peer_pass }}"   # ansible-vault encrypted
-        ebgp_multihop: 2
-        update_source: "Loopback0"
-      - neighbor: "10.0.2.2"
-        remote_as: "65000"
-        description: "ibgp-peer-dist-01"
-        update_source: "Loopback0"
-    bgp_advertised_networks:
-      - { prefix: "203.0.113.0", mask: "255.255.255.0" }
+    ansible_network_os: ios
+    ansible_user: "{{ vault_net_username }}"
+    ansible_password: "{{ vault_net_password }}"
+    ansible_become: true
+    ansible_become_method: enable
+    ansible_become_pass: "{{ vault_enable_password }}"
+
+    acl_name: "{{ acl_name | default('PERIMETER-INBOUND-v3') }}"
+    acl_interface: "{{ acl_interface | default('GigabitEthernet0/0') }}"
+    acl_direction: "{{ acl_direction | default('in') }}"
 
   tasks:
-    - name: Capture pre-change BGP state
+    - name: Capture pre-deployment ACL and interface state
       cisco.ios.ios_command:
         commands:
-          - show ip bgp summary
-      register: bgp_pre_state
-      failed_when: false
+          - "show ip access-lists {{ acl_name }}"
+          - "show running-config | section interface {{ acl_interface }}"
+      register: pre_state
+      retries: 2
+      delay: 5
 
-    - name: Display current BGP summary
-      ansible.builtin.debug:
-        var: bgp_pre_state.stdout_lines
-
-    - name: Deploy BGP configuration
+    - name: Deploy ACL entries and bind to interface
       block:
-        - name: Configure BGP process and global parameters
+        - name: Configure named IP access list via resource module
+          cisco.ios.ios_acls:
+            config:
+              - afi: ipv4
+                acls:
+                  - name: "{{ acl_name }}"
+                    aces:
+                      - sequence: 10
+                        grant: permit
+                        protocol_options:
+                          tcp: {}
+                        source:
+                          address: 10.0.0.0
+                          wildcard_bits: 0.255.255.255
+                        destination:
+                          address: 172.16.0.0
+                          wildcard_bits: 0.0.255.255
+                          port_protocol:
+                            eq: "443"
+                        log:
+                          set: true
+                      - sequence: 20
+                        grant: permit
+                        protocol_options:
+                          tcp: {}
+                        source:
+                          address: 10.0.0.0
+                          wildcard_bits: 0.255.255.255
+                        destination:
+                          address: 172.16.0.0
+                          wildcard_bits: 0.0.255.255
+                          port_protocol:
+                            eq: "80"
+                      - sequence: 30
+                        grant: permit
+                        protocol_options:
+                          icmp: {}
+                        source:
+                          address: 10.0.0.0
+                          wildcard_bits: 0.255.255.255
+                        destination:
+                          any: true
+                      - sequence: 100
+                        grant: deny
+                        protocol_options:
+                          ip: {}
+                        source:
+                          any: true
+                        destination:
+                          any: true
+                        log:
+                          set: true
+            state: replaced
+          register: acl_result
+
+        - name: Bind ACL to interface
           cisco.ios.ios_config:
             lines:
-              - "router bgp {{ bgp_local_as }}"
-              - " bgp router-id {{ bgp_router_id | default(ansible_host) }}"
-              - " bgp log-neighbor-changes"
-              - " timers bgp {{ bgp_keepalive }} {{ bgp_holdtime }}"
-              - " no auto-summary"
+              - "ip access-group {{ acl_name }} {{ acl_direction }}"
+            parents: "interface {{ acl_interface }}"
+          register: iface_result
 
-        - name: Configure BGP peer base attributes
-          cisco.ios.ios_config:
-            parents: "router bgp {{ bgp_local_as }}"
-            lines:
-              - "neighbor {{ item.neighbor }} remote-as {{ item.remote_as }}"
-              - "neighbor {{ item.neighbor }} description {{ item.description }}"
-              - "neighbor {{ item.neighbor }} update-source {{ item.update_source }}"
-              - "neighbor {{ item.neighbor }} send-community both"
-          loop: "{{ bgp_peers }}"
-          loop_control:
-            label: "{{ item.neighbor }} (AS{{ item.remote_as }})"
-
-        - name: Configure eBGP multihop where required
-          cisco.ios.ios_config:
-            parents: "router bgp {{ bgp_local_as }}"
-            lines:
-              - "neighbor {{ item.neighbor }} ebgp-multihop {{ item.ebgp_multihop }}"
-          loop: "{{ bgp_peers | selectattr('ebgp_multihop', 'defined') | list }}"
-          loop_control:
-            label: "{{ item.neighbor }}"
-
-        - name: Configure BGP peer MD5 authentication
-          cisco.ios.ios_config:
-            parents: "router bgp {{ bgp_local_as }}"
-            lines:
-              - "neighbor {{ item.neighbor }} password {{ item.password }}"
-          loop: "{{ bgp_peers | selectattr('password', 'defined') | list }}"
-          loop_control:
-            label: "{{ item.neighbor }}"
-          no_log: true
-
-        - name: Advertise local prefixes into BGP
-          cisco.ios.ios_config:
-            parents: "router bgp {{ bgp_local_as }}"
-            lines:
-              - "network {{ item.prefix }} mask {{ item.mask }}"
-          loop: "{{ bgp_advertised_networks }}"
-
-        - name: Write configuration to NVRAM
+        - name: Persist configuration
           cisco.ios.ios_config:
             save_when: modified
 
       rescue:
-        - name: Collect failure diagnostics
-          cisco.ios.ios_command:
-            commands:
-              - show logging | include BGP|CONFIG
-              - show running-config | section router bgp
-          register: failure_diag
-          failed_when: false
-
-        - name: Display failure diagnostics
+        - name: Announce rollback
           ansible.builtin.debug:
-            var: failure_diag.stdout_lines
+            msg: "Deployment failed on {{ inventory_hostname }} -- rolling back"
 
-        - name: Abort with descriptive message
+        - name: Remove ACL binding from interface
+          cisco.ios.ios_config:
+            lines:
+              - "no ip access-group {{ acl_name }} {{ acl_direction }}"
+            parents: "interface {{ acl_interface }}"
+          ignore_errors: true
+
+        - name: Delete partially deployed ACL
+          cisco.ios.ios_acls:
+            config:
+              - afi: ipv4
+                acls:
+                  - name: "{{ acl_name }}"
+            state: deleted
+          ignore_errors: true
+
+        - name: Fail after rollback
           ansible.builtin.fail:
-            msg: "BGP deployment failed on {{ inventory_hostname }} — review diagnostics above"
+            msg: "ACL deployment failed and was rolled back on {{ inventory_hostname }}"
 
-    - name: Wait for BGP peers to reach Established state
+    - name: Verify ACL is present and bound post-deployment
       cisco.ios.ios_command:
         commands:
-          - show ip bgp summary
-        wait_for:
-          - result[0] contains Established
-        retries: 12
-        interval: 15
-      register: bgp_verify
-      failed_when: false
+          - "show ip access-lists {{ acl_name }}"
+          - "show ip interface {{ acl_interface }} | include access list"
+      register: post_state
+      failed_when: acl_name not in post_state.stdout[0]
+      retries: 2
+      delay: 3
 
-    - name: Display post-deployment BGP summary
+    - name: Display deployment summary
       ansible.builtin.debug:
-        var: bgp_verify.stdout_lines
-
-    - name: Assert each expected peer appears in BGP summary
-      ansible.builtin.assert:
-        that:
-          - bgp_verify.stdout[0] is search(item.neighbor)
-        fail_msg: "Peer {{ item.neighbor }} not found in BGP summary on {{ inventory_hostname }}"
-        success_msg: "Peer {{ item.neighbor }} confirmed on {{ inventory_hostname }}"
-      loop: "{{ bgp_peers }}"
-      loop_control:
-        label: "{{ item.neighbor }}
+        msg:
+          - "Host        : {{ inventory_hostname }}"
+          - "ACL         : {{ acl_name }}"
+          - "Interface   : {{ acl_interface }} ({{ acl_direction }}bound)"
+          - "Changed     : {{ acl_result.changed or iface_result.changed }}"
+          - "Interface   : {{ post_state.stdout[1] | default('no acl binding output') }}"
+          - "Match counts: {{ post_state.stdout[0] | regex_findall('(\\d+) matches') }}
