@@ -1,106 +1,135 @@
 ---
-# Inventory example:
-# [network_devices]
-# core-rtr-01   ansible_host=10.0.1.1  ansible_network_os=ios
-# dist-sw-01    ansible_host=10.0.1.2  ansible_network_os=nxos
+# syslog_config_v3.yml
 #
-# [network_devices:vars]
-# ansible_user="{{ vault_net_user }}"        # ansible-vault encrypted
-# ansible_password="{{ vault_net_password }}" # ansible-vault encrypted
-# ansible_become=true
-# ansible_become_method=enable
-# ansible_connection=network_cli
+# Advanced syslog hardening: VRF-aware source binding, rate-limiting,
+# discriminator-based debug filtering, and post-change verification.
+# Extends v1/v2 with multi-platform support (IOS/IOS-XE and NX-OS).
+#
+# Inventory example:
+#   [ios_routers]
+#   core-rtr-01  ansible_host=10.0.0.1  ansible_network_os=ios
+#   core-rtr-02  ansible_host=10.0.0.2  ansible_network_os=ios
+#
+#   [nxos_switches]
+#   dist-sw-01   ansible_host=10.0.1.1  ansible_network_os=nxos
+#
+#   [network:children]
+#   ios_routers
+#   nxos_switches
+#
+#   [network:vars]
+#   ansible_user={{ vault_net_username }}
+#   ansible_password={{ vault_net_password }}
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_net_enable_password }}
+#   # Credentials stored in group_vars/network/vault.yml (ansible-vault encrypted)
 
-- name: Harden logging buffer, timestamps, rate-limiting, and source-interface on network devices
-  hosts: network_devices
+- name: Syslog hardening — VRF binding, rate-limiting, discriminators, and verification
+  hosts: network
   gather_facts: false
+  connection: network_cli
 
   vars:
-    # Load credentials from vault: ansible-playbook site.yml --vault-password-file ~/.vault_pass
-    ansible_user: "{{ vault_net_user }}"
-    ansible_password: "{{ vault_net_password }}"
-    log_buffer_size: 131072
-    log_severity: informational
-    log_rate_limit: 30
-    log_source_intf: Loopback0
+    syslog_servers:
+      - host: 10.0.100.10
+        vrf: MGMT
+      - host: 10.0.100.11
+        vrf: MGMT
+    syslog_source_interface: Loopback0
+    syslog_facility: local6
+    syslog_severity: informational
+    log_buffer_size: 512000
 
   tasks:
-
     - name: Capture pre-change logging state (IOS)
       cisco.ios.ios_command:
         commands:
-          - show logging | include Syslog|Buffer|rate-limit|Source
-      register: pre_log_state
-      retries: 2
-      delay: 5
+          - show logging | include Syslog|Buffer|rate-limit
+      register: pre_state
+      failed_when: false
       when: ansible_network_os == 'ios'
 
     - name: Display pre-change logging state
       ansible.builtin.debug:
-        var: pre_log_state.stdout_lines
-      when: pre_log_state is not skipped
-
-    - name: Apply logging hardening (IOS / IOS-XE)
-      block:
-
-        - name: Configure buffer size, timestamps, rate-limit, and source-interface
-          cisco.ios.ios_config:
-            lines:
-              - "logging buffered {{ log_buffer_size }} {{ log_severity }}"
-              - logging timestamps log datetime msec
-              - no logging console
-              - "logging monitor {{ log_severity }}"
-              - "logging rate-limit {{ log_rate_limit }}"
-              - "logging source-interface {{ log_source_intf }}"
-            save_when: changed
-          register: ios_result
-
-        - name: Verify buffer size was applied
-          cisco.ios.ios_command:
-            commands:
-              - show logging | include Buffer logging
-          register: verify_buffer
-          failed_when: log_buffer_size | string not in verify_buffer.stdout[0]
-
-      rescue:
-
-        - name: Report configuration failure
-          ansible.builtin.debug:
-            msg: "Logging hardening FAILED on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
-
-        - name: Abort play for this host
-          ansible.builtin.fail:
-            msg: "Manual review required for {{ inventory_hostname }}"
-
+        msg: "{{ pre_state.stdout_lines | default([]) }}"
       when: ansible_network_os == 'ios'
 
-    - name: Apply logging hardening (NX-OS)
+    - name: Apply IOS syslog hardening
       block:
-
-        - name: Configure buffer logging and timestamps (NX-OS)
-          cisco.nxos.nxos_config:
+        - name: Configure IOS logging — buffer, rate-limit, VRF-aware servers, discriminator
+          cisco.ios.ios_config:
             lines:
-              - "logging level all {{ log_severity }}"
-              - logging timestamp milliseconds
               - no logging console
-          register: nxos_result
+              - "logging buffered {{ log_buffer_size }} {{ syslog_severity }}"
+              - logging rate-limit 10000 except warnings
+              - "logging source-interface {{ syslog_source_interface }}"
+              - "logging facility {{ syslog_facility }}"
+              - logging discriminator DROP_DEBUG severity drops 7
+              - "logging host {{ item.host }} vrf {{ item.vrf }} discriminator DROP_DEBUG"
+            save_when: changed
+          loop: "{{ syslog_servers }}"
+          register: ios_result
+          retries: 3
+          delay: 10
+          until: ios_result is not failed
+          when: ansible_network_os == 'ios'
 
       rescue:
-
-        - name: Report NX-OS configuration failure
-          ansible.builtin.debug:
-            msg: "Logging hardening FAILED on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown') }}"
-
-        - name: Abort play for this host
+        - name: Report IOS config failure and abort
           ansible.builtin.fail:
-            msg: "Manual review required for {{ inventory_hostname }}"
+            msg: >
+              Syslog hardening failed on {{ inventory_hostname }} after retries.
+              Error: {{ ios_result.msg | default('check task output above') }}
 
-      when: ansible_network_os == 'nxos'
+    - name: Apply NX-OS syslog hardening
+      block:
+        - name: Configure NX-OS logging — logfile, source-interface, VRF-aware servers
+          cisco.nxos.nxos_config:
+            lines:
+              - no logging console
+              - "logging logfile messages {{ syslog_severity }} size {{ log_buffer_size }}"
+              - "logging source-interface {{ syslog_source_interface }}"
+              - "logging server {{ item.host }} {{ syslog_severity }} use-vrf {{ item.vrf }} facility {{ syslog_facility }}"
+            save_when: changed
+          loop: "{{ syslog_servers }}"
+          register: nxos_result
+          retries: 3
+          delay: 10
+          until: nxos_result is not failed
+          when: ansible_network_os == 'nxos'
 
-    - name: Summarize result per host
-      ansible.builtin.debug:
-        msg: >-
-          {{ inventory_hostname }}: logging hardening
-          {{ 'applied — config changed'
-             if (ios_result.changed | default(false) or nxos_result.changed | default(false))
-             else 'already compliant — no change' }}
+      rescue:
+        - name: Report NX-OS config failure and abort
+          ansible.builtin.fail:
+            msg: >
+              Syslog hardening failed on {{ inventory_hostname }} after retries.
+              Error: {{ nxos_result.msg | default('check task output above') }}
+
+    - name: Verify syslog server reachability via VRF ping (IOS)
+      cisco.ios.ios_command:
+        commands:
+          - "ping vrf {{ item.vrf }} {{ item.host }} repeat 3 source {{ syslog_source_interface }}"
+      register: ping_results
+      loop: "{{ syslog_servers }}"
+      failed_when: "'Success rate is 0 percent' in ping_results.stdout[0]"
+      when: ansible_network_os == 'ios'
+
+    - name: Confirm syslog servers present in running config (IOS)
+      cisco.ios.ios_command:
+        commands:
+          - show logging
+      register: post_state
+      failed_when: false
+      when: ansible_network_os == 'ios'
+
+    - name: Assert all syslog servers active in running config
+      ansible.builtin.assert:
+        that:
+          - "item.host in post_state.stdout[0]"
+        fail_msg: "{{ item.host }} missing from logging config on {{ inventory_hostname }}"
+        success_msg: "{{ item.host }} confirmed in logging config on {{ inventory_hostname }}"
+      loop: "{{ syslog_servers }}"
+      when:
+        - ansible_network_os == 'ios'
+        - post_state.stdout is defined
