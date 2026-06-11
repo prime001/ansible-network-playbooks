@@ -1,120 +1,124 @@
 ---
-# CDP and LLDP Neighbor Discovery
+# bgp_neighbor_audit.yml
 #
-# Queries CDP and LLDP adjacency tables to build a per-device topology report.
-# Complements facts_gathering.yml (device-level attributes) by capturing
-# neighbor adjacencies — useful for validating cabling, detecting rogue
-# devices, and generating topology maps.
+# Collects BGP neighbor states, session uptime, and received prefix counts
+# across IOS/IOS-XE, NX-OS, and IOS-XR platforms. Designed for pre/post
+# change-window validation and daily BGP health checks.
 #
 # Inventory example:
-#   [network_devices]
-#   core-sw1   ansible_host=10.0.1.1  ansible_network_os=ios
-#   dist-sw1   ansible_host=10.0.1.2  ansible_network_os=nxos
-#   edge-rtr1  ansible_host=10.0.1.3  ansible_network_os=iosxr
+#   [core_routers]
+#   rtr-01 ansible_host=10.0.0.1 ansible_network_os=ios
+#   rtr-02 ansible_host=10.0.0.2 ansible_network_os=iosxr
 #
-#   [network_devices:vars]
-#   ansible_user="{{ vault_net_username }}"       # ansible-vault encrypted
-#   ansible_password="{{ vault_net_password }}"   # ansible-vault encrypted
+#   [dc_spine]
+#   spine-01 ansible_host=10.1.0.1 ansible_network_os=nxos
+#
+#   [all:vars]
+#   ansible_connection=network_cli
 #   ansible_become=true
 #   ansible_become_method=enable
-#   ansible_connection=network_cli
+#   ansible_user={{ vault_net_user }}       # ansible-vault encrypted
+#   ansible_password={{ vault_net_pass }}   # ansible-vault encrypted
+#   ansible_ssh_common_args='-o StrictHostKeyChecking=no'
 
-- name: Gather CDP and LLDP neighbor topology data
-  hosts: network_devices
+- name: BGP Neighbor State Audit
+  hosts: "{{ target_hosts | default('all') }}"
   gather_facts: false
   vars:
-    ansible_user: "{{ vault_net_username }}"
-    ansible_password: "{{ vault_net_password }}"
-    ansible_become_pass: "{{ vault_net_enable_password }}"
-    report_dir: "topology_reports"
+    bgp_down_pattern: "Idle|Active|Connect|OpenSent|OpenConfirm"
 
   tasks:
-    - name: Create local report directory
-      delegate_to: localhost
-      run_once: true
-      ansible.builtin.file:
-        path: "{{ report_dir }}"
-        state: directory
-        mode: "0750"
 
-    - name: Collect neighbor adjacencies
+    - name: Collect BGP data - IOS / IOS-XE
       block:
-        - name: Query CDP and LLDP neighbors (IOS/IOS-XE)
+        - name: Run show ip bgp summary
           cisco.ios.ios_command:
             commands:
-              - show cdp neighbors detail
-              - show lldp neighbors detail
-          register: ios_neighbors
-          # LLDP may be disabled on some devices; treat partial failure as non-fatal
-          failed_when: >-
-            ios_neighbors.failed and
-            'Invalid input' not in (ios_neighbors.stdout | join(' '))
-          retries: 3
+              - show ip bgp summary
+              - show ip bgp neighbors | include BGP neighbor is|BGP state|Prefixes received
+          register: ios_bgp
+          retries: 2
           delay: 5
-          until: ios_neighbors is not failed
-          when: ansible_network_os in ['ios', 'iosxe']
+          until: ios_bgp is not failed
 
-        - name: Query CDP and LLDP neighbors (NX-OS)
-          cisco.nxos.nxos_command:
-            commands:
-              - show cdp neighbors detail
-              - show lldp neighbors detail
-          register: nxos_neighbors
-          failed_when: >-
-            nxos_neighbors.failed and
-            'Invalid command' not in (nxos_neighbors.stdout | join(' '))
-          retries: 3
-          delay: 5
-          until: nxos_neighbors is not failed
-          when: ansible_network_os == 'nxos'
+        - name: Display IOS BGP neighbor table
+          ansible.builtin.debug:
+            var: ios_bgp.stdout_lines[0]
 
-        - name: Query LLDP neighbors (IOS-XR)
-          cisco.iosxr.iosxr_command:
-            commands:
-              - show lldp neighbors detail
-          register: iosxr_neighbors
-          retries: 3
-          delay: 5
-          until: iosxr_neighbors is not failed
-          when: ansible_network_os == 'iosxr'
+        - name: Display IOS BGP neighbor detail
+          ansible.builtin.debug:
+            var: ios_bgp.stdout_lines[1]
+
+        - name: Flag non-Established sessions on IOS
+          ansible.builtin.debug:
+            msg: "WARN: Non-Established BGP session on {{ inventory_hostname }} -- investigate before change window"
+          when: ios_bgp.stdout[0] is search(bgp_down_pattern)
 
       rescue:
-        - name: Report neighbor collection failure
+        - name: Log IOS collection failure
           ansible.builtin.debug:
-            msg: >-
-              {{ inventory_hostname }}: neighbor query failed —
-              {{ ansible_failed_result.msg | default('no detail available') }}
+            msg: "ERROR: BGP collection failed on {{ inventory_hostname }} -- {{ ansible_failed_result.msg | default('check SSH/credentials') }}"
 
-        - name: Flag host so report task is skipped
-          ansible.builtin.set_fact:
-            neighbor_collect_failed: true
+      when: ansible_network_os in ['ios', 'iosxe']
 
-    - name: Merge stdout from whichever platform ran
-      ansible.builtin.set_fact:
-        neighbor_output: >-
-          {{
-            (ios_neighbors.stdout | default([]))
-            + (nxos_neighbors.stdout | default([]))
-            + (iosxr_neighbors.stdout | default([]))
-          }}
-      when: neighbor_collect_failed is not defined
+    - name: Collect BGP data - NX-OS
+      block:
+        - name: Run show bgp all summary
+          cisco.nxos.nxos_command:
+            commands:
+              - show bgp all summary
+              - show bgp all neighbors | include BGP neighbor|BGP state|Prefixes received
+          register: nxos_bgp
+          retries: 2
+          delay: 5
+          until: nxos_bgp is not failed
 
-    - name: Display neighbor adjacency data
+        - name: Display NX-OS BGP neighbor table
+          ansible.builtin.debug:
+            var: nxos_bgp.stdout_lines[0]
+
+        - name: Flag non-Established sessions on NX-OS
+          ansible.builtin.debug:
+            msg: "WARN: Non-Established BGP session on {{ inventory_hostname }}"
+          when: nxos_bgp.stdout[0] is search(bgp_down_pattern)
+
+      rescue:
+        - name: Log NX-OS collection failure
+          ansible.builtin.debug:
+            msg: "ERROR: BGP collection failed on {{ inventory_hostname }} -- {{ ansible_failed_result.msg | default('check SSH/credentials') }}"
+
+      when: ansible_network_os == 'nxos'
+
+    - name: Collect BGP data - IOS-XR
+      block:
+        - name: Run show bgp summary
+          cisco.iosxr.iosxr_command:
+            commands:
+              - show bgp summary
+              - show bgp neighbors | include Neighbor|BGP state|Prefixes received
+          register: iosxr_bgp
+          retries: 2
+          delay: 5
+          until: iosxr_bgp is not failed
+          failed_when: iosxr_bgp.stdout[0] is search('% BGP not active')
+
+        - name: Display IOS-XR BGP neighbor table
+          ansible.builtin.debug:
+            var: iosxr_bgp.stdout_lines[0]
+
+        - name: Flag non-Established sessions on IOS-XR
+          ansible.builtin.debug:
+            msg: "WARN: Non-Established BGP session on {{ inventory_hostname }}"
+          when: iosxr_bgp.stdout[0] is search(bgp_down_pattern)
+
+      rescue:
+        - name: Log IOS-XR collection failure
+          ansible.builtin.debug:
+            msg: "ERROR: BGP collection failed on {{ inventory_hostname }} -- {{ ansible_failed_result.msg | default('check SSH/credentials') }}"
+
+      when: ansible_network_os == 'iosxr'
+
+    - name: Unsupported platform notice
       ansible.builtin.debug:
-        var: neighbor_output
-      when: neighbor_output is defined
-
-    - name: Write per-device neighbor report
-      delegate_to: localhost
-      ansible.builtin.copy:
-        content: "{{ neighbor_output | join('\n---\n') }}"
-        dest: "{{ report_dir }}/{{ inventory_hostname }}_neighbors.txt"
-        mode: "0640"
-      when:
-        - neighbor_output is defined
-        - neighbor_output | length > 0
-
-    - name: Report hosts where collection was skipped
-      ansible.builtin.debug:
-        msg: "{{ inventory_hostname }}: neighbor collection failed or OS not supported"
-      when: neighbor_collect_failed is defined
+        msg: "SKIP: {{ inventory_hostname }} has unsupported network_os '{{ ansible_network_os }}' -- add a task block to extend coverage"
+      when: ansible_network_os not in ['ios', 'iosxe', 'nxos', 'iosxr']
