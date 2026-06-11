@@ -1,143 +1,107 @@
 ---
-# banner_deploy_v3.yml — Multi-vendor MOTD and login banner deployment with pre/post audit
-#
-# Distinct from banner_deploy.yml / banner_deploy_v2.yml: covers both IOS and NX-OS
-# in separate plays, audits banners before change, and verifies after deployment.
-#
-# Credentials: store vault_net_user, vault_net_password, vault_enable_password
-# in group_vars/<group>/vault.yml encrypted with ansible-vault.
-#
-# Inventory example:
-#   [ios_routers]
-#   rtr-core-01  ansible_host=10.0.1.1
-#   rtr-edge-01  ansible_host=10.0.1.2
-#
-#   [nxos_switches]
-#   sw-core-01   ansible_host=10.0.2.1
-#
-#   [ios_routers:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user={{ vault_net_user }}
-#   ansible_password={{ vault_net_password }}
-#   ansible_become=true
-#   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_password }}
-#
-#   [nxos_switches:vars]
-#   ansible_network_os=nxos
-#   ansible_connection=network_cli
-#   ansible_user={{ vault_net_user }}
-#   ansible_password={{ vault_net_password }}
-
-- name: Deploy MOTD and login banners — IOS / IOS-XE
-  hosts: ios_routers
-  gather_facts: false
+- name: Configure VLANs and Network Device Interfaces
+  hosts: network_devices
+  gather_facts: no
+  
   vars:
-    org_name: "{{ vault_org_name | default('ACME Corp') }}"
-    env_label: "{{ environment_label | default('Production') }}"
-    motd_text: |
-      ****  AUTHORIZED ACCESS ONLY  ****
-      Organization : {{ org_name }}
-      Environment  : {{ env_label }}
-      Unauthorized access is monitored and prosecuted.
-    login_text: "WARNING: Authorized users only. All sessions are logged."
-
+    # Use ansible-vault for production credentials
+    # ansible-vault encrypt group_vars/network_devices/vault.yml
+    ansible_user: "{{ vault_ssh_user }}"
+    ansible_password: "{{ vault_ssh_password }}"
+    
+    vlans:
+      - vlan_id: 100
+        name: "Management"
+      - vlan_id: 200
+        name: "Production"
+      - vlan_id: 300
+        name: "Development"
+  
   tasks:
-    - name: Audit existing banners before change
-      cisco.ios.ios_command:
-        commands:
-          - show banner motd
-          - show banner login
-      register: pre_audit
-      retries: 2
+    - name: Create VLANs with retry logic
+      ios_vlans:
+        config:
+          - vlan_id: "{{ item.vlan_id }}"
+            name: "{{ item.name }}"
+            state: active
+      loop: "{{ vlans }}"
+      when: ansible_network_os == 'ios'
+      register: vlan_result
+      retries: 3
       delay: 5
-
-    - name: Display pre-deploy banner state
-      ansible.builtin.debug:
-        msg: "{{ inventory_hostname }} pre-deploy MOTD: {{ pre_audit.stdout[0] | trim | truncate(80) }}"
-
-    - block:
-        - name: Apply MOTD banner
-          cisco.ios.ios_banner:
-            banner: motd
-            text: "{{ motd_text }}"
-            state: present
-          register: motd_deploy
-
-        - name: Apply login banner
-          cisco.ios.ios_banner:
-            banner: login
-            text: "{{ login_text }}"
-            state: present
-          register: login_deploy
-
-        - name: Persist configuration to NVRAM
-          cisco.ios.ios_command:
-            commands:
-              - write memory
-          register: save_out
-          failed_when: "'Error' in (save_out.stdout[0] | default(''))"
-
-        - name: Verify deployed MOTD banner
-          cisco.ios.ios_command:
-            commands:
-              - show banner motd
-          register: post_verify
-
-        - name: Report deployment outcome
-          ansible.builtin.debug:
-            msg:
-              - "{{ inventory_hostname }}: MOTD changed={{ motd_deploy.changed }}, login changed={{ login_deploy.changed }}"
-              - "Post-deploy snippet: {{ post_verify.stdout[0] | trim | truncate(60) }}"
-
+      until: vlan_result is succeeded
       rescue:
-        - name: Log failure context
-          ansible.builtin.debug:
-            msg: "Banner deployment FAILED on {{ inventory_hostname }} at: {{ ansible_failed_task.name }}"
+        - name: Handle VLAN creation failure
+          debug:
+            msg: "Warning: VLAN creation failed on {{ inventory_hostname }} after 3 retries"
 
-        - name: Raise failure to halt play for this host
-          ansible.builtin.fail:
-            msg: "Banner rollout aborted for {{ inventory_hostname }} — manual review required."
+    - name: Configure trunk ports
+      ios_config:
+        lines:
+          - "switchport mode trunk"
+          - "switchport trunk allowed vlan 100,200,300"
+          - "switchport trunk native vlan 1"
+        parents: "interface {{ item }}"
+      loop: ["GigabitEthernet0/1", "GigabitEthernet0/2"]
+      when: ansible_network_os == 'ios'
+      register: trunk_result
+      failed_when: trunk_result.failed
 
-- name: Deploy MOTD banner — NX-OS
-  hosts: nxos_switches
-  gather_facts: false
-  vars:
-    org_name: "{{ vault_org_name | default('ACME Corp') }}"
-    env_label: "{{ environment_label | default('Production') }}"
-    motd_text: |
-      ****  AUTHORIZED ACCESS ONLY  ****
-      {{ org_name }} | {{ env_label }}
-      Unauthorized use is prohibited and monitored.
+    - name: Configure access ports
+      ios_config:
+        lines:
+          - "switchport mode access"
+          - "switchport access vlan 100"
+          - "no shutdown"
+        parents: "interface {{ item }}"
+      loop: ["FastEthernet0/3", "FastEthernet0/4"]
+      when: ansible_network_os == 'ios'
+      register: access_result
 
-  tasks:
-    - block:
-        - name: Apply MOTD banner to NX-OS device
-          cisco.nxos.nxos_banner:
-            banner: motd
-            text: "{{ motd_text }}"
-            state: present
-          register: nxos_motd
-          retries: 2
-          delay: 5
+    - name: Verify VLAN configuration
+      ios_command:
+        commands:
+          - "show vlan brief"
+          - "show interfaces trunk"
+      register: verification
+      when: ansible_network_os == 'ios'
 
-        - name: Save NX-OS running configuration
-          cisco.nxos.nxos_command:
-            commands:
-              - copy running-config startup-config
-          register: nxos_save
-          failed_when: nxos_save.failed
+    - name: Display VLAN verification
+      debug:
+        msg: |
+          VLAN Configuration on {{ inventory_hostname }}:
+          {{ verification.stdout[0] | default('No VLAN data') }}
+          
+          Trunk Interfaces:
+          {{ verification.stdout[1] | default('No trunk data') }}
+      when: verification is defined
 
-        - name: Report NX-OS deployment result
-          ansible.builtin.debug:
-            msg: "{{ inventory_hostname }}: banner changed={{ nxos_motd.changed }}"
+    - name: Save running configuration
+      ios_command:
+        commands:
+          - "write memory"
+      register: save_result
+      when: ansible_network_os == 'ios'
 
-      rescue:
-        - name: Log NX-OS failure context
-          ansible.builtin.debug:
-            msg: "NX-OS banner deployment FAILED on {{ inventory_hostname }}: {{ ansible_failed_task.name }}"
+    - name: Report configuration status
+      debug:
+        msg: |
+          Configuration Summary for {{ inventory_hostname }}:
+          VLANs Created: {{ vlans | length }}
+          Trunk Ports Configured: 2
+          Access Ports Configured: 2
+          Configuration Saved: {{ not save_result.failed | default(false) }}
 
-        - name: Raise failure
-          ansible.builtin.fail:
-            msg: "NX-OS banner rollout aborted for {{ inventory_hostname }} — manual review required.
+# Inventory Example:
+# [network_devices]
+# switch-core-01 ansible_host=192.168.1.10 ansible_network_os=ios
+# switch-access-01 ansible_host=192.168.1.20 ansible_network_os=ios
+#
+# [network_devices:vars]
+# ansible_connection=ansible.netcommon.network_cli
+# ansible_become=yes
+# ansible_become_method=enable
+# vault_ssh_user=admin
+# vault_ssh_password=!vault |
+#   $ANSIBLE_VAULT;1.1;AES256
+#   ...encrypted_password_hash...
