@@ -1,128 +1,112 @@
 ---
-# BGP Session Compliance Check
-# Validates BGP peer state, MD5 authentication, and outbound route-map policy
-# on IOS/IOS-XE routers. Designed to run as a scheduled compliance gate before
-# maintenance windows or as part of a daily audit cron job.
+# Remote Access Security Compliance Check
+# Audits SSH hardening and secure line config on Cisco IOS/IOS-XE devices.
+# Checks SSH v2, telnet lockdown, password encryption, and brute-force protection.
 #
-# Inventory example (inventory/routers.yml):
-#   all:
-#     children:
-#       routers:
-#         hosts:
-#           core-rtr-01:
-#             ansible_host: 10.0.0.1
-#             ansible_network_os: ios
-#             bgp_local_as: 65001
-#             bgp_expected_neighbors:
-#               - peer_ip: 10.0.0.2
-#                 peer_as: 65002
-#               - peer_ip: 10.0.0.3
-#                 peer_as: 65003
-#           core-rtr-02:
-#             ansible_host: 10.0.0.2
-#             ansible_network_os: ios
-#             bgp_local_as: 65001
-#             bgp_expected_neighbors:
-#               - peer_ip: 10.0.0.1
-#                 peer_as: 65001
-#         vars:
-#           ansible_connection: network_cli
-#           ansible_user: "{{ vault_net_user }}"       # group_vars/all/vault.yml
-#           ansible_password: "{{ vault_net_password }}"
-#           ansible_become: true
-#           ansible_become_method: enable
-#           ansible_become_pass: "{{ vault_enable_pass }}"
+# Inventory example:
+# [core_switches]
+# sw-core-01 ansible_host=10.0.1.1
+# sw-core-02 ansible_host=10.0.1.2
+#
+# [distribution_routers]
+# rtr-dist-01 ansible_host=10.0.1.10
+#
+# [network:children]
+# core_switches
+# distribution_routers
+#
+# [network:vars]
+# ansible_network_os=ios
+# ansible_connection=network_cli
+# ansible_user={{ vault_net_user }}              # stored in ansible-vault
+# ansible_password={{ vault_net_password }}       # stored in ansible-vault
+# ansible_become=yes
+# ansible_become_method=enable
+# ansible_become_password={{ vault_enable_pass }} # stored in ansible-vault
 
-- name: BGP Session Compliance Check
-  hosts: routers
+- name: Remote Access Security Compliance Check
+  hosts: network
   gather_facts: false
-  vars:
-    # Credentials sourced from Ansible Vault — never hardcode
-    ansible_user: "{{ vault_net_user }}"
-    ansible_password: "{{ vault_net_password }}"
-    ansible_become_pass: "{{ vault_enable_pass }}"
-    compliance_passed: true
 
   tasks:
-    - name: Retrieve BGP summary with retry on transient SSH failure
-      cisco.ios.ios_command:
-        commands:
-          - show bgp ipv4 unicast summary
-      register: bgp_summary
-      retries: 3
-      delay: 10
-      until: not bgp_summary.failed
-      changed_when: false
-
-    - name: Display BGP summary for audit record
-      ansible.builtin.debug:
-        var: bgp_summary.stdout_lines
-
-    - name: Run per-neighbor compliance checks
+    - name: Gather remote-access-related config sections
       block:
-        - name: Query each expected BGP neighbor
+        - name: Collect SSH and line configuration
           cisco.ios.ios_command:
             commands:
-              - "show bgp neighbors {{ item.peer_ip }}"
-          loop: "{{ bgp_expected_neighbors }}"
-          register: bgp_neighbor_detail
-          changed_when: false
-
-        - name: Assert session is Established for each neighbor
-          ansible.builtin.assert:
-            that:
-              - "'BGP state = Established' in item.stdout[0]"
-            fail_msg: >-
-              [FAIL] {{ inventory_hostname }}: neighbor {{ item.item.peer_ip }}
-              (AS {{ item.item.peer_as }}) is not in Established state.
-            success_msg: >-
-              [PASS] {{ inventory_hostname }}: neighbor {{ item.item.peer_ip }} Established.
-          loop: "{{ bgp_neighbor_detail.results }}"
-          loop_control:
-            label: "{{ item.item.peer_ip }}"
-
-        - name: Assert MD5 authentication is configured per neighbor
-          ansible.builtin.assert:
-            that:
-              - "'password' in item.stdout[0]"
-            fail_msg: >-
-              [FAIL] {{ inventory_hostname }}: neighbor {{ item.item.peer_ip }}
-              is missing MD5 authentication — session vulnerable to spoofing.
-            success_msg: >-
-              [PASS] {{ inventory_hostname }}: neighbor {{ item.item.peer_ip }}
-              has MD5 authentication configured.
-          loop: "{{ bgp_neighbor_detail.results }}"
-          loop_control:
-            label: "{{ item.item.peer_ip }}"
-
-        - name: Assert outbound route-map policy is applied per neighbor
-          ansible.builtin.assert:
-            that:
-              - "'Route map for outgoing' in item.stdout[0]"
-            fail_msg: >-
-              [FAIL] {{ inventory_hostname }}: neighbor {{ item.item.peer_ip }}
-              has no outbound route-map — unfiltered prefix advertisement risk.
-            success_msg: >-
-              [PASS] {{ inventory_hostname }}: neighbor {{ item.item.peer_ip }}
-              has outbound route-map applied.
-          loop: "{{ bgp_neighbor_detail.results }}"
-          loop_control:
-            label: "{{ item.item.peer_ip }}"
+              - show ip ssh
+              - show running-config | section ^line vty
+              - show running-config | section ^line con
+              - show running-config | include ^service password-encryption
+              - show running-config | include ^login block-for
+          register: sec_output
+          retries: 2
+          delay: 5
+          until: sec_output is not failed
 
       rescue:
-        - name: Mark host as non-compliant
-          ansible.builtin.set_fact:
-            compliance_passed: false
-
-        - name: Report compliance failure details
+        - name: Record collection failure and continue
           ansible.builtin.debug:
-            msg: >-
-              COMPLIANCE FAILURE on {{ inventory_hostname }}:
-              One or more BGP checks failed. Verify peer state, MD5 auth,
-              and outbound route-map policy before the next maintenance window.
+            msg: "WARNING: Failed to collect config from {{ inventory_hostname }} after retries"
+        - name: Skip remaining tasks for unreachable host
+          ansible.builtin.meta: end_host
 
-    - name: Emit final compliance status per host
+    - name: Evaluate SSH version 2 enforcement
+      ansible.builtin.set_fact:
+        chk_ssh_v2: >-
+          {{ 'version 2' in sec_output.stdout[0] | lower }}
+
+    - name: Evaluate telnet disabled on VTY lines
+      ansible.builtin.set_fact:
+        chk_telnet_off: >-
+          {{ 'transport input ssh' in sec_output.stdout[1] and
+             'transport input all' not in sec_output.stdout[1] and
+             'transport input telnet' not in sec_output.stdout[1] }}
+
+    - name: Evaluate VTY exec-timeout presence
+      ansible.builtin.set_fact:
+        chk_vty_timeout: >-
+          {{ 'exec-timeout' in sec_output.stdout[1] }}
+
+    - name: Evaluate service password-encryption
+      ansible.builtin.set_fact:
+        chk_pwd_encrypt: >-
+          {{ 'service password-encryption' in sec_output.stdout[3] }}
+
+    - name: Evaluate login brute-force protection
+      ansible.builtin.set_fact:
+        chk_login_block: >-
+          {{ 'login block-for' in sec_output.stdout[4] }}
+
+    - name: Display per-device compliance summary
       ansible.builtin.debug:
-        msg: >-
-          {{ inventory_hostname }} BGP compliance result:
-          {{ 'PASSED' if compliance_passed else 'FAILED — remediation required' }}
+        msg:
+          - "=== Remote Access Compliance: {{ inventory_hostname }} ==="
+          - "SSH v2 only:              {{ 'PASS' if chk_ssh_v2      else 'FAIL' }}"
+          - "Telnet disabled on VTY:   {{ 'PASS' if chk_telnet_off  else 'FAIL' }}"
+          - "VTY exec-timeout set:     {{ 'PASS' if chk_vty_timeout else 'FAIL' }}"
+          - "Service password-encrypt: {{ 'PASS' if chk_pwd_encrypt else 'FAIL' }}"
+          - "Login brute-force block:  {{ 'PASS' if chk_login_block else 'FAIL' }}"
+
+    - name: Assert all remote-access controls are in place
+      ansible.builtin.assert:
+        that:
+          - chk_ssh_v2
+          - chk_telnet_off
+          - chk_vty_timeout
+          - chk_pwd_encrypt
+          - chk_login_block
+        fail_msg: >
+          COMPLIANCE FAILURE on {{ inventory_hostname }}:
+          ssh_v2={{ chk_ssh_v2 }}, telnet_off={{ chk_telnet_off }},
+          vty_timeout={{ chk_vty_timeout }}, pwd_encrypt={{ chk_pwd_encrypt }},
+          login_block={{ chk_login_block }}
+        success_msg: "All remote access security checks PASSED on {{ inventory_hostname }}"
+      register: compliance_result
+      ignore_errors: true
+
+    - name: Summarize non-compliant hosts for remediation tracking
+      ansible.builtin.debug:
+        msg: "ACTION REQUIRED: Open remediation ticket for {{ inventory_hostname }}"
+      when: compliance_result is failed
+      failed_when: false
