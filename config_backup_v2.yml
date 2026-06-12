@@ -1,72 +1,77 @@
 ---
 # ospf_config.yml
-# Deploys and validates OSPF routing process configuration on Cisco IOS routers.
-# Manages router-id, reference bandwidth, network statements, and passive interfaces.
+# Deploys and verifies OSPF routing configuration on Cisco IOS devices.
+# Configures process ID, router-ID, network statements, and passive interfaces,
+# then validates adjacency formation post-change.
 #
 # Inventory example:
-#   [routers]
-#   core-rtr-01   ansible_host=10.0.1.1  ospf_pid=1
-#   branch-rtr-01 ansible_host=10.0.2.1  ospf_pid=1
+#   [core_routers]
+#   r1.dc1.example.com ansible_host=10.0.0.1
+#   r2.dc1.example.com ansible_host=10.0.0.2
 #
-#   [routers:vars]
+#   [core_routers:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_user="{{ vault_net_username }}"          # ansible-vault encrypted
-#   ansible_password="{{ vault_net_password }}"      # ansible-vault encrypted
+#   ansible_user="{{ vault_network_username }}"        # ansible-vault encrypted
+#   ansible_password="{{ vault_network_password }}"    # ansible-vault encrypted
 #   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_become_password="{{ vault_enable_password }}"  # ansible-vault encrypted
+#   ansible_become_password="{{ vault_enable_password }}"
 
-- name: Configure OSPF routing process on Cisco IOS routers
-  hosts: routers
+- name: Deploy and verify OSPF routing configuration
+  hosts: core_routers
   gather_facts: false
 
   vars:
-    ospf_process_id: "{{ ospf_pid | default(1) }}"
+    ansible_user: "{{ vault_network_username }}"
+    ansible_password: "{{ vault_network_password }}"
+    ansible_become_password: "{{ vault_enable_password }}"
+
+    ospf_process_id: 1
     ospf_router_id: "{{ ansible_host }}"
-    ospf_reference_bandwidth: 10000
-    ospf_log_adjacency: true
+    ospf_reference_bandwidth_mbps: 10000
+    ospf_log_adjacency_changes: true
+
     ospf_networks:
-      - prefix: "10.0.0.0"
-        wildcard: "0.255.255.255"
-        area: 0
-      - prefix: "192.168.100.0"
-        wildcard: "0.0.0.255"
-        area: 1
+      - { network: "10.0.0.0",   wildcard: "0.0.0.255", area: 0 }
+      - { network: "192.168.0.0", wildcard: "0.0.255.255", area: 1 }
+
     ospf_passive_interfaces:
       - Loopback0
 
   tasks:
-    - name: Confirm device reachability before changes
+    - name: Capture pre-change OSPF neighbor state
       cisco.ios.ios_command:
-        commands:
-          - show version
-      register: device_check
-      retries: 3
-      delay: 10
-      until: device_check is not failed
+        commands: show ip ospf neighbor
+      register: ospf_pre_neighbors
+      retries: 2
+      delay: 5
 
-    - name: Deploy OSPF configuration
+    - name: Display pre-change OSPF neighbors
+      ansible.builtin.debug:
+        msg: "{{ ospf_pre_neighbors.stdout_lines }}"
+
+    - name: Apply OSPF configuration
       block:
         - name: Configure OSPF process parameters
           cisco.ios.ios_config:
             lines:
               - "router-id {{ ospf_router_id }}"
-              - "auto-cost reference-bandwidth {{ ospf_reference_bandwidth }}"
-              - "{{ 'log-adjacency-changes' if ospf_log_adjacency else 'no log-adjacency-changes' }}"
+              - "auto-cost reference-bandwidth {{ ospf_reference_bandwidth_mbps }}"
+              - "log-adjacency-changes"
             parents: "router ospf {{ ospf_process_id }}"
-            save_when: modified
+          register: ospf_base_result
+          when: ospf_log_adjacency_changes
 
-        - name: Add OSPF network statements
+        - name: Advertise networks into OSPF
           cisco.ios.ios_config:
             lines:
-              - "network {{ item.prefix }} {{ item.wildcard }} area {{ item.area }}"
+              - "network {{ item.network }} {{ item.wildcard }} area {{ item.area }}"
             parents: "router ospf {{ ospf_process_id }}"
           loop: "{{ ospf_networks }}"
-          loop_control:
-            label: "{{ item.prefix }} area {{ item.area }}"
+          register: ospf_network_result
 
-        - name: Configure passive interfaces
+        - name: Set passive interfaces
           cisco.ios.ios_config:
             lines:
               - "passive-interface {{ item }}"
@@ -74,22 +79,37 @@
           loop: "{{ ospf_passive_interfaces }}"
 
       rescue:
-        - name: Report configuration failure
+        - name: Log OSPF configuration failure
           ansible.builtin.debug:
-            msg: "OSPF config failed on {{ inventory_hostname }} at task: {{ ansible_failed_task.name }}"
+            msg: "OSPF config failed on {{ inventory_hostname }} — review device state before retrying."
 
-        - name: Abort with failure
+        - name: Abort play with descriptive error
           ansible.builtin.fail:
-            msg: "OSPF deployment aborted for {{ inventory_hostname }} — review device logs"
+            msg: "Halting: OSPF configuration task failed on {{ inventory_hostname }}"
 
-    - name: Verify OSPF process is running
+    - name: Pause for OSPF convergence after changes
+      ansible.builtin.pause:
+        seconds: 30
+      when: ospf_base_result.changed or ospf_network_result.changed
+
+    - name: Verify OSPF process is active
       cisco.ios.ios_command:
-        commands:
-          - "show ip ospf {{ ospf_process_id }}"
-          - show ip ospf neighbor
-      register: ospf_state
-      failed_when: "'OSPF Router with ID' not in ospf_state.stdout[0]"
+        commands: "show ip ospf {{ ospf_process_id }}"
+      register: ospf_process_state
+      failed_when: "'OSPF Router with ID' not in ospf_process_state.stdout[0]"
 
-    - name: Show OSPF neighbor summary
+    - name: Confirm OSPF neighbors have formed
+      cisco.ios.ios_command:
+        commands: show ip ospf neighbor
+      register: ospf_post_neighbors
+      retries: 3
+      delay: 10
+      until: ospf_post_neighbors.stdout[0] | length > 0
+
+    - name: Display OSPF process summary
       ansible.builtin.debug:
-        msg: "{{ inventory_hostname }} OSPF neighbors:\n{{ ospf_state.stdout[1] }}
+        msg: "{{ ospf_process_state.stdout_lines }}"
+
+    - name: Display post-change OSPF neighbor table
+      ansible.builtin.debug:
+        msg: "{{ ospf_post_neighbors.stdout_lines }}
