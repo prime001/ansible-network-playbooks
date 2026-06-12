@@ -1,137 +1,116 @@
 ---
 # snmp_v3_hardening.yml
-# Hardens SNMP posture by removing default community strings, configuring
-# SNMPv3 users with auth+priv, and restricting polling to approved hosts.
-# Complements snmp_config.yml (community setup) and snmp_config_v2.yml.
-#
-# Vault usage: ansible-playbook snmp_v3_hardening.yml --vault-id prod@prompt
+# Deploys SNMPv3 users/groups/views and removes insecure community strings
+# Credentials sourced from Ansible Vault (see vault_vars below)
 #
 # Inventory example:
-#   [core_routers]
-#   rtr-core-01 ansible_host=10.0.1.1
-#   rtr-core-02 ansible_host=10.0.1.2
+# [core_switches]
+# sw-core-01 ansible_host=10.0.1.11
+# sw-core-02 ansible_host=10.0.1.12
 #
-#   [core_routers:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user={{ vault_net_user }}
-#   ansible_password={{ vault_net_password }}
-#   ansible_become=yes
-#   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_password }}
+# [core_switches:vars]
+# ansible_network_os=ios
+# ansible_connection=network_cli
+# ansible_user={{ vault_net_user }}
+# ansible_password={{ vault_net_pass }}
+# ansible_become=yes
+# ansible_become_method=enable
+# ansible_become_password={{ vault_enable_pass }}
 
-- name: Enforce SNMPv3 auth/priv hardening and remove legacy communities
-  hosts: core_routers
+- name: Deploy SNMPv3 hardened configuration with view/group restrictions
+  hosts: core_switches
   gather_facts: false
 
   vars:
-    snmp_v3_group: NETOPS-RO
-    snmp_v3_view: NETOPS-VIEW
-    snmp_v3_username: "{{ vault_snmp_v3_user }}"
-    snmp_v3_auth_pass: "{{ vault_snmp_v3_auth_pass }}"
-    snmp_v3_priv_pass: "{{ vault_snmp_v3_priv_pass }}"
-    snmp_auth_proto: sha256
-    snmp_priv_proto: aes 256
-    snmp_poll_acl: SNMP-NMS-PERMIT
-    snmp_nms_hosts:
-      - 10.200.0.10
-      - 10.200.0.11
-    legacy_communities:
-      - public
-      - private
-      - "{{ vault_legacy_community | default('') }}"
+    snmp_location: "{{ vault_snmp_location | default('DC1-Row3-Rack12') }}"
+    snmp_contact: "{{ vault_snmp_contact | default('noc@example.com') }}"
+    snmp_v3_group: NOC_RO
+    snmp_v3_view: NOC_VIEW
+    snmp_trap_host: "{{ vault_snmp_trap_host | default('10.0.1.100') }}"
+    snmp_acl_number: 98
+    # vault_snmp_v3_user, vault_snmp_v3_auth, vault_snmp_v3_priv must exist in vault
 
   tasks:
-    - name: Apply SNMPv3 hardening block
+    - name: Apply SNMPv3 configuration block
       block:
-        - name: Remove insecure legacy community strings
+        - name: Set SNMP system information
           cisco.ios.ios_config:
             lines:
-              - "no snmp-server community {{ item }}"
-            match: none
-          loop: "{{ legacy_communities | select('ne', '') | list }}"
-          register: community_removal
+              - "snmp-server location {{ snmp_location }}"
+              - "snmp-server contact {{ snmp_contact }}"
+          register: snmp_sysinfo
 
-        - name: Build NMS permit ACL for SNMP polling restriction
-          cisco.ios.ios_config:
-            lines:
-              - "ip access-list standard {{ snmp_poll_acl }}"
-              - "  permit {{ item }}"
-            parents: []
-            match: line
-          loop: "{{ snmp_nms_hosts }}"
-          register: acl_result
-
-        - name: Configure SNMPv3 view and group
+        - name: Create restricted OID view (exclude credential MIBs)
           cisco.ios.ios_config:
             lines:
               - "snmp-server view {{ snmp_v3_view }} iso included"
-              - "snmp-server group {{ snmp_v3_group }} v3 priv read {{ snmp_v3_view }} access {{ snmp_poll_acl }}"
-            match: line
-          register: group_result
-          retries: 2
-          delay: 5
-          until: group_result is not failed
+              - "snmp-server view {{ snmp_v3_view }} snmpUsmMIB excluded"
+              - "snmp-server view {{ snmp_v3_view }} snmpVacmMIB excluded"
+              - "snmp-server view {{ snmp_v3_view }} snmpCommunityMIB excluded"
+          register: snmp_view
 
-        - name: Configure SNMPv3 user with auth and priv
+        - name: Create SNMPv3 group enforcing auth and priv
           cisco.ios.ios_config:
             lines:
-              - >-
-                snmp-server user {{ snmp_v3_username }} {{ snmp_v3_group }} v3
-                auth {{ snmp_auth_proto }} {{ snmp_v3_auth_pass }}
-                priv {{ snmp_priv_proto }} {{ snmp_v3_priv_pass }}
-            match: none
-          no_log: true
-          register: user_result
-          retries: 2
-          delay: 5
-          until: user_result is not failed
+              - "snmp-server group {{ snmp_v3_group }} v3 priv read {{ snmp_v3_view }} access {{ snmp_acl_number }}"
+          register: snmp_group
 
-        - name: Verify SNMPv3 user and group are present
+        - name: Create SNMPv3 user with SHA-256 auth and AES-128 priv
+          cisco.ios.ios_config:
+            lines:
+              - "snmp-server user {{ vault_snmp_v3_user }} {{ snmp_v3_group }} v3 auth sha {{ vault_snmp_v3_auth }} priv aes 128 {{ vault_snmp_v3_priv }}"
+          no_log: true
+          register: snmp_user
+
+        - name: Configure SNMPv3 trap destination and enable key trap types
+          cisco.ios.ios_config:
+            lines:
+              - "snmp-server host {{ snmp_trap_host }} version 3 priv {{ vault_snmp_v3_user }}"
+              - "snmp-server enable traps snmp authentication linkdown linkup coldstart"
+              - "snmp-server enable traps config"
+              - "snmp-server enable traps syslog"
+          register: snmp_traps
+
+        - name: Remove default insecure community strings
+          cisco.ios.ios_config:
+            lines:
+              - "no snmp-server community public RO"
+              - "no snmp-server community private RW"
+          register: snmp_harden
+          failed_when:
+            - snmp_harden.failed is defined
+            - snmp_harden.failed
+            - "'Invalid input' not in (snmp_harden.msg | default(''))"
+
+        - name: Verify SNMPv3 user appears in device config
           cisco.ios.ios_command:
             commands:
               - show snmp user
               - show snmp group
-          register: snmp_verify
-          retries: 2
-          delay: 3
-          until: snmp_verify is not failed
-          failed_when: snmp_v3_username not in snmp_verify.stdout[0]
-
-        - name: Audit for residual plaintext communities
-          cisco.ios.ios_command:
-            commands:
-              - show running-config | include snmp-server community
-          register: community_audit
-          failed_when: >
-            community_audit.stdout[0] | regex_search('community\s+(public|private)\s', ignorecase=True)
-
-        - name: Save hardened configuration
-          cisco.ios.ios_command:
-            commands:
-              - write memory
-          register: save_result
+              - show snmp view
           retries: 3
-          delay: 10
-          until: save_result is not failed
-
-        - name: Report hardening results
-          ansible.builtin.debug:
-            msg:
-              - "Host: {{ inventory_hostname }}"
-              - "SNMPv3 user '{{ snmp_v3_username }}' active with {{ snmp_auth_proto }}/{{ snmp_priv_proto }}"
-              - "Legacy communities removed: {{ legacy_communities | select('ne', '') | list }}"
-              - "Polling restricted to: {{ snmp_nms_hosts }}"
-              - "Save status: {{ save_result.stdout[0] | default('unknown') }}"
+          delay: 5
+          register: snmp_verify
+          no_log: true
+          until: snmp_verify.stdout[0] is search(vault_snmp_v3_user)
 
       rescue:
-        - name: Log hardening failure details
+        - name: Report configuration failure
           ansible.builtin.debug:
-            msg:
-              - "HARDENING FAILED on {{ inventory_hostname }}"
-              - "Review output above and check vault credentials."
-              - "No partial config saved — device may be in transitional state."
+            msg: "SNMPv3 configuration failed on {{ inventory_hostname }}. Manual review required."
 
-        - name: Fail explicitly after rescue logging
+        - name: Fail play after rescue notification
           ansible.builtin.fail:
-            msg: "SNMPv3 hardening incomplete on {{ inventory_hostname }} — manual review required.
+            msg: "Halting after SNMPv3 failure on {{ inventory_hostname }}"
+
+    - name: Display configuration change summary
+      ansible.builtin.debug:
+        msg:
+          - "Host          : {{ inventory_hostname }}"
+          - "View changed  : {{ snmp_view.changed }}"
+          - "Group changed : {{ snmp_group.changed }}"
+          - "User changed  : {{ snmp_user.changed }}"
+          - "Traps changed : {{ snmp_traps.changed }}"
+          - "Hardened      : {{ snmp_harden.changed }}"
+          - "SNMP groups   :"
+          - "{{ snmp_verify.stdout[1] }}
