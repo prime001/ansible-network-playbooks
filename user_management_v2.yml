@@ -1,117 +1,123 @@
 ---
-# ssh_key_auth.yml - SSH Public Key Authentication Management for Cisco IOS
+# ssh_hardening.yml
+# Hardens SSH access and secures VTY/console lines on Cisco IOS devices.
+# Enforces SSHv2-only transport, RSA key generation, idle timeouts, and
+# login ACL binding on VTY lines.
 #
-# Configures SSH public key authentication (ip ssh pubkey-chain) for local users,
-# enabling key-based SSH login. Distinct from user_management.yml which handles
-# username/password/privilege-level provisioning.
-#
-# Usage: ansible-playbook ssh_key_auth.yml -i inventory/network.yml --ask-vault-pass
+# Credentials: ansible-vault encrypted in group_vars/network_devices/vault.yml
+#   vault_ansible_user, vault_ansible_password, vault_enable_password
 #
 # Inventory example:
-#   [ios_routers]
-#   core-rtr-01  ansible_host=10.0.1.1
-#   dist-rtr-01  ansible_host=10.0.1.2
+# [core_switches]
+# sw-core-01 ansible_host=10.0.1.10
+# sw-core-02 ansible_host=10.0.1.11
 #
-#   [ios_routers:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user={{ vault_net_user }}             # ansible-vault encrypted
-#   ansible_password={{ vault_net_password }}      # ansible-vault encrypted
-#   ansible_become=true
-#   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_pw }}  # ansible-vault encrypted
+# [network_devices:children]
+# core_switches
+#
+# [network_devices:vars]
+# ansible_network_os=ios
+# ansible_connection=network_cli
+# ansible_user="{{ vault_ansible_user }}"
+# ansible_password="{{ vault_ansible_password }}"
+# ansible_become=yes
+# ansible_become_method=enable
+# ansible_become_password="{{ vault_enable_password }}"
 
-- name: Manage SSH public key authentication on Cisco IOS devices
-  hosts: ios_routers
+- name: Harden SSH and VTY line access on IOS devices
+  hosts: network_devices
   gather_facts: false
 
   vars:
-    ssh_version: 2
-    ssh_timeout: 60
-    ssh_auth_retries: 3
-    # Defined in group_vars/all/vault.yml (ansible-vault encrypted)
-    # Structure: [{username: "netops", public_key: "ssh-rsa AAAA...xyz user@host"}, ...]
-    ssh_key_users: "{{ vault_ssh_key_users | default([]) }}"
+    ssh_rsa_modulus: 4096
+    vty_idle_timeout_minutes: 10
+    con_idle_timeout_minutes: 5
+    max_login_attempts: 3
+    vty_acl_name: VTY-MGMT-ACCESS
+    mgmt_subnets:
+      - 10.0.0.0 0.0.0.255
+      - 192.168.100.0 0.0.0.255
 
   tasks:
-    - name: Harden SSH transport settings
+    - name: Set hostname and domain name required for RSA key
       cisco.ios.ios_config:
         lines:
-          - "ip ssh version {{ ssh_version }}"
-          - "ip ssh time-out {{ ssh_timeout }}"
-          - "ip ssh authentication-retries {{ ssh_auth_retries }}"
-      register: ssh_base_cfg
+          - "ip domain-name {{ ansible_domain | default('corp.local') }}"
+
+    - name: Generate RSA crypto key for SSH
+      cisco.ios.ios_command:
+        commands:
+          - command: "crypto key generate rsa modulus {{ ssh_rsa_modulus }}"
+            prompt: "Do you really want to replace them"
+            answer: "yes"
+      register: rsa_gen_result
+      failed_when:
+        - rsa_gen_result is failed
+        - "'already exist' not in (rsa_gen_result.stdout[0] | default(''))"
+
+    - name: Enforce SSH version 2 and login hardening
+      cisco.ios.ios_config:
+        lines:
+          - "ip ssh version 2"
+          - "ip ssh time-out 60"
+          - "ip ssh authentication-retries {{ max_login_attempts }}"
+          - "login block-for 120 attempts {{ max_login_attempts }} within 60"
+          - "login on-failure log"
+          - "login on-success log"
+      register: ssh_config_result
       retries: 2
       delay: 5
-      until: ssh_base_cfg is not failed
+      until: ssh_config_result is not failed
 
-    - name: Gather current SSH and pubkey-chain state
+    - name: Build VTY management ACL
+      cisco.ios.ios_config:
+        lines: "{{ ['ip access-list standard ' + vty_acl_name] + (mgmt_subnets | map('regex_replace', '^', ' permit ') | list) + [' deny any log'] }}"
+      register: acl_result
+
+    - name: Configure VTY lines for SSH-only with timeout and ACL
+      cisco.ios.ios_config:
+        lines:
+          - "transport input ssh"
+          - "login local"
+          - "exec-timeout {{ vty_idle_timeout_minutes }} 0"
+          - "access-class {{ vty_acl_name }} in"
+          - "logging synchronous"
+        parents: "line vty 0 15"
+      register: vty_result
+
+    - name: Configure console line with timeout
+      cisco.ios.ios_config:
+        lines:
+          - "exec-timeout {{ con_idle_timeout_minutes }} 0"
+          - "logging synchronous"
+        parents: "line con 0"
+
+    - name: Verify SSH is listening
       cisco.ios.ios_command:
         commands:
-          - show ip ssh
-          - show ip ssh pubkey-chain
-      register: ssh_state
-      failed_when: ssh_state.stdout | length == 0
-
-    - name: Display current SSH state
-      ansible.builtin.debug:
-        msg: "{{ ssh_state.stdout_lines }}"
-
-    - name: Configure RSA public keys per user
-      block:
-        - name: Push public key into pubkey-chain for each user
-          cisco.ios.ios_config:
-            lines:
-              - key-string
-              - "{{ item.public_key }}"
-              - exit
-            parents:
-              - ip ssh pubkey-chain
-              - "username {{ item.username }}"
-          loop: "{{ ssh_key_users }}"
-          loop_control:
-            label: "{{ item.username }}"
-          register: pubkey_cfg
-          when: ssh_key_users | length > 0
-
-      rescue:
-        - name: Report pubkey configuration failure
-          ansible.builtin.debug:
-            msg: >
-              SSH pubkey config failed on {{ inventory_hostname }}:
-              {{ ansible_failed_result.msg | default('unknown error') }}
-
-        - name: Abort with actionable error
-          ansible.builtin.fail:
-            msg: >
-              SSH pubkey-chain configuration failed on {{ inventory_hostname }}.
-              Verify IOS version supports 'ip ssh pubkey-chain' (requires 15.1+).
-
-    - name: Verify pubkey-chain reflects configured users
-      cisco.ios.ios_command:
-        commands:
-          - show ip ssh pubkey-chain
-      register: pubkey_verify
+          - "show ip ssh"
+          - "show line vty 0 4"
+      register: ssh_verify
       retries: 2
       delay: 3
-      until: pubkey_verify is not failed
-      when: ssh_key_users | length > 0
 
-    - name: Assert each user key appears in pubkey-chain output
+    - name: Confirm SSHv2 is active
       ansible.builtin.assert:
         that:
-          - "item.username in pubkey_verify.stdout[0]"
-        fail_msg: "Public key for '{{ item.username }}' not found in pubkey-chain on {{ inventory_hostname }}"
-        success_msg: "Public key verified for '{{ item.username }}' on {{ inventory_hostname }}"
-      loop: "{{ ssh_key_users }}"
-      loop_control:
-        label: "{{ item.username }}"
-      when: ssh_key_users | length > 0
+          - "'SSH Enabled' in ssh_verify.stdout[0]"
+          - "'version 2.0' in ssh_verify.stdout[0]"
+        fail_msg: "SSHv2 not confirmed active on {{ inventory_hostname }}"
+        success_msg: "SSHv2 confirmed active on {{ inventory_hostname }}"
 
-    - name: Show SSH key authentication summary
+    - name: Save running configuration
+      cisco.ios.ios_config:
+        save_when: modified
+
+    - name: Report SSH hardening summary
       ansible.builtin.debug:
         msg:
-          - "Host            : {{ inventory_hostname }}"
-          - "SSH hardening   : {{ 'changed' if ssh_base_cfg.changed else 'already compliant' }}"
-          - "Key auth users  : {{ ssh_key_users | map(attribute='username') | list }}"
-          - "SSH version     : {{ ssh_version }}
+          - "Host: {{ inventory_hostname }}"
+          - "RSA modulus: {{ ssh_rsa_modulus }}"
+          - "VTY idle timeout: {{ vty_idle_timeout_minutes }}m"
+          - "Management ACL: {{ vty_acl_name }}"
+          - "SSH status: {{ ssh_verify.stdout_lines[0] | select('match', '.*SSH.*') | list | first | default('see output') }}
