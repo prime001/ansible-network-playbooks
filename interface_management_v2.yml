@@ -1,140 +1,111 @@
-The playbook is within range. Here it is:
-
 ---
-# VLAN and Layer 2 Interface Management
-# Creates VLANs and configures access/trunk port assignments on Cisco IOS switches.
-# Distinct from interface_management.yml (L3/routed) — this targets L2 switching.
+# QoS Policy Deployment — Cisco IOS/IOS-XE
+# Deploys DSCP-based class-maps and policy-map with bandwidth guarantees.
+# Not covered by existing playbooks (ntp, syslog, interfaces, acl, snmp, etc.).
 #
 # Inventory example:
-#   [access_switches]
-#   sw-core-01  ansible_host=10.0.1.11
-#   sw-edge-01  ansible_host=10.0.1.21
+#   [core_switches]
+#   core-sw-01 ansible_host=10.0.1.1
+#   core-sw-02 ansible_host=10.0.1.2
 #
-#   [access_switches:vars]
+#   [core_switches:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_user={{ vault_net_user }}           # ansible-vault encrypted
-#   ansible_password={{ vault_net_password }}    # ansible-vault encrypted
 #   ansible_become=yes
 #   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_password }}
+#   ansible_user={{ vault_net_user }}     # ansible-vault encrypted
+#   ansible_password={{ vault_net_pass }} # ansible-vault encrypted
 
-- name: Manage VLANs and Layer 2 port assignments
-  hosts: access_switches
+- name: Deploy DSCP-based QoS policy to Cisco IOS/IOS-XE devices
+  hosts: core_switches
   gather_facts: false
 
   vars:
-    vlans:
-      - vlan_id: 10
-        name: CORPORATE_USERS
-      - vlan_id: 20
-        name: SERVERS
-      - vlan_id: 30
-        name: MANAGEMENT
-      - vlan_id: 40
-        name: VOICE
-      - vlan_id: 99
-        name: NATIVE_UNTAGGED
-
-    access_ports:
-      - name: GigabitEthernet1/0/1
-        vlan: 10
-        description: "Corp user workstation"
-      - name: GigabitEthernet1/0/2
-        vlan: 40
-        description: "IP Phone - voice VLAN"
-      - name: GigabitEthernet1/0/48
-        vlan: 20
-        description: "App server NIC"
-
-    trunk_uplinks:
-      - name: GigabitEthernet1/0/24
-        allowed_vlans: "10,20,30,40,99"
-        description: "Uplink to distribution layer"
+    qos_policy_name: "ENTERPRISE-QOS"
+    voice_dscp: "ef"
+    video_dscp: "af41"
+    critical_dscp: "af31"
+    voice_bandwidth_pct: 20
+    video_bandwidth_pct: 30
+    critical_bandwidth_pct: 25
+    # Credentials via vault: ansible-vault encrypt_string '<secret>' --name 'vault_net_pass'
 
   tasks:
-    - name: Create and name VLANs
-      block:
-        - name: Apply VLAN database entries
-          cisco.ios.ios_vlans:
-            config: "{{ vlans }}"
-            state: merged
-          register: vlan_config
-          retries: 2
-          delay: 5
-          until: vlan_config is not failed
+    - name: Verify device reachability and collect platform info
+      cisco.ios.ios_command:
+        commands:
+          - show version | include IOS
+      register: device_version
+      retries: 3
+      delay: 5
+      until: device_version is not failed
 
-        - name: Show VLAN changes applied
-          ansible.builtin.debug:
-            msg: "{{ vlan_config.commands | default(['No VLAN changes needed']) }}"
+    - name: Display platform version
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} — {{ device_version.stdout[0] }}"
+
+    - block:
+        - name: Create VOICE class-map (EF DSCP)
+          cisco.ios.ios_config:
+            lines:
+              - "match dscp {{ voice_dscp }}"
+            parents: "class-map match-any VOICE-TRAFFIC"
+            save_when: never
+
+        - name: Create VIDEO class-map (AF41 DSCP)
+          cisco.ios.ios_config:
+            lines:
+              - "match dscp {{ video_dscp }}"
+            parents: "class-map match-any VIDEO-TRAFFIC"
+            save_when: never
+
+        - name: Create CRITICAL-DATA class-map (AF31 DSCP)
+          cisco.ios.ios_config:
+            lines:
+              - "match dscp {{ critical_dscp }}"
+            parents: "class-map match-any CRITICAL-DATA"
+            save_when: never
+
+        - name: Build policy-map with bandwidth allocations
+          cisco.ios.ios_config:
+            lines:
+              - "class VOICE-TRAFFIC"
+              - " priority percent {{ voice_bandwidth_pct }}"
+              - "class VIDEO-TRAFFIC"
+              - " bandwidth percent {{ video_bandwidth_pct }}"
+              - "class CRITICAL-DATA"
+              - " bandwidth percent {{ critical_bandwidth_pct }}"
+              - "class class-default"
+              - " fair-queue"
+            parents: "policy-map {{ qos_policy_name }}"
+            save_when: never
+
+        - name: Save configuration after successful deployment
+          cisco.ios.ios_config:
+            save_when: always
 
       rescue:
-        - name: Fail clearly on VLAN provisioning error
+        - name: Alert on QoS deployment failure
+          ansible.builtin.debug:
+            msg: "FAILED: QoS deployment on {{ inventory_hostname }} — configuration may be partial, manual review required"
+
+        - name: Abort with descriptive error
           ansible.builtin.fail:
-            msg: "VLAN provisioning failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg }}"
+            msg: "QoS policy deployment failed on {{ inventory_hostname }}"
 
-    - name: Assign access ports to VLANs
-      cisco.ios.ios_l2_interfaces:
-        config:
-          - name: "{{ item.name }}"
-            mode: access
-            access:
-              vlan: "{{ item.vlan }}"
-        state: merged
-      loop: "{{ access_ports }}"
-      register: access_config
-      failed_when:
-        - access_config.failed
-        - "'not supported' not in (access_config.msg | default(''))"
+    - name: Verify policy-map exists post-deployment
+      cisco.ios.ios_command:
+        commands:
+          - "show policy-map {{ qos_policy_name }}"
+      register: qos_verify
+      failed_when: "'Policy Map' not in qos_verify.stdout[0]"
 
-    - name: Set access port descriptions
-      cisco.ios.ios_interfaces:
-        config:
-          - name: "{{ item.name }}"
-            description: "{{ item.description }}"
-            enabled: true
-        state: merged
-      loop: "{{ access_ports }}"
-
-    - name: Configure trunk uplink ports
-      cisco.ios.ios_l2_interfaces:
-        config:
-          - name: "{{ item.name }}"
-            mode: trunk
-            trunk:
-              allowed_vlans: "{{ item.allowed_vlans }}"
-              native_vlan: 99
-        state: merged
-      loop: "{{ trunk_uplinks }}"
-      register: trunk_config
-      retries: 2
-      delay: 3
-      until: trunk_config is not failed
-
-    - name: Set trunk port descriptions
-      cisco.ios.ios_interfaces:
-        config:
-          - name: "{{ item.name }}"
-            description: "{{ item.description }}"
-            enabled: true
-        state: merged
-      loop: "{{ trunk_uplinks }}"
-
-    - name: Gather VLAN state for verification
-      cisco.ios.ios_vlans:
-        state: gathered
-      register: vlan_state
-
-    - name: Assert all required VLANs are active
-      ansible.builtin.assert:
-        that:
-          - item.vlan_id in (vlan_state.gathered | map(attribute='vlan_id') | list)
-        fail_msg: "VLAN {{ item.vlan_id }} ({{ item.name }}) missing on {{ inventory_hostname }}"
-        success_msg: "VLAN {{ item.vlan_id }} confirmed present"
-      loop: "{{ vlans }}"
-
-    - name: Display final VLAN inventory
+    - name: Report deployment result
       ansible.builtin.debug:
-        msg: >-
-          {{ inventory_hostname }} active VLANs:
-          {{ vlan_state.gathered | map(attribute='vlan_id') | list | sort }}
+        msg:
+          - "Host       : {{ inventory_hostname }}"
+          - "Policy     : {{ qos_policy_name }}"
+          - "Voice BW   : {{ voice_bandwidth_pct }}%  (DSCP {{ voice_dscp }})"
+          - "Video BW   : {{ video_bandwidth_pct }}%  (DSCP {{ video_dscp }})"
+          - "Critical BW: {{ critical_bandwidth_pct }}%  (DSCP {{ critical_dscp }})"
+          - "Status     : DEPLOYED
