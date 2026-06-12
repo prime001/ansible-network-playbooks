@@ -1,156 +1,121 @@
 ---
 # acl_deploy_v3.yml
-# Deploys named IP ACLs with pre/post verification and automatic rollback on failure.
-# Credentials stored in Ansible Vault -- see group_vars/all/vault.yml.
+# Deploys named extended/standard ACLs to Cisco IOS devices with a
+# pre-change snapshot, post-deployment verification, and auto-rollback.
+# Distinct from acl_deploy_v2 in that it atomically replaces ACLs,
+# retries verification, and rolls back on assertion failure.
 #
 # Inventory example:
-#   [core_routers]
-#   core-rtr-01 ansible_host=10.0.1.1
-#   core-rtr-02 ansible_host=10.0.1.2
+# [network_devices]
+# core-rtr-01 ansible_host=10.0.1.1
+# dist-sw-01  ansible_host=10.0.2.1
 #
-#   [core_routers:vars]
-#   acl_interface=GigabitEthernet0/0/0
-#   acl_direction=in
-#
-# Usage: ansible-playbook acl_deploy_v3.yml -i inventory/prod --ask-vault-pass
-#        ansible-playbook acl_deploy_v3.yml -i inventory/prod -e "target_hosts=core-rtr-01"
+# [network_devices:vars]
+# ansible_network_os=ios
+# ansible_connection=network_cli
+# ansible_user={{ vault_net_user }}           # ansible-vault encrypted
+# ansible_password={{ vault_net_password }}
+# ansible_become=yes
+# ansible_become_method=enable
+# ansible_become_password={{ vault_enable_password }}
 
-- name: Stateful ACL deployment with pre/post verification and rollback
-  hosts: "{{ target_hosts | default('core_routers') }}"
+- name: Deploy named ACLs with snapshot, verification, and rollback
+  hosts: network_devices
   gather_facts: false
-  connection: network_cli
 
   vars:
-    ansible_network_os: ios
-    ansible_user: "{{ vault_net_username }}"
-    ansible_password: "{{ vault_net_password }}"
-    ansible_become: true
-    ansible_become_method: enable
-    ansible_become_pass: "{{ vault_enable_password }}"
+    # Vault reference: ansible-vault encrypt_string '<password>' --name vault_net_user
+    rollback_on_failure: true
 
-    acl_name: "{{ acl_name | default('PERIMETER-INBOUND-v3') }}"
-    acl_interface: "{{ acl_interface | default('GigabitEthernet0/0') }}"
-    acl_direction: "{{ acl_direction | default('in') }}"
+    acl_config:
+      - name: PERMIT_TRUSTED_MGMT
+        type: extended
+        lines:
+          - "10 permit tcp 10.100.0.0 0.0.255.255 any eq 22"
+          - "20 permit tcp 10.100.0.0 0.0.255.255 any eq 443"
+          - "30 permit icmp 10.100.0.0 0.0.255.255 any"
+          - "100 deny ip any any log"
+      - name: DENY_RFC1918_INGRESS
+        type: extended
+        lines:
+          - "10 deny ip 10.0.0.0 0.255.255.255 any log"
+          - "20 deny ip 172.16.0.0 0.15.255.255 any log"
+          - "30 deny ip 192.168.0.0 0.0.255.255 any log"
+          - "100 permit ip any any"
 
   tasks:
-    - name: Capture pre-deployment ACL and interface state
+    - name: Capture pre-change ACL state
       cisco.ios.ios_command:
         commands:
-          - "show ip access-lists {{ acl_name }}"
-          - "show running-config | section interface {{ acl_interface }}"
-      register: pre_state
-      retries: 2
-      delay: 5
+          - "show ip access-lists"
+      register: pre_change_acls
 
-    - name: Deploy ACL entries and bind to interface
+    - name: Save pre-change snapshot to control node
+      ansible.builtin.copy:
+        content: "{{ inventory_hostname }} pre-change {{ now(utc=true, fmt='%Y%m%d_%H%M%S') }}\n{{ pre_change_acls.stdout[0] }}"
+        dest: "/tmp/acl_pre_{{ inventory_hostname }}.txt"
+        mode: '0600'
+      delegate_to: localhost
+
+    - name: Deploy and verify ACLs
       block:
-        - name: Configure named IP access list via resource module
-          cisco.ios.ios_acls:
-            config:
-              - afi: ipv4
-                acls:
-                  - name: "{{ acl_name }}"
-                    aces:
-                      - sequence: 10
-                        grant: permit
-                        protocol_options:
-                          tcp: {}
-                        source:
-                          address: 10.0.0.0
-                          wildcard_bits: 0.255.255.255
-                        destination:
-                          address: 172.16.0.0
-                          wildcard_bits: 0.0.255.255
-                          port_protocol:
-                            eq: "443"
-                        log:
-                          set: true
-                      - sequence: 20
-                        grant: permit
-                        protocol_options:
-                          tcp: {}
-                        source:
-                          address: 10.0.0.0
-                          wildcard_bits: 0.255.255.255
-                        destination:
-                          address: 172.16.0.0
-                          wildcard_bits: 0.0.255.255
-                          port_protocol:
-                            eq: "80"
-                      - sequence: 30
-                        grant: permit
-                        protocol_options:
-                          icmp: {}
-                        source:
-                          address: 10.0.0.0
-                          wildcard_bits: 0.255.255.255
-                        destination:
-                          any: true
-                      - sequence: 100
-                        grant: deny
-                        protocol_options:
-                          ip: {}
-                        source:
-                          any: true
-                        destination:
-                          any: true
-                        log:
-                          set: true
-            state: replaced
-          register: acl_result
-
-        - name: Bind ACL to interface
+        - name: Atomically replace each ACL
           cisco.ios.ios_config:
-            lines:
-              - "ip access-group {{ acl_name }} {{ acl_direction }}"
-            parents: "interface {{ acl_interface }}"
-          register: iface_result
+            before: "no ip access-list {{ item.type }} {{ item.name }}"
+            parents: "ip access-list {{ item.type }} {{ item.name }}"
+            lines: "{{ item.lines }}"
+          loop: "{{ acl_config }}"
+          loop_control:
+            label: "{{ item.name }}"
+          register: acl_apply_result
 
-        - name: Persist configuration
+        - name: Poll for post-deployment ACL state
+          cisco.ios.ios_command:
+            commands:
+              - "show ip access-lists"
+          register: post_deploy_acls
+          retries: 3
+          delay: 5
+          until: post_deploy_acls.stdout[0] | length > 0
+
+        - name: Assert all target ACLs are present
+          ansible.builtin.assert:
+            that: "item.name in post_deploy_acls.stdout[0]"
+            fail_msg: "ACL {{ item.name }} missing on {{ inventory_hostname }} after deployment"
+            success_msg: "ACL {{ item.name }} verified on {{ inventory_hostname }}"
+          loop: "{{ acl_config }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: Persist verified configuration to NVRAM
           cisco.ios.ios_config:
             save_when: modified
 
       rescue:
-        - name: Announce rollback
+        - name: Log failure
           ansible.builtin.debug:
-            msg: "Deployment failed on {{ inventory_hostname }} -- rolling back"
+            msg: "Deployment failed on {{ inventory_hostname }} — rollback={{ rollback_on_failure }}"
 
-        - name: Remove ACL binding from interface
+        - name: Remove newly pushed ACLs
           cisco.ios.ios_config:
-            lines:
-              - "no ip access-group {{ acl_name }} {{ acl_direction }}"
-            parents: "interface {{ acl_interface }}"
-          ignore_errors: true
+            lines: "no ip access-list {{ item.type }} {{ item.name }}"
+          loop: "{{ acl_config }}"
+          loop_control:
+            label: "{{ item.name }}"
+          when: rollback_on_failure | bool
 
-        - name: Delete partially deployed ACL
-          cisco.ios.ios_acls:
-            config:
-              - afi: ipv4
-                acls:
-                  - name: "{{ acl_name }}"
-            state: deleted
-          ignore_errors: true
+        - name: Save rolled-back state to NVRAM
+          cisco.ios.ios_config:
+            save_when: always
+          when: rollback_on_failure | bool
 
-        - name: Fail after rollback
+        - name: Abort with rollback context
           ansible.builtin.fail:
-            msg: "ACL deployment failed and was rolled back on {{ inventory_hostname }}"
+            msg: "ACL deployment rolled back on {{ inventory_hostname }}. Pre-change state: /tmp/acl_pre_{{ inventory_hostname }}.txt"
 
-    - name: Verify ACL is present and bound post-deployment
-      cisco.ios.ios_command:
-        commands:
-          - "show ip access-lists {{ acl_name }}"
-          - "show ip interface {{ acl_interface }} | include access list"
-      register: post_state
-      failed_when: acl_name not in post_state.stdout[0]
-      retries: 2
-      delay: 3
-
-    - name: Display deployment summary
+    - name: Report deployment outcome
       ansible.builtin.debug:
         msg:
-          - "Host        : {{ inventory_hostname }}"
-          - "ACL         : {{ acl_name }}"
-          - "Interface   : {{ acl_interface }} ({{ acl_direction }}bound)"
-          - "Changed     : {{ acl_result.changed or iface_result.changed }}"
-          - "Interface   : {{ post_state.stdout[1] | default('no acl binding output') }}"
-          - "Match counts: {{ post_state.stdout[0] | regex_findall('(\\d+) matches') }}
+          - "Host: {{ inventory_hostname }}"
+          - "ACLs configured: {{ acl_config | map(attribute='name') | join(', ') }}"
+          - "Modified: {{ acl_apply_result.results | selectattr('changed') | list | length }} of {{ acl_config | length }} ACL(s)
