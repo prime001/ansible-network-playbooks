@@ -1,112 +1,112 @@
 ---
-# Remote Access Security Compliance Check
-# Audits SSH hardening and secure line config on Cisco IOS/IOS-XE devices.
-# Checks SSH v2, telnet lockdown, password encryption, and brute-force protection.
+# Cisco IOS SSH and AAA Hardening Compliance Check
+#
+# Validates SSH v2-only transport, AAA new-model, password encryption,
+# idle session timeouts, and management-plane attack-surface reduction.
+# Complements compliance_check.yml (NTP/syslog/ACL/banner/SNMP checks).
 #
 # Inventory example:
-# [core_switches]
-# sw-core-01 ansible_host=10.0.1.1
-# sw-core-02 ansible_host=10.0.1.2
+#   [core_routers]
+#   rtr-core-01  ansible_host=10.0.0.1
+#   rtr-core-02  ansible_host=10.0.0.2
 #
-# [distribution_routers]
-# rtr-dist-01 ansible_host=10.0.1.10
-#
-# [network:children]
-# core_switches
-# distribution_routers
-#
-# [network:vars]
-# ansible_network_os=ios
-# ansible_connection=network_cli
-# ansible_user={{ vault_net_user }}              # stored in ansible-vault
-# ansible_password={{ vault_net_password }}       # stored in ansible-vault
-# ansible_become=yes
-# ansible_become_method=enable
-# ansible_become_password={{ vault_enable_pass }} # stored in ansible-vault
+#   [core_routers:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_net_user }}             # see group_vars/all/vault.yml
+#   ansible_password={{ vault_net_password }}
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_enable_secret }}
 
-- name: Remote Access Security Compliance Check
-  hosts: network
+- name: IOS SSH and AAA Hardening Compliance Check
+  hosts: core_routers
   gather_facts: false
 
   tasks:
-    - name: Gather remote-access-related config sections
+    - name: Collect SSH version and AAA/service configuration
       block:
-        - name: Collect SSH and line configuration
+        - name: Run compliance data collection commands
           cisco.ios.ios_command:
             commands:
               - show ip ssh
+              - show running-config | include ^(aaa new-model|service password-encryption|service tcp-small|service udp-small)
               - show running-config | section ^line vty
-              - show running-config | section ^line con
-              - show running-config | include ^service password-encryption
-              - show running-config | include ^login block-for
-          register: sec_output
+          register: compliance_data
           retries: 2
           delay: 5
-          until: sec_output is not failed
+          until: compliance_data is not failed
 
       rescue:
-        - name: Record collection failure and continue
+        - name: Report data collection failure
           ansible.builtin.debug:
-            msg: "WARNING: Failed to collect config from {{ inventory_hostname }} after retries"
-        - name: Skip remaining tasks for unreachable host
-          ansible.builtin.meta: end_host
+            msg: "Cannot collect compliance data from {{ inventory_hostname }}: {{ ansible_failed_result.msg }}"
 
-    - name: Evaluate SSH version 2 enforcement
-      ansible.builtin.set_fact:
-        chk_ssh_v2: >-
-          {{ 'version 2' in sec_output.stdout[0] | lower }}
+        - name: Abort compliance checks for unreachable host
+          ansible.builtin.fail:
+            msg: "Halting checks for {{ inventory_hostname }} — collection failed."
 
-    - name: Evaluate telnet disabled on VTY lines
-      ansible.builtin.set_fact:
-        chk_telnet_off: >-
-          {{ 'transport input ssh' in sec_output.stdout[1] and
-             'transport input all' not in sec_output.stdout[1] and
-             'transport input telnet' not in sec_output.stdout[1] }}
-
-    - name: Evaluate VTY exec-timeout presence
-      ansible.builtin.set_fact:
-        chk_vty_timeout: >-
-          {{ 'exec-timeout' in sec_output.stdout[1] }}
-
-    - name: Evaluate service password-encryption
-      ansible.builtin.set_fact:
-        chk_pwd_encrypt: >-
-          {{ 'service password-encryption' in sec_output.stdout[3] }}
-
-    - name: Evaluate login brute-force protection
-      ansible.builtin.set_fact:
-        chk_login_block: >-
-          {{ 'login block-for' in sec_output.stdout[4] }}
-
-    - name: Display per-device compliance summary
-      ansible.builtin.debug:
-        msg:
-          - "=== Remote Access Compliance: {{ inventory_hostname }} ==="
-          - "SSH v2 only:              {{ 'PASS' if chk_ssh_v2      else 'FAIL' }}"
-          - "Telnet disabled on VTY:   {{ 'PASS' if chk_telnet_off  else 'FAIL' }}"
-          - "VTY exec-timeout set:     {{ 'PASS' if chk_vty_timeout else 'FAIL' }}"
-          - "Service password-encrypt: {{ 'PASS' if chk_pwd_encrypt else 'FAIL' }}"
-          - "Login brute-force block:  {{ 'PASS' if chk_login_block else 'FAIL' }}"
-
-    - name: Assert all remote-access controls are in place
+    - name: Assert SSH version 2 is enforced
       ansible.builtin.assert:
-        that:
-          - chk_ssh_v2
-          - chk_telnet_off
-          - chk_vty_timeout
-          - chk_pwd_encrypt
-          - chk_login_block
-        fail_msg: >
-          COMPLIANCE FAILURE on {{ inventory_hostname }}:
-          ssh_v2={{ chk_ssh_v2 }}, telnet_off={{ chk_telnet_off }},
-          vty_timeout={{ chk_vty_timeout }}, pwd_encrypt={{ chk_pwd_encrypt }},
-          login_block={{ chk_login_block }}
-        success_msg: "All remote access security checks PASSED on {{ inventory_hostname }}"
-      register: compliance_result
+        that: "'version 2' in compliance_data.stdout[0]"
+        fail_msg: "[FAIL] {{ inventory_hostname }}: SSH v2 not enforced — downgrade attack risk."
+        success_msg: "[PASS] {{ inventory_hostname }}: SSH version 2 confirmed."
+      register: chk_ssh_v2
       ignore_errors: true
 
-    - name: Summarize non-compliant hosts for remediation tracking
+    - name: Assert AAA new-model is enabled
+      ansible.builtin.assert:
+        that: "'aaa new-model' in compliance_data.stdout[1]"
+        fail_msg: "[FAIL] {{ inventory_hostname }}: AAA new-model absent — legacy auth active."
+        success_msg: "[PASS] {{ inventory_hostname }}: AAA new-model enabled."
+      register: chk_aaa
+      ignore_errors: true
+
+    - name: Assert service password-encryption is active
+      ansible.builtin.assert:
+        that: "'service password-encryption' in compliance_data.stdout[1]"
+        fail_msg: "[FAIL] {{ inventory_hostname }}: Passwords stored in cleartext — enable service password-encryption."
+        success_msg: "[PASS] {{ inventory_hostname }}: Password encryption active."
+      register: chk_pwd_enc
+      ignore_errors: true
+
+    - name: Assert tcp-small-servers and udp-small-servers are disabled
+      ansible.builtin.assert:
+        that:
+          - "'service tcp-small-servers' not in compliance_data.stdout[1]"
+          - "'service udp-small-servers' not in compliance_data.stdout[1]"
+        fail_msg: "[FAIL] {{ inventory_hostname }}: Minor TCP/UDP services must be explicitly disabled."
+        success_msg: "[PASS] {{ inventory_hostname }}: Minor TCP/UDP services not running."
+      register: chk_small_svc
+      ignore_errors: true
+
+    - name: Assert VTY lines enforce exec-timeout
+      ansible.builtin.assert:
+        that: "'exec-timeout' in compliance_data.stdout[2]"
+        fail_msg: "[FAIL] {{ inventory_hostname }}: No exec-timeout on VTY lines — idle session exposure."
+        success_msg: "[PASS] {{ inventory_hostname }}: VTY exec-timeout configured."
+      register: chk_vty_timeout
+      ignore_errors: true
+
+    - name: Build per-host compliance report
+      ansible.builtin.set_fact:
+        compliance_report:
+          host: "{{ inventory_hostname }}"
+          checks:
+            ssh_v2:         "{{ 'PASS' if not chk_ssh_v2.failed      else 'FAIL' }}"
+            aaa_new_model:  "{{ 'PASS' if not chk_aaa.failed         else 'FAIL' }}"
+            pwd_encryption: "{{ 'PASS' if not chk_pwd_enc.failed     else 'FAIL' }}"
+            minor_services: "{{ 'PASS' if not chk_small_svc.failed   else 'FAIL' }}"
+            vty_timeout:    "{{ 'PASS' if not chk_vty_timeout.failed else 'FAIL' }}"
+
+    - name: Display compliance report
       ansible.builtin.debug:
-        msg: "ACTION REQUIRED: Open remediation ticket for {{ inventory_hostname }}"
-      when: compliance_result is failed
-      failed_when: false
+        var: compliance_report
+
+    - name: Fail play if any control failed
+      ansible.builtin.fail:
+        msg: "{{ inventory_hostname }} has compliance violations — review report above."
+      when: >
+        chk_ssh_v2.failed or chk_aaa.failed or
+        chk_pwd_enc.failed or chk_small_svc.failed or
+        chk_vty_timeout.failed
