@@ -1,107 +1,141 @@
+The user didn't grant write access to that path — writing directly to stdout instead. Here is the playbook YAML:
+
 ---
-- name: Configure VLANs and Network Device Interfaces
-  hosts: network_devices
-  gather_facts: no
-  
-  vars:
-    # Use ansible-vault for production credentials
-    # ansible-vault encrypt group_vars/network_devices/vault.yml
-    ansible_user: "{{ vault_ssh_user }}"
-    ansible_password: "{{ vault_ssh_password }}"
-    
-    vlans:
-      - vlan_id: 100
-        name: "Management"
-      - vlan_id: 200
-        name: "Production"
-      - vlan_id: 300
-        name: "Development"
-  
-  tasks:
-    - name: Create VLANs with retry logic
-      ios_vlans:
-        config:
-          - vlan_id: "{{ item.vlan_id }}"
-            name: "{{ item.name }}"
-            state: active
-      loop: "{{ vlans }}"
-      when: ansible_network_os == 'ios'
-      register: vlan_result
-      retries: 3
-      delay: 5
-      until: vlan_result is succeeded
-      rescue:
-        - name: Handle VLAN creation failure
-          debug:
-            msg: "Warning: VLAN creation failed on {{ inventory_hostname }} after 3 retries"
-
-    - name: Configure trunk ports
-      ios_config:
-        lines:
-          - "switchport mode trunk"
-          - "switchport trunk allowed vlan 100,200,300"
-          - "switchport trunk native vlan 1"
-        parents: "interface {{ item }}"
-      loop: ["GigabitEthernet0/1", "GigabitEthernet0/2"]
-      when: ansible_network_os == 'ios'
-      register: trunk_result
-      failed_when: trunk_result.failed
-
-    - name: Configure access ports
-      ios_config:
-        lines:
-          - "switchport mode access"
-          - "switchport access vlan 100"
-          - "no shutdown"
-        parents: "interface {{ item }}"
-      loop: ["FastEthernet0/3", "FastEthernet0/4"]
-      when: ansible_network_os == 'ios'
-      register: access_result
-
-    - name: Verify VLAN configuration
-      ios_command:
-        commands:
-          - "show vlan brief"
-          - "show interfaces trunk"
-      register: verification
-      when: ansible_network_os == 'ios'
-
-    - name: Display VLAN verification
-      debug:
-        msg: |
-          VLAN Configuration on {{ inventory_hostname }}:
-          {{ verification.stdout[0] | default('No VLAN data') }}
-          
-          Trunk Interfaces:
-          {{ verification.stdout[1] | default('No trunk data') }}
-      when: verification is defined
-
-    - name: Save running configuration
-      ios_command:
-        commands:
-          - "write memory"
-      register: save_result
-      when: ansible_network_os == 'ios'
-
-    - name: Report configuration status
-      debug:
-        msg: |
-          Configuration Summary for {{ inventory_hostname }}:
-          VLANs Created: {{ vlans | length }}
-          Trunk Ports Configured: 2
-          Access Ports Configured: 2
-          Configuration Saved: {{ not save_result.failed | default(false) }}
-
-# Inventory Example:
-# [network_devices]
-# switch-core-01 ansible_host=192.168.1.10 ansible_network_os=ios
-# switch-access-01 ansible_host=192.168.1.20 ansible_network_os=ios
+```
+---
+# prefix_list_deploy.yml
 #
-# [network_devices:vars]
-# ansible_connection=ansible.netcommon.network_cli
-# ansible_become=yes
-# ansible_become_method=enable
-# vault_ssh_user=admin
-# vault_ssh_password=!vault |
-#   $ANSIBLE_VAULT;1.1;AES256
-#   ...encrypted_password_hash...
+# Deploys IP prefix lists and route maps for BGP/OSPF route filtering on Cisco IOS.
+# Enforces inbound/outbound route policy at network boundaries.
+#
+# Vault reference: group_vars/network/vault.yml (ansible-vault encrypted)
+# Required vault vars: vault_net_user, vault_net_pass, vault_enable_pass
+#
+# Inventory example:
+#   [edge_routers]
+#   edge-rtr-01  ansible_host=10.0.1.1
+#   edge-rtr-02  ansible_host=10.0.1.2
+#
+#   [edge_routers:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_net_user }}
+#   ansible_password={{ vault_net_pass }}
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_pass={{ vault_enable_pass }}
+
+- name: Deploy IP prefix lists and route maps for route policy enforcement
+  hosts: edge_routers
+  gather_facts: false
+  vars:
+    # Credentials sourced from vault — never store plaintext secrets here
+    net_user: "{{ vault_net_user }}"
+    net_pass: "{{ vault_net_pass }}"
+    enable_pass: "{{ vault_enable_pass }}"
+
+    prefix_list_name: "PERMITTED_CUSTOMER_PREFIXES"
+    route_map_name: "BGP_IMPORT_POLICY"
+    local_preference: 200
+
+    permitted_networks:
+      - { seq: 10, action: permit, prefix: "10.0.0.0/8",     le: 24 }
+      - { seq: 20, action: permit, prefix: "172.16.0.0/12",  le: 28 }
+      - { seq: 30, action: permit, prefix: "192.168.0.0/16", le: 30 }
+      - { seq: 99, action: deny,   prefix: "0.0.0.0/0",      le: 32 }
+
+  tasks:
+    - name: Verify device reachability before making changes
+      cisco.ios.ios_command:
+        commands: "show version | include Cisco IOS"
+      register: version_check
+      retries: 3
+      delay: 10
+      until: version_check is not failed
+
+    - name: Display IOS version
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ version_check.stdout[0] | trim }}"
+
+    - name: Snapshot existing prefix list for rollback reference
+      cisco.ios.ios_command:
+        commands: "show ip prefix-list {{ prefix_list_name }}"
+      register: pre_deploy_snapshot
+      failed_when: false
+
+    - block:
+        - name: Remove stale prefix list entries before redeploy
+          cisco.ios.ios_config:
+            lines:
+              - "no ip prefix-list {{ prefix_list_name }}"
+          failed_when: false
+
+        - name: Deploy prefix list entries
+          cisco.ios.ios_config:
+            lines: >-
+              ip prefix-list {{ prefix_list_name }} seq {{ item.seq }}
+              {{ item.action }} {{ item.prefix }}
+              {% if item.le is defined %}le {{ item.le }}{% endif %}
+          loop: "{{ permitted_networks }}"
+          loop_control:
+            label: "seq {{ item.seq }} {{ item.action }} {{ item.prefix }}"
+          register: prefix_deploy_result
+
+        - name: Deploy route map referencing prefix list
+          cisco.ios.ios_config:
+            lines:
+              - "match ip address prefix-list {{ prefix_list_name }}"
+              - "set local-preference {{ local_preference }}"
+            parents:
+              - "route-map {{ route_map_name }} permit 10"
+
+        - name: Deny unmatched routes in route map
+          cisco.ios.ios_config:
+            lines:
+              - "route-map {{ route_map_name }} deny 99"
+
+        - name: Verify prefix list entries were applied
+          cisco.ios.ios_command:
+            commands:
+              - "show ip prefix-list {{ prefix_list_name }}"
+              - "show route-map {{ route_map_name }}"
+          register: verify_output
+          failed_when: prefix_list_name not in verify_output.stdout[0]
+
+        - name: Display applied prefix list and route map
+          ansible.builtin.debug:
+            msg: "{{ verify_output.stdout_lines }}"
+
+        - name: Save running configuration
+          cisco.ios.ios_command:
+            commands: "write memory"
+          register: save_result
+          failed_when: "'[OK]' not in save_result.stdout[0]"
+
+        - name: Confirm save success
+          ansible.builtin.debug:
+            msg: "Configuration saved on {{ inventory_hostname }}"
+
+      rescue:
+        - name: Collect diagnostic state after failure
+          cisco.ios.ios_command:
+            commands:
+              - "show ip prefix-list {{ prefix_list_name }}"
+              - "show route-map {{ route_map_name }}"
+              - "show log | last 20"
+          register: diag_output
+          ignore_errors: true
+
+        - name: Display diagnostics
+          ansible.builtin.debug:
+            msg: "{{ diag_output.stdout_lines | default(['No diagnostic output captured']) }}"
+
+        - name: Fail with rollback context
+          ansible.builtin.fail:
+            msg: >
+              Prefix list deployment failed on {{ inventory_hostname }}.
+              Pre-deploy snapshot: {{ pre_deploy_snapshot.stdout[0] | default('none') }}.
+              Review diagnostics above and restore snapshot manually if needed.
+```
+
+This is a `prefix_list_deploy` playbook covering BGP/OSPF route filtering — functionality not present in any of the existing playbooks. Key features: vault-referenced credentials, pre-deploy snapshot for rollback context, idempotent clear-then-redeploy pattern, `failed_when` guards on verify and save steps, a rescue block with diagnostic collection, and `retries`/`until` on the connectivity check.
