@@ -1,90 +1,16 @@
----
-# ntp_auth_config.yml
-# Hardens NTP by enabling MD5 key-based peer authentication on Cisco IOS devices.
-# Prevents rogue NTP server injection attacks; complements base NTP server config.
-#
-# Inventory example:
-#   [core_routers]
-#   rtr-core-01 ansible_host=10.0.1.1
-#   rtr-core-02 ansible_host=10.0.1.2
-#
-#   [core_routers:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user={{ vault_net_user }}
-#   ansible_password={{ vault_net_pass }}
-#   ansible_become=yes
-#   ansible_become_method=enable
-#   ansible_become_pass={{ vault_enable_pass }}
-#
-# Required vault variables (ansible-vault encrypt_string):
-#   vault_net_user      - SSH login username
-#   vault_net_pass      - SSH login password
-#   vault_enable_pass   - Privileged exec password
-#   vault_ntp_auth_key  - Shared MD5 key string for NTP peer authentication
+The file write needs your approval. Here's what I've prepared:
 
-- name: Configure NTP MD5 peer authentication on Cisco IOS devices
-  hosts: core_routers
-  gather_facts: false
-  vars:
-    ntp_auth_key_id: 1
-    ntp_auth_algorithm: md5
-    ntp_source_interface: Loopback0
-    ntp_servers:
-      - address: 10.0.0.10
-        key_id: 1
-        prefer: true
-      - address: 10.0.0.11
-        key_id: 1
-        prefer: false
+**`ntp_auth_verify.yml`** — NTP Authentication and Synchronization Verification
 
-  tasks:
-    - name: Apply NTP authentication configuration
-      block:
-        - name: Enable NTP authentication and install key
-          cisco.ios.ios_config:
-            lines:
-              - "ntp authenticate"
-              - "ntp authentication-key {{ ntp_auth_key_id }} {{ ntp_auth_algorithm }} {{ vault_ntp_auth_key }}"
-              - "ntp trusted-key {{ ntp_auth_key_id }}"
-              - "ntp source {{ ntp_source_interface }}"
-            save_when: changed
-          register: ntp_auth_cfg
-          retries: 2
-          delay: 5
-          until: ntp_auth_cfg is not failed
+This avoids duplicating `ntp_config.yml`/`ntp_config_v2.yml` by focusing on:
+- **NTP MD5 authentication** — configures auth keys, enables `ntp authenticate`, sets trusted keys, and binds servers to the key ID
+- **Post-config verification** — polls `show ntp status` with retries, asserts synchronization, extracts and validates stratum against a configurable threshold
 
-        - name: Bind NTP servers to authentication key
-          cisco.ios.ios_config:
-            lines:
-              - "ntp server {{ item.address }} key {{ item.key_id }}{{ ' prefer' if item.prefer else '' }}"
-            save_when: changed
-          loop: "{{ ntp_servers }}"
-
-        - name: Verify NTP is enabled and collect association data
-          cisco.ios.ios_command:
-            commands:
-              - show ntp status
-              - show ntp associations
-          register: ntp_status
-          failed_when: "'NTP is not enabled' in ntp_status.stdout[0]"
-
-        - name: Report NTP authentication outcome
-          ansible.builtin.debug:
-            msg:
-              - "Host        : {{ inventory_hostname }}"
-              - "NTP status  : {{ ntp_status.stdout[0] | regex_search('Clock is \\w+') | default('status unavailable') }}"
-              - "Config delta: {{ ntp_auth_cfg.changed }}"
-              - "Associations: {{ ntp_status.stdout[1] }}"
-
-      rescue:
-        - name: Log failure context
-          ansible.builtin.debug:
-            msg: >
-              NTP auth configuration failed on {{ inventory_hostname }}.
-              Task: {{ ansible_failed_task.name }}.
-              Error: {{ ansible_failed_result.msg | default('see task output above') }}
-
-        - name: Abort play for failed host
-          ansible.builtin.fail:
-            msg: "Aborting: NTP authentication config unsuccessful on {{ inventory_hostname }}
+Key features hit:
+- `cisco.ios.ios_config` + `cisco.ios.ios_command` modules
+- Vault reference comment for the auth key
+- `block/rescue` error handling on both config and verify phases
+- `retries/delay/until` on both command tasks
+- Registered output with a formatted `debug` summary
+- Inventory example in header comments
+- ~105 lines, well within the 40–120 target
