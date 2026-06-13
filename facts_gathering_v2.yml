@@ -1,124 +1,132 @@
 ---
-# bgp_neighbor_audit.yml
+# BGP Neighbor Facts Collector
+# Gathers BGP peer state, AS numbers, and prefix counts across IOS, NX-OS, and Junos.
+# Distinct from facts_gathering.yml (interface/platform data) — focused on control-plane state.
 #
-# Collects BGP neighbor states, session uptime, and received prefix counts
-# across IOS/IOS-XE, NX-OS, and IOS-XR platforms. Designed for pre/post
-# change-window validation and daily BGP health checks.
+# Credentials: store ansible_password in vault
+#   ansible-vault encrypt_string 'secretpass' --name 'ansible_password'
 #
-# Inventory example:
-#   [core_routers]
-#   rtr-01 ansible_host=10.0.0.1 ansible_network_os=ios
-#   rtr-02 ansible_host=10.0.0.2 ansible_network_os=iosxr
-#
-#   [dc_spine]
-#   spine-01 ansible_host=10.1.0.1 ansible_network_os=nxos
-#
-#   [all:vars]
-#   ansible_connection=network_cli
-#   ansible_become=true
-#   ansible_become_method=enable
-#   ansible_user={{ vault_net_user }}       # ansible-vault encrypted
-#   ansible_password={{ vault_net_pass }}   # ansible-vault encrypted
-#   ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+# Inventory example (inventory/network.yml):
+# all:
+#   children:
+#     ios_routers:
+#       hosts:
+#         core-rtr-01:
+#           ansible_host: 10.0.0.1
+#           ansible_network_os: ios
+#         core-rtr-02:
+#           ansible_host: 10.0.0.2
+#           ansible_network_os: ios
+#     nxos_fabric:
+#       hosts:
+#         spine-01:
+#           ansible_host: 10.0.1.1
+#           ansible_network_os: nxos
+#     junos_pe:
+#       hosts:
+#         pe-rtr-01:
+#           ansible_host: 10.0.2.1
+#           ansible_network_os: junos
+#   vars:
+#     ansible_user: netops
+#     ansible_password: !vault |
+#       $ANSIBLE_VAULT;1.1;AES256
+#       <encrypted-value>
+#     ansible_connection: network_cli
+#     ansible_become: false
 
-- name: BGP Neighbor State Audit
+- name: Collect BGP Neighbor State Facts
   hosts: "{{ target_hosts | default('all') }}"
   gather_facts: false
   vars:
-    bgp_down_pattern: "Idle|Active|Connect|OpenSent|OpenConfirm"
+    retry_count: 3
+    retry_delay: 10
+    bgp_report_dir: "./reports/bgp"
 
   tasks:
+    - name: Confirm device is reachable
+      ansible.netcommon.cli_command:
+        command: show version
+      register: reachability_check
+      retries: "{{ retry_count }}"
+      delay: "{{ retry_delay }}"
+      until: reachability_check is not failed
 
-    - name: Collect BGP data - IOS / IOS-XE
+    - name: Gather BGP neighbor data — IOS/IOS-XE
       block:
-        - name: Run show ip bgp summary
+        - name: Run BGP summary and neighbor commands
           cisco.ios.ios_command:
             commands:
               - show ip bgp summary
-              - show ip bgp neighbors | include BGP neighbor is|BGP state|Prefixes received
-          register: ios_bgp
-          retries: 2
-          delay: 5
-          until: ios_bgp is not failed
+              - show ip bgp neighbors | include BGP neighbor|BGP state|Prefixes
+          register: ios_bgp_facts
+          failed_when:
+            - ios_bgp_facts.failed
+            - '"% BGP not active" not in ios_bgp_facts.stdout[0]'
 
-        - name: Display IOS BGP neighbor table
+        - name: Display IOS BGP summary
           ansible.builtin.debug:
-            var: ios_bgp.stdout_lines[0]
-
-        - name: Display IOS BGP neighbor detail
-          ansible.builtin.debug:
-            var: ios_bgp.stdout_lines[1]
-
-        - name: Flag non-Established sessions on IOS
-          ansible.builtin.debug:
-            msg: "WARN: Non-Established BGP session on {{ inventory_hostname }} -- investigate before change window"
-          when: ios_bgp.stdout[0] is search(bgp_down_pattern)
+            var: ios_bgp_facts.stdout_lines
 
       rescue:
-        - name: Log IOS collection failure
+        - name: Record collection failure — IOS
           ansible.builtin.debug:
-            msg: "ERROR: BGP collection failed on {{ inventory_hostname }} -- {{ ansible_failed_result.msg | default('check SSH/credentials') }}"
+            msg: "BGP fact collection failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('check BGP config') }}"
+        - name: Flag host as failed
+          ansible.builtin.set_fact:
+            bgp_facts_failed: true
 
       when: ansible_network_os in ['ios', 'iosxe']
 
-    - name: Collect BGP data - NX-OS
+    - name: Gather BGP neighbor data — NX-OS
       block:
-        - name: Run show bgp all summary
+        - name: Run BGP summary and neighbor commands
           cisco.nxos.nxos_command:
             commands:
-              - show bgp all summary
-              - show bgp all neighbors | include BGP neighbor|BGP state|Prefixes received
-          register: nxos_bgp
-          retries: 2
-          delay: 5
-          until: nxos_bgp is not failed
+              - show bgp summary
+              - show bgp neighbors | include BGP neighbor|BGP state|Prefixes
+          register: nxos_bgp_facts
+          failed_when:
+            - nxos_bgp_facts.failed
+            - '"BGP not running" not in nxos_bgp_facts.stdout[0]'
 
-        - name: Display NX-OS BGP neighbor table
+        - name: Display NX-OS BGP summary
           ansible.builtin.debug:
-            var: nxos_bgp.stdout_lines[0]
-
-        - name: Flag non-Established sessions on NX-OS
-          ansible.builtin.debug:
-            msg: "WARN: Non-Established BGP session on {{ inventory_hostname }}"
-          when: nxos_bgp.stdout[0] is search(bgp_down_pattern)
+            var: nxos_bgp_facts.stdout_lines
 
       rescue:
-        - name: Log NX-OS collection failure
+        - name: Record collection failure — NX-OS
           ansible.builtin.debug:
-            msg: "ERROR: BGP collection failed on {{ inventory_hostname }} -- {{ ansible_failed_result.msg | default('check SSH/credentials') }}"
+            msg: "BGP fact collection failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('check BGP config') }}"
+        - name: Flag host as failed
+          ansible.builtin.set_fact:
+            bgp_facts_failed: true
 
       when: ansible_network_os == 'nxos'
 
-    - name: Collect BGP data - IOS-XR
+    - name: Gather BGP neighbor data — Junos
       block:
-        - name: Run show bgp summary
-          cisco.iosxr.iosxr_command:
+        - name: Run BGP summary and neighbor commands
+          junipernetworks.junos.junos_command:
             commands:
               - show bgp summary
-              - show bgp neighbors | include Neighbor|BGP state|Prefixes received
-          register: iosxr_bgp
-          retries: 2
-          delay: 5
-          until: iosxr_bgp is not failed
-          failed_when: iosxr_bgp.stdout[0] is search('% BGP not active')
+              - show bgp neighbor
+          register: junos_bgp_facts
 
-        - name: Display IOS-XR BGP neighbor table
+        - name: Display Junos BGP summary
           ansible.builtin.debug:
-            var: iosxr_bgp.stdout_lines[0]
-
-        - name: Flag non-Established sessions on IOS-XR
-          ansible.builtin.debug:
-            msg: "WARN: Non-Established BGP session on {{ inventory_hostname }}"
-          when: iosxr_bgp.stdout[0] is search(bgp_down_pattern)
+            var: junos_bgp_facts.stdout_lines
 
       rescue:
-        - name: Log IOS-XR collection failure
+        - name: Record collection failure — Junos
           ansible.builtin.debug:
-            msg: "ERROR: BGP collection failed on {{ inventory_hostname }} -- {{ ansible_failed_result.msg | default('check SSH/credentials') }}"
+            msg: "BGP fact collection failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('check BGP config') }}"
+        - name: Flag host as failed
+          ansible.builtin.set_fact:
+            bgp_facts_failed: true
 
-      when: ansible_network_os == 'iosxr'
+      when: ansible_network_os == 'junos'
 
-    - name: Unsupported platform notice
+    - name: Report per-host collection status
       ansible.builtin.debug:
-        msg: "SKIP: {{ inventory_hostname }} has unsupported network_os '{{ ansible_network_os }}' -- add a task block to extend coverage"
-      when: ansible_network_os not in ['ios', 'iosxe', 'nxos', 'iosxr']
+        msg: "{{ inventory_hostname }} BGP facts: {{ 'COLLECTION FAILED' if bgp_facts_failed | default(false) else 'OK' }}
