@@ -1,111 +1,103 @@
 ---
-# QoS Policy Deployment — Cisco IOS/IOS-XE
-# Deploys DSCP-based class-maps and policy-map with bandwidth guarantees.
-# Not covered by existing playbooks (ntp, syslog, interfaces, acl, snmp, etc.).
+# static_route_management.yml
+#
+# Deploys and verifies static IPv4 routes on Cisco IOS routers.
+# Supports merged state (add/update without removing unlisted routes).
+#
+# Requirements: cisco.ios collection (ansible-galaxy collection install cisco.ios)
 #
 # Inventory example:
-#   [core_switches]
-#   core-sw-01 ansible_host=10.0.1.1
-#   core-sw-02 ansible_host=10.0.1.2
+#   [core_routers]
+#   rtr-core-01 ansible_host=10.0.1.1
+#   rtr-core-02 ansible_host=10.0.1.2
 #
-#   [core_switches:vars]
+#   [core_routers:vars]
 #   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_become=yes
+#   ansible_user={{ vault_net_user }}          # ansible-vault encrypted
+#   ansible_password={{ vault_net_password }}  # ansible-vault encrypted
+#   ansible_become=true
 #   ansible_become_method=enable
-#   ansible_user={{ vault_net_user }}     # ansible-vault encrypted
-#   ansible_password={{ vault_net_pass }} # ansible-vault encrypted
+#   ansible_become_password={{ vault_enable_pass }}
+#
+# Usage: ansible-playbook static_route_management.yml --ask-vault-pass
 
-- name: Deploy DSCP-based QoS policy to Cisco IOS/IOS-XE devices
-  hosts: core_switches
+- name: Static route management on Cisco IOS routers
+  hosts: core_routers
   gather_facts: false
 
   vars:
-    qos_policy_name: "ENTERPRISE-QOS"
-    voice_dscp: "ef"
-    video_dscp: "af41"
-    critical_dscp: "af31"
-    voice_bandwidth_pct: 20
-    video_bandwidth_pct: 30
-    critical_bandwidth_pct: 25
-    # Credentials via vault: ansible-vault encrypt_string '<secret>' --name 'vault_net_pass'
+    ansible_user: "{{ vault_net_user }}"
+    ansible_password: "{{ vault_net_password }}"
+    ansible_become_password: "{{ vault_enable_pass }}"
+
+    # Routes to install — adjust per environment
+    static_routes:
+      - vrf: default
+        address_families:
+          - afi: ipv4
+            routes:
+              - dest: 192.168.100.0/24
+                next_hops:
+                  - forward_router_address: 10.0.0.1
+                    admin_distance: 1
+                    description: spoke-site-a
+              - dest: 192.168.200.0/24
+                next_hops:
+                  - forward_router_address: 10.0.0.1
+                    interface: GigabitEthernet0/1
+                    tag: 200
+                    description: spoke-site-b
 
   tasks:
-    - name: Verify device reachability and collect platform info
-      cisco.ios.ios_command:
-        commands:
-          - show version | include IOS
-      register: device_version
-      retries: 3
-      delay: 5
-      until: device_version is not failed
+    - name: Deploy and verify static routes
+      block:
+        - name: Apply static routes (merged — existing unrelated routes preserved)
+          cisco.ios.ios_static_routes:
+            config: "{{ static_routes }}"
+            state: merged
+          register: route_deploy
+          retries: 2
+          delay: 5
+          until: route_deploy is not failed
 
-    - name: Display platform version
-      ansible.builtin.debug:
-        msg: "{{ inventory_hostname }} — {{ device_version.stdout[0] }}"
+        - name: Retrieve static routing table
+          cisco.ios.ios_command:
+            commands:
+              - show ip route static
+              - show running-config | section ^ip route
+          register: route_verify
+          failed_when: >
+            route_verify.stdout[0] is not defined or
+            '192.168.100.0' not in route_verify.stdout[0]
 
-    - block:
-        - name: Create VOICE class-map (EF DSCP)
-          cisco.ios.ios_config:
-            lines:
-              - "match dscp {{ voice_dscp }}"
-            parents: "class-map match-any VOICE-TRAFFIC"
-            save_when: never
-
-        - name: Create VIDEO class-map (AF41 DSCP)
-          cisco.ios.ios_config:
-            lines:
-              - "match dscp {{ video_dscp }}"
-            parents: "class-map match-any VIDEO-TRAFFIC"
-            save_when: never
-
-        - name: Create CRITICAL-DATA class-map (AF31 DSCP)
-          cisco.ios.ios_config:
-            lines:
-              - "match dscp {{ critical_dscp }}"
-            parents: "class-map match-any CRITICAL-DATA"
-            save_when: never
-
-        - name: Build policy-map with bandwidth allocations
-          cisco.ios.ios_config:
-            lines:
-              - "class VOICE-TRAFFIC"
-              - " priority percent {{ voice_bandwidth_pct }}"
-              - "class VIDEO-TRAFFIC"
-              - " bandwidth percent {{ video_bandwidth_pct }}"
-              - "class CRITICAL-DATA"
-              - " bandwidth percent {{ critical_bandwidth_pct }}"
-              - "class class-default"
-              - " fair-queue"
-            parents: "policy-map {{ qos_policy_name }}"
-            save_when: never
-
-        - name: Save configuration after successful deployment
-          cisco.ios.ios_config:
-            save_when: always
+        - name: Display deployment summary
+          ansible.builtin.debug:
+            msg:
+              - "Host       : {{ inventory_hostname }}"
+              - "Changed    : {{ route_deploy.changed }}"
+              - "Static routes in RIB:"
+              - "{{ route_verify.stdout_lines[0] }}"
+              - "Running-config static entries:"
+              - "{{ route_verify.stdout_lines[1] }}"
 
       rescue:
-        - name: Alert on QoS deployment failure
+        - name: Capture diagnostic state after failure
+          cisco.ios.ios_command:
+            commands:
+              - show ip route
+              - show running-config | include ip route
+          register: diag
+          ignore_errors: true
+
+        - name: Print diagnostics
           ansible.builtin.debug:
-            msg: "FAILED: QoS deployment on {{ inventory_hostname }} — configuration may be partial, manual review required"
+            msg:
+              - "ERROR: static route deployment failed on {{ inventory_hostname }}"
+              - "Reason : {{ ansible_failed_result.msg | default('see diag below') }}"
+              - "RIB    : {{ diag.stdout_lines[0] | default([]) }}"
+              - "Config : {{ diag.stdout_lines[1] | default([]) }}"
 
-        - name: Abort with descriptive error
+        - name: Abort with failure
           ansible.builtin.fail:
-            msg: "QoS policy deployment failed on {{ inventory_hostname }}"
-
-    - name: Verify policy-map exists post-deployment
-      cisco.ios.ios_command:
-        commands:
-          - "show policy-map {{ qos_policy_name }}"
-      register: qos_verify
-      failed_when: "'Policy Map' not in qos_verify.stdout[0]"
-
-    - name: Report deployment result
-      ansible.builtin.debug:
-        msg:
-          - "Host       : {{ inventory_hostname }}"
-          - "Policy     : {{ qos_policy_name }}"
-          - "Voice BW   : {{ voice_bandwidth_pct }}%  (DSCP {{ voice_dscp }})"
-          - "Video BW   : {{ video_bandwidth_pct }}%  (DSCP {{ video_dscp }})"
-          - "Critical BW: {{ critical_bandwidth_pct }}%  (DSCP {{ critical_dscp }})"
-          - "Status     : DEPLOYED
+            msg: "Static route deployment failed on {{ inventory_hostname }}. Review diagnostic output above.
