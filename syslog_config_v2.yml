@@ -1,105 +1,126 @@
 ---
-# syslog_config_v3.yml
+# Playbook: VLAN Configuration Management
+# Description: Deploy and manage VLANs across network infrastructure
+# Supports: Cisco IOS, IOS-XR, NXOS
 #
-# Configures secure syslog (TLS transport), syslog discriminators for
-# rate-limiting/noise filtering, and source-interface pinning on IOS-XE
-# devices. Differentiated from v1/v2 by TLS transport, discriminator
-# support, and per-host facility overrides.
+# INVENTORY EXAMPLE:
+# [ios_devices]
+# switch-1 ansible_host=192.168.1.10
 #
-# Inventory example:
-#   [core_routers]
-#   rtr-core-01  ansible_host=10.0.1.1
-#   rtr-core-02  ansible_host=10.0.1.2
+# [iosxr_devices]
+# router-1 ansible_host=192.168.2.10
 #
-#   [core_routers:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user={{ vault_net_user }}        # ansible-vault encrypted
-#   ansible_password={{ vault_net_pass }}
-#   ansible_become=yes
-#   ansible_become_method=enable
-#   ansible_become_pass={{ vault_enable_pass }}
+# [nxos_devices]
+# switch-nx-1 ansible_host=192.168.3.10
+#
+# VARIABLES (use ansible-vault for credentials):
+# ansible_user: admin
+# ansible_password: password123
+# vlans:
+#   - vlan_id: 10
+#     name: Management
+#   - vlan_id: 20
+#     name: Production
 
-- name: Configure secure syslog with TLS transport and discriminators (IOS-XE)
-  hosts: core_routers
-  gather_facts: false
-
+- name: Deploy VLAN Configuration
+  hosts: network_devices
+  gather_facts: no
   vars:
-    syslog_server: "10.0.100.50"
-    syslog_tls_port: 6514
-    syslog_source_intf: "Loopback0"
-    syslog_facility: "local6"
-    syslog_severity: "informational"
-    syslog_discriminator_name: "NOISE_FILTER"
-    # Suppress chatty BGP keepalive and interface flap noise
-    syslog_discriminator_mnemonics: "ADJCHG|UPDOWN|LINEPROTO"
-    syslog_buffer_size: 32768
+    # Vault reference for credentials in production
+    # ansible_user: "{{ vault_username }}"
+    # ansible_password: "{{ vault_password }}"
+    vlans:
+      - vlan_id: 10
+        name: Management
+      - vlan_id: 20
+        name: Production
+      - vlan_id: 30
+        name: Guest
 
   tasks:
-    - name: Configure syslog buffer size and console severity
-      cisco.ios.ios_config:
-        lines:
-          - "logging buffered {{ syslog_buffer_size }} {{ syslog_severity }}"
-          - "logging console critical"
-          - "logging monitor {{ syslog_severity }}"
-        match: line
-      register: buffer_result
-      retries: 2
-      delay: 5
-      until: buffer_result is not failed
+    - name: Configure VLANs on Cisco IOS
+      block:
+        - name: Create VLANs
+          ios_vlan:
+            vlan_id: "{{ item.vlan_id }}"
+            name: "{{ item.name }}"
+            state: present
+          loop: "{{ vlans }}"
+          register: ios_result
+          retries: 3
+          delay: 5
+          until: ios_result is succeeded
+        
+        - name: Show VLAN Configuration Results
+          debug:
+            msg: "Created VLAN {{ item.vlan_id }}: {{ item.name }}"
+          loop: "{{ vlans }}"
+      
+      rescue:
+        - name: Handle VLAN Configuration Error
+          debug:
+            msg: "Error configuring VLANs on {{ inventory_hostname }}: {{ ansible_failed_result.msg }}"
+      
+      when: inventory_hostname in groups.get('ios_devices', [])
 
-    - name: Configure syslog source interface
-      cisco.ios.ios_config:
-        lines:
-          - "logging source-interface {{ syslog_source_intf }}"
-        match: line
-      register: source_intf_result
+    - name: Configure VLANs on Cisco IOS-XR
+      block:
+        - name: Create VLANs
+          iosxr_vlan:
+            vlan_id: "{{ item.vlan_id }}"
+            name: "{{ item.name }}"
+            state: present
+          loop: "{{ vlans }}"
+          register: iosxr_result
+          retries: 3
+          delay: 5
+          until: iosxr_result is succeeded
+        
+        - name: Show VLAN Configuration Results
+          debug:
+            msg: "Created VLAN {{ item.vlan_id }}: {{ item.name }} on IOS-XR"
+          loop: "{{ vlans }}"
+      
+      rescue:
+        - name: Handle VLAN Configuration Error
+          debug:
+            msg: "Error configuring VLANs on IOS-XR {{ inventory_hostname }}: {{ ansible_failed_result.msg }}"
+      
+      when: inventory_hostname in groups.get('iosxr_devices', [])
 
-    - name: Configure syslog discriminator for noise suppression
-      cisco.ios.ios_config:
-        lines:
-          - "logging discriminator {{ syslog_discriminator_name }} mnemonics drops {{ syslog_discriminator_mnemonics }}"
-        match: line
-      register: discriminator_result
+    - name: Configure VLANs on Cisco NXOS
+      block:
+        - name: Create VLANs
+          nxos_vlan:
+            vlan_id: "{{ item.vlan_id }}"
+            name: "{{ item.name }}"
+            state: present
+          loop: "{{ vlans }}"
+          register: nxos_result
+          retries: 3
+          delay: 5
+          until: nxos_result is succeeded
+        
+        - name: Show VLAN Configuration Results
+          debug:
+            msg: "Created VLAN {{ item.vlan_id }}: {{ item.name }} on NXOS"
+          loop: "{{ vlans }}"
+      
+      rescue:
+        - name: Handle VLAN Configuration Error
+          debug:
+            msg: "Error configuring VLANs on NXOS {{ inventory_hostname }}: {{ ansible_failed_result.msg }}"
+      
+      when: inventory_hostname in groups.get('nxos_devices', [])
 
-    - name: Configure TLS syslog server with facility and discriminator
-      cisco.ios.ios_config:
-        lines:
-          - "logging host {{ syslog_server }} transport tls port {{ syslog_tls_port }}"
-          - "logging host {{ syslog_server }} discriminator {{ syslog_discriminator_name }}"
-          - "logging facility {{ syslog_facility }}"
-        match: line
-      register: server_result
-      retries: 2
-      delay: 5
-      until: server_result is not failed
+    - name: Verify VLAN Configuration
+      ios_command:
+        commands: "show vlan brief"
+      register: vlan_check
+      failed_when: vlan_check.rc != 0
+      when: inventory_hostname in groups.get('ios_devices', [])
 
-    - name: Verify syslog configuration
-      cisco.ios.ios_command:
-        commands:
-          - show logging | include Logging to|Log Buffer|Syslog|facility|discriminator
-      register: syslog_verify
-      failed_when: syslog_server not in syslog_verify.stdout[0]
-
-    - name: Display syslog verification output
-      ansible.builtin.debug:
-        msg: "{{ inventory_hostname }} syslog state: {{ syslog_verify.stdout_lines[0] }}"
-
-  rescue:
-    - name: Report configuration failure
-      ansible.builtin.debug:
-        msg: >
-          FAILED on {{ inventory_hostname }}: syslog TLS config did not apply.
-          Check PKI trustpoint and reachability to {{ syslog_server }}:{{ syslog_tls_port }}.
-
-    - name: Collect current logging state for diagnostics
-      cisco.ios.ios_command:
-        commands:
-          - show logging
-          - show crypto pki trustpoints | include Trustpoint
-      register: diag_output
-      ignore_errors: true
-
-    - name: Display diagnostic output
-      ansible.builtin.debug:
-        var: diag_output.stdout_lines
+    - name: Display VLAN Verification
+      debug:
+        var: vlan_check.stdout_lines
+      when: vlan_check is defined and vlan_check.stdout_lines is defined
