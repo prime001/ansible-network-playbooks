@@ -1,123 +1,113 @@
 ---
-# ssh_hardening.yml
-# Hardens SSH access and secures VTY/console lines on Cisco IOS devices.
-# Enforces SSHv2-only transport, RSA key generation, idle timeouts, and
-# login ACL binding on VTY lines.
-#
-# Credentials: ansible-vault encrypted in group_vars/network_devices/vault.yml
-#   vault_ansible_user, vault_ansible_password, vault_enable_password
+# aaa_config.yml
+# Configures AAA authentication/authorization using TACACS+ on Cisco IOS devices.
+# Distinct from user_management.yml (local accounts) — this manages centralized
+# auth-server policy, method lists, accounting, and VTY login binding.
 #
 # Inventory example:
-# [core_switches]
-# sw-core-01 ansible_host=10.0.1.10
-# sw-core-02 ansible_host=10.0.1.11
+#   [core_routers]
+#   rtr-core-01 ansible_host=10.0.0.1
+#   rtr-core-02 ansible_host=10.0.0.2
 #
-# [network_devices:children]
-# core_switches
-#
-# [network_devices:vars]
-# ansible_network_os=ios
-# ansible_connection=network_cli
-# ansible_user="{{ vault_ansible_user }}"
-# ansible_password="{{ vault_ansible_password }}"
-# ansible_become=yes
-# ansible_become_method=enable
-# ansible_become_password="{{ vault_enable_password }}"
+#   [core_routers:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_net_user }}
+#   ansible_password={{ vault_net_password }}
+#   ansible_become=true
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_enable_password }}
 
-- name: Harden SSH and VTY line access on IOS devices
-  hosts: network_devices
+- name: Configure AAA centralized authentication and accounting (TACACS+)
+  hosts: core_routers
   gather_facts: false
 
   vars:
-    ssh_rsa_modulus: 4096
-    vty_idle_timeout_minutes: 10
-    con_idle_timeout_minutes: 5
-    max_login_attempts: 3
-    vty_acl_name: VTY-MGMT-ACCESS
-    mgmt_subnets:
-      - 10.0.0.0 0.0.0.255
-      - 192.168.100.0 0.0.0.255
+    # All sensitive values come from Ansible Vault — see group_vars/all/vault.yml
+    tacacs_primary_ip: "{{ vault_tacacs_primary_ip }}"
+    tacacs_secondary_ip: "{{ vault_tacacs_secondary_ip }}"
+    tacacs_key: "{{ vault_tacacs_key }}"
+    aaa_method_list: "NETOPS"
 
   tasks:
-    - name: Set hostname and domain name required for RSA key
-      cisco.ios.ios_config:
-        lines:
-          - "ip domain-name {{ ansible_domain | default('corp.local') }}"
-
-    - name: Generate RSA crypto key for SSH
+    - name: Check device reachability and capture IOS version
       cisco.ios.ios_command:
         commands:
-          - command: "crypto key generate rsa modulus {{ ssh_rsa_modulus }}"
-            prompt: "Do you really want to replace them"
-            answer: "yes"
-      register: rsa_gen_result
-      failed_when:
-        - rsa_gen_result is failed
-        - "'already exist' not in (rsa_gen_result.stdout[0] | default(''))"
-
-    - name: Enforce SSH version 2 and login hardening
-      cisco.ios.ios_config:
-        lines:
-          - "ip ssh version 2"
-          - "ip ssh time-out 60"
-          - "ip ssh authentication-retries {{ max_login_attempts }}"
-          - "login block-for 120 attempts {{ max_login_attempts }} within 60"
-          - "login on-failure log"
-          - "login on-success log"
-      register: ssh_config_result
-      retries: 2
+          - show version | include IOS Software
+      register: ios_version
+      retries: 3
       delay: 5
-      until: ssh_config_result is not failed
+      until: not ios_version.failed
+      failed_when: ios_version.stdout[0] == ""
 
-    - name: Build VTY management ACL
-      cisco.ios.ios_config:
-        lines: "{{ ['ip access-list standard ' + vty_acl_name] + (mgmt_subnets | map('regex_replace', '^', ' permit ') | list) + [' deny any log'] }}"
-      register: acl_result
+    - name: Display target device info
+      ansible.builtin.debug:
+        msg: "Configuring AAA on {{ inventory_hostname }} — {{ ios_version.stdout[0] }}"
 
-    - name: Configure VTY lines for SSH-only with timeout and ACL
-      cisco.ios.ios_config:
-        lines:
-          - "transport input ssh"
-          - "login local"
-          - "exec-timeout {{ vty_idle_timeout_minutes }} 0"
-          - "access-class {{ vty_acl_name }} in"
-          - "logging synchronous"
-        parents: "line vty 0 15"
-      register: vty_result
+    - name: Apply TACACS+ server definitions and AAA policy
+      block:
+        - name: Configure TACACS+ servers
+          cisco.ios.ios_config:
+            lines:
+              - "tacacs server TACACS-PRIMARY"
+              - " address ipv4 {{ tacacs_primary_ip }}"
+              - " key {{ tacacs_key }}"
+              - " timeout 3"
+              - "tacacs server TACACS-SECONDARY"
+              - " address ipv4 {{ tacacs_secondary_ip }}"
+              - " key {{ tacacs_key }}"
+              - " timeout 3"
+            save_when: modified
+          register: tacacs_server_result
 
-    - name: Configure console line with timeout
-      cisco.ios.ios_config:
-        lines:
-          - "exec-timeout {{ con_idle_timeout_minutes }} 0"
-          - "logging synchronous"
-        parents: "line con 0"
+        - name: Enable AAA and configure method lists
+          cisco.ios.ios_config:
+            lines:
+              - "aaa new-model"
+              - "aaa authentication login {{ aaa_method_list }} group tacacs+ local"
+              - "aaa authorization exec {{ aaa_method_list }} group tacacs+ local if-authenticated"
+              - "aaa authorization commands 15 {{ aaa_method_list }} group tacacs+ local"
+              - "aaa accounting exec default start-stop group tacacs+"
+              - "aaa accounting commands 15 default start-stop group tacacs+"
+              - "line vty 0 15"
+              - " login authentication {{ aaa_method_list }}"
+              - " authorization commands 15 {{ aaa_method_list }}"
+            save_when: modified
+          register: aaa_policy_result
 
-    - name: Verify SSH is listening
+        - name: Verify TACACS+ server connectivity
+          cisco.ios.ios_command:
+            commands:
+              - show tacacs
+          register: tacacs_status
+          failed_when: "'No TACACS' in tacacs_status.stdout[0]"
+
+      rescue:
+        - name: Log failure details
+          ansible.builtin.debug:
+            msg: >
+              AAA config failed on {{ inventory_hostname }}.
+              Verify TACACS+ servers are reachable before applying.
+              Error: {{ ansible_failed_result.msg | default('unknown error') }}
+
+        - name: Revert VTY lines to local auth fallback
+          cisco.ios.ios_config:
+            lines:
+              - "line vty 0 15"
+              - " login local"
+
+        - name: Raise failure so pipeline reports the error
+          ansible.builtin.fail:
+            msg: "AAA configuration failed on {{ inventory_hostname }} — reverted VTY to local auth."
+
+    - name: Capture AAA and TACACS sections for audit
       cisco.ios.ios_command:
         commands:
-          - "show ip ssh"
-          - "show line vty 0 4"
-      register: ssh_verify
-      retries: 2
-      delay: 3
+          - show running-config | section aaa
+          - show running-config | section tacacs
+          - show tacacs
+      register: aaa_audit
 
-    - name: Confirm SSHv2 is active
-      ansible.builtin.assert:
-        that:
-          - "'SSH Enabled' in ssh_verify.stdout[0]"
-          - "'version 2.0' in ssh_verify.stdout[0]"
-        fail_msg: "SSHv2 not confirmed active on {{ inventory_hostname }}"
-        success_msg: "SSHv2 confirmed active on {{ inventory_hostname }}"
-
-    - name: Save running configuration
-      cisco.ios.ios_config:
-        save_when: modified
-
-    - name: Report SSH hardening summary
+    - name: Display post-change AAA summary
       ansible.builtin.debug:
-        msg:
-          - "Host: {{ inventory_hostname }}"
-          - "RSA modulus: {{ ssh_rsa_modulus }}"
-          - "VTY idle timeout: {{ vty_idle_timeout_minutes }}m"
-          - "Management ACL: {{ vty_acl_name }}"
-          - "SSH status: {{ ssh_verify.stdout_lines[0] | select('match', '.*SSH.*') | list | first | default('see output') }}
+        var: aaa_audit.stdout_lines
