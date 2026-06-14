@@ -1,16 +1,114 @@
-The file write needs your approval. Here's what I've prepared:
+---
+# NTP Verification and Drift Remediation Playbook
+# Checks NTP synchronization health on IOS devices: verifies sync state, stratum
+# level, and that all desired servers are configured. Remediates missing peers.
+# Distinct from ntp_config.yml (initial push) -- this is operational validation.
+#
+# Credentials: store ansible_password and ansible_become_pass with ansible-vault
+# Run: ansible-playbook ntp_verify_remediate.yml -i inventory/network.yml --ask-vault-pass
+#
+# Inventory example (inventory/network.yml):
+# all:
+#   children:
+#     core_routers:
+#       hosts:
+#         rtr-core-01:
+#           ansible_host: 192.168.1.1
+#           ansible_network_os: ios
+#           ansible_connection: network_cli
+#           ansible_user: netadmin
+#           ansible_password: !vault |
+#             $ANSIBLE_VAULT;1.1;AES256
+#             <encrypted-value>
+#           ansible_become: true
+#           ansible_become_method: enable
+#           ansible_become_password: !vault |
+#             $ANSIBLE_VAULT;1.1;AES256
+#             <encrypted-value>
 
-**`ntp_auth_verify.yml`** — NTP Authentication and Synchronization Verification
+- name: Verify NTP synchronization health and remediate missing peers
+  hosts: core_routers
+  gather_facts: false
+  vars:
+    # Define desired NTP servers -- override per host/group in inventory
+    ntp_desired_servers:
+      - "10.0.0.10"
+      - "10.0.0.11"
+    ntp_max_stratum: 5
 
-This avoids duplicating `ntp_config.yml`/`ntp_config_v2.yml` by focusing on:
-- **NTP MD5 authentication** — configures auth keys, enables `ntp authenticate`, sets trusted keys, and binds servers to the key ID
-- **Post-config verification** — polls `show ntp status` with retries, asserts synchronization, extracts and validates stratum against a configurable threshold
+  tasks:
+    - name: Gather NTP status and associations
+      block:
+        - name: Collect NTP status and associations from device
+          cisco.ios.ios_command:
+            commands:
+              - show ntp status
+              - show ntp associations
+          register: ntp_raw
+          retries: 2
+          delay: 5
+          until: ntp_raw is not failed
 
-Key features hit:
-- `cisco.ios.ios_config` + `cisco.ios.ios_command` modules
-- Vault reference comment for the auth key
-- `block/rescue` error handling on both config and verify phases
-- `retries/delay/until` on both command tasks
-- Registered output with a formatted `debug` summary
-- Inventory example in header comments
-- ~105 lines, well within the 40–120 target
+        - name: Parse synchronization facts from NTP status output
+          set_fact:
+            ntp_synchronized: "{{ 'Clock is synchronized' in ntp_raw.stdout[0] }}"
+            ntp_stratum: >-
+              {{ ntp_raw.stdout[0] | regex_search('stratum (\d+)', '\1')
+                 | first | default('99') | int }}
+            ntp_reference: >-
+              {{ ntp_raw.stdout[0] | regex_search('reference is ([\d\.]+)', '\1')
+                 | first | default('none') }}
+
+        - name: Display current NTP synchronization state
+          debug:
+            msg: >-
+              {{ inventory_hostname }} -- synchronized: {{ ntp_synchronized }},
+              stratum: {{ ntp_stratum }}, reference: {{ ntp_reference }}
+
+        - name: Assert NTP is synchronized within stratum threshold
+          assert:
+            that:
+              - ntp_synchronized | bool
+              - ntp_stratum <= ntp_max_stratum
+            fail_msg: >-
+              {{ inventory_hostname }} NTP UNHEALTHY -- synchronized: {{ ntp_synchronized }},
+              stratum {{ ntp_stratum }} (threshold: {{ ntp_max_stratum }})
+            success_msg: "{{ inventory_hostname }} NTP healthy at stratum {{ ntp_stratum }}"
+
+        - name: Identify desired NTP servers absent from associations output
+          set_fact:
+            missing_servers: >-
+              {{ ntp_desired_servers | difference(
+                   ntp_raw.stdout[1] | regex_findall('([\d]+\.[\d]+\.[\d]+\.[\d]+)')
+                 ) }}
+
+        - name: Add missing NTP server entries
+          cisco.ios.ios_config:
+            lines:
+              - "ntp server {{ item }}"
+          loop: "{{ missing_servers }}"
+          when: missing_servers | length > 0
+          register: remediate_result
+
+        - name: Report remediation actions taken
+          debug:
+            msg: >-
+              {{ inventory_hostname }}: added {{ missing_servers | length }}
+              missing peer(s): {{ missing_servers | join(', ') }}
+          when: missing_servers | length > 0
+
+        - name: Confirm no changes needed when peers are current
+          debug:
+            msg: "{{ inventory_hostname }}: all desired NTP servers present, no remediation required"
+          when: missing_servers | length == 0
+
+      rescue:
+        - name: Capture and surface verification failure details
+          debug:
+            msg: >-
+              FAILED on {{ inventory_hostname }}:
+              {{ ansible_failed_result.msg | default('check connectivity and credentials') }}
+
+        - name: Abort play for this host after logging failure
+          fail:
+            msg: "NTP verification/remediation failed on {{ inventory_hostname }}
