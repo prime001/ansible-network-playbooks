@@ -1,116 +1,104 @@
 ---
-# snmp_v3_hardening.yml
-# Deploys SNMPv3 users/groups/views and removes insecure community strings
-# Credentials sourced from Ansible Vault (see vault_vars below)
+# SNMPv3 User and Secure Access Group Configuration
+# Provisions SNMPv3 users with auth/priv for encrypted, authenticated polling.
+# Distinct from snmp_config.yml (v2c communities) and snmp_config_v2.yml (trap destinations).
+#
+# Credentials managed via Ansible Vault:
+#   ansible-vault encrypt_string '<password>' --name 'vault_snmp_auth_pass'
+#   ansible-vault encrypt_string '<password>' --name 'vault_snmp_priv_pass'
 #
 # Inventory example:
 # [core_switches]
-# sw-core-01 ansible_host=10.0.1.11
-# sw-core-02 ansible_host=10.0.1.12
+# sw-core-01 ansible_host=10.0.1.1
+# sw-core-02 ansible_host=10.0.1.2
 #
 # [core_switches:vars]
 # ansible_network_os=ios
-# ansible_connection=network_cli
-# ansible_user={{ vault_net_user }}
-# ansible_password={{ vault_net_pass }}
+# ansible_user={{ vault_device_user }}
+# ansible_password={{ vault_device_password }}
 # ansible_become=yes
 # ansible_become_method=enable
-# ansible_become_password={{ vault_enable_pass }}
+# ansible_become_password={{ vault_enable_password }}
 
-- name: Deploy SNMPv3 hardened configuration with view/group restrictions
-  hosts: core_switches
+- name: Configure SNMPv3 users with authentication and privacy
+  hosts: "{{ target_hosts | default('network_devices') }}"
   gather_facts: false
+  connection: network_cli
 
   vars:
-    snmp_location: "{{ vault_snmp_location | default('DC1-Row3-Rack12') }}"
-    snmp_contact: "{{ vault_snmp_contact | default('noc@example.com') }}"
-    snmp_v3_group: NOC_RO
-    snmp_v3_view: NOC_VIEW
-    snmp_trap_host: "{{ vault_snmp_trap_host | default('10.0.1.100') }}"
-    snmp_acl_number: 98
-    # vault_snmp_v3_user, vault_snmp_v3_auth, vault_snmp_v3_priv must exist in vault
+    snmp_v3_view_name: "FULL_MIB_VIEW"
+    snmp_v3_group_ro: "NETMON_RO"
+    snmp_v3_group_rw: "NETMON_RW"
+    # vault_snmp_auth_pass and vault_snmp_priv_pass loaded from Vault
+    snmp_v3_users:
+      - username: "netmon_ro"
+        group: "{{ snmp_v3_group_ro }}"
+        auth_proto: sha
+        priv_proto: aes 128
+      - username: "netmon_rw"
+        group: "{{ snmp_v3_group_rw }}"
+        auth_proto: sha
+        priv_proto: aes 128
 
   tasks:
-    - name: Apply SNMPv3 configuration block
+    - name: Apply SNMPv3 view, groups, and users
       block:
-        - name: Set SNMP system information
+        - name: Configure MIB view and access groups
           cisco.ios.ios_config:
             lines:
-              - "snmp-server location {{ snmp_location }}"
-              - "snmp-server contact {{ snmp_contact }}"
-          register: snmp_sysinfo
+              - "snmp-server view {{ snmp_v3_view_name }} iso included"
+              - "snmp-server group {{ snmp_v3_group_ro }} v3 priv read {{ snmp_v3_view_name }}"
+              - "snmp-server group {{ snmp_v3_group_rw }} v3 priv read {{ snmp_v3_view_name }} write {{ snmp_v3_view_name }}"
+          register: group_config_result
+          retries: 2
+          delay: 5
+          until: group_config_result is not failed
 
-        - name: Create restricted OID view (exclude credential MIBs)
+        - name: Create SNMPv3 users with auth and priv
           cisco.ios.ios_config:
             lines:
-              - "snmp-server view {{ snmp_v3_view }} iso included"
-              - "snmp-server view {{ snmp_v3_view }} snmpUsmMIB excluded"
-              - "snmp-server view {{ snmp_v3_view }} snmpVacmMIB excluded"
-              - "snmp-server view {{ snmp_v3_view }} snmpCommunityMIB excluded"
-          register: snmp_view
-
-        - name: Create SNMPv3 group enforcing auth and priv
-          cisco.ios.ios_config:
-            lines:
-              - "snmp-server group {{ snmp_v3_group }} v3 priv read {{ snmp_v3_view }} access {{ snmp_acl_number }}"
-          register: snmp_group
-
-        - name: Create SNMPv3 user with SHA-256 auth and AES-128 priv
-          cisco.ios.ios_config:
-            lines:
-              - "snmp-server user {{ vault_snmp_v3_user }} {{ snmp_v3_group }} v3 auth sha {{ vault_snmp_v3_auth }} priv aes 128 {{ vault_snmp_v3_priv }}"
+              - "snmp-server user {{ item.username }} {{ item.group }} v3 auth {{ item.auth_proto }} {{ vault_snmp_auth_pass }} priv {{ item.priv_proto }} {{ vault_snmp_priv_pass }}"
+          loop: "{{ snmp_v3_users }}"
+          loop_control:
+            label: "{{ item.username }}"
           no_log: true
-          register: snmp_user
+          register: user_config_result
 
-        - name: Configure SNMPv3 trap destination and enable key trap types
-          cisco.ios.ios_config:
-            lines:
-              - "snmp-server host {{ snmp_trap_host }} version 3 priv {{ vault_snmp_v3_user }}"
-              - "snmp-server enable traps snmp authentication linkdown linkup coldstart"
-              - "snmp-server enable traps config"
-              - "snmp-server enable traps syslog"
-          register: snmp_traps
-
-        - name: Remove default insecure community strings
-          cisco.ios.ios_config:
-            lines:
-              - "no snmp-server community public RO"
-              - "no snmp-server community private RW"
-          register: snmp_harden
-          failed_when:
-            - snmp_harden.failed is defined
-            - snmp_harden.failed
-            - "'Invalid input' not in (snmp_harden.msg | default(''))"
-
-        - name: Verify SNMPv3 user appears in device config
+        - name: Retrieve SNMPv3 user table for verification
           cisco.ios.ios_command:
             commands:
               - show snmp user
-              - show snmp group
-              - show snmp view
-          retries: 3
-          delay: 5
-          register: snmp_verify
-          no_log: true
-          until: snmp_verify.stdout[0] is search(vault_snmp_v3_user)
+          register: snmp_user_output
+          retries: 2
+          delay: 3
+          until: snmp_user_output is not failed
+
+        - name: Assert each configured user appears in device output
+          ansible.builtin.assert:
+            that:
+              - item.username in snmp_user_output.stdout[0]
+            fail_msg: "SNMPv3 user '{{ item.username }}' not found in 'show snmp user' on {{ inventory_hostname }}"
+            success_msg: "SNMPv3 user '{{ item.username }}' confirmed on {{ inventory_hostname }}"
+          loop: "{{ snmp_v3_users }}"
+          loop_control:
+            label: "{{ item.username }}"
 
       rescue:
-        - name: Report configuration failure
+        - name: Report configuration failure details
           ansible.builtin.debug:
-            msg: "SNMPv3 configuration failed on {{ inventory_hostname }}. Manual review required."
+            msg: >
+              SNMPv3 configuration failed on {{ inventory_hostname }}.
+              Task: {{ ansible_failed_task.name | default('unknown') }}.
+              Error: {{ ansible_failed_result.msg | default('see above') }}
 
-        - name: Fail play after rescue notification
+        - name: Fail with actionable message
           ansible.builtin.fail:
-            msg: "Halting after SNMPv3 failure on {{ inventory_hostname }}"
+            msg: "SNMPv3 setup incomplete on {{ inventory_hostname }} — verify Vault variables and device connectivity"
 
-    - name: Display configuration change summary
+    - name: Summarise SNMPv3 deployment result
       ansible.builtin.debug:
-        msg:
-          - "Host          : {{ inventory_hostname }}"
-          - "View changed  : {{ snmp_view.changed }}"
-          - "Group changed : {{ snmp_group.changed }}"
-          - "User changed  : {{ snmp_user.changed }}"
-          - "Traps changed : {{ snmp_traps.changed }}"
-          - "Hardened      : {{ snmp_harden.changed }}"
-          - "SNMP groups   :"
-          - "{{ snmp_verify.stdout[1] }}
+        msg: >
+          {{ inventory_hostname }}: SNMPv3 users
+          {{ snmp_v3_users | map(attribute='username') | join(', ') }}
+          configured in groups {{ snmp_v3_group_ro }}/{{ snmp_v3_group_rw }}
+          under view {{ snmp_v3_view_name }}.
