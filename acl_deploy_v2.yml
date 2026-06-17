@@ -1,124 +1,104 @@
 ---
-# Ansible Playbook: ACL Deploy with Automated Rollback
-# Deploys named extended ACLs to Cisco IOS devices with pre/post
-# verification and automatic rollback on validation failure.
+# acl_deploy_with_rollback.yml
 #
-# Credentials: store in Ansible Vault
-#   ansible-vault encrypt_string 'password' --name 'ansible_password'
+# Deploys named extended ACLs to Cisco IOS/IOS-XE routers with a pre-flight
+# configuration snapshot, post-deploy verification, and automatic rollback
+# via block/rescue if the deployment or verification step fails.
 #
 # Inventory example:
 #   [core_routers]
-#   rtr-core-01 ansible_host=10.0.0.1
-#   rtr-core-02 ansible_host=10.0.0.2
+#   rtr-core-01  ansible_host=192.168.1.1
+#   rtr-edge-01  ansible_host=192.168.1.2
 #
 #   [core_routers:vars]
-#   ansible_network_os=cisco.ios.ios
-#   ansible_connection=ansible.netcommon.network_cli
-#   ansible_user=netops
-#   ansible_password=!vault |
-#     $ANSIBLE_VAULT;1.1;AES256
-#     ...
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_net_user }}
+#   ansible_password={{ vault_net_password }}   # ansible-vault encrypt_string
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_net_enable }}
 
-- name: Deploy ACLs with pre-check and automatic rollback on IOS devices
+- name: Deploy named extended ACLs with snapshot and automatic rollback
   hosts: core_routers
   gather_facts: false
-  vars:
-    # Credentials — source from vault in production
-    ansible_user: "{{ vault_net_user }}"
-    ansible_password: "{{ vault_net_pass }}"
-    ansible_become: true
-    ansible_become_method: enable
-    ansible_become_pass: "{{ vault_enable_pass }}"
+  connection: network_cli
 
-    acls_to_deploy:
-      - name: ACL_MGMT_IN
-        acl_type: extended
-        entries:
-          - sequence: 10
-            grant: permit
-            protocol: tcp
-            source:
-              address: 10.10.0.0
-              wildcard_bits: 0.0.0.255
-            destination:
-              any: true
-            port_protocol:
-              eq: "22"
-          - sequence: 20
-            grant: permit
-            protocol: icmp
-            source:
-              address: 10.0.0.0
-              wildcard_bits: 0.255.255.255
-            destination:
-              any: true
-          - sequence: 100
-            grant: deny
-            protocol: ip
-            source:
-              any: true
-            destination:
-              any: true
-            log: true
+  vars:
+    # Credentials sourced from Ansible Vault — see group_vars/all/vault.yml
+    net_user: "{{ vault_net_user }}"
+    net_password: "{{ vault_net_password }}"
+    net_enable: "{{ vault_net_enable }}"
+
+    acl_definitions:
+      - name: MGMT_ACCESS_IN
+        lines:
+          - "10 permit tcp 10.10.0.0 0.0.255.255 any eq 22"
+          - "20 permit tcp 10.10.0.0 0.0.255.255 any eq 443"
+          - "30 deny ip any any log"
+      - name: UNTRUSTED_INBOUND
+        lines:
+          - "10 deny ip 10.0.0.0 0.255.255.255 any"
+          - "20 deny ip 172.16.0.0 0.15.255.255 any"
+          - "30 deny ip 192.168.0.0 0.0.255.255 any"
+          - "40 permit tcp any any established"
+          - "50 permit udp any any eq 53"
+          - "60 deny ip any any log"
 
   tasks:
-    - name: Capture pre-deploy ACL snapshot
+    - name: Capture pre-deployment ACL snapshot for rollback reference
       cisco.ios.ios_command:
-        commands:
-          - show ip access-lists
-      register: acl_snapshot_before
-      retries: 2
+        commands: "show running-config | section ip access-list"
+      register: acl_snapshot
+      retries: 3
       delay: 5
+      until: acl_snapshot is not failed
 
-    - name: Deploy ACLs
+    - name: Deploy ACLs with rollback on any failure
       block:
-        - name: Apply ACL configuration
-          cisco.ios.ios_acls:
-            config:
-              - afi: ipv4
-                acls: "{{ acls_to_deploy }}"
-            state: replaced
-          register: acl_deploy_result
+        - name: Configure named extended ACLs (idempotent replace)
+          cisco.ios.ios_config:
+            lines: "{{ item.lines }}"
+            parents: "ip access-list extended {{ item.name }}"
+            match: exact
+            replace: block
+          loop: "{{ acl_definitions }}"
+          register: acl_push_result
 
-        - name: Save configuration after successful deploy
-          cisco.ios.ios_command:
-            commands:
-              - write memory
-          register: save_result
-          failed_when: "'OK' not in save_result.stdout[0] and '[OK]' not in save_result.stdout[0]"
+        - name: Persist configuration after successful push
+          cisco.ios.ios_config:
+            save_when: modified
 
-        - name: Verify deployed ACLs are present
+        - name: Verify each ACL is present in running configuration
           cisco.ios.ios_command:
-            commands:
-              - "show ip access-lists {{ item.name }}"
+            commands: "show ip access-lists {{ item.name }}"
           register: acl_verify
+          loop: "{{ acl_definitions }}"
           failed_when: item.name not in acl_verify.stdout[0]
-          loop: "{{ acls_to_deploy }}"
+
+        - name: Report active entry counts per ACL
+          ansible.builtin.debug:
+            msg: >
+              {{ item.item.name }} on {{ inventory_hostname }}:
+              {{ item.stdout | regex_findall('(permit|deny)') | length }} entries active
+          loop: "{{ acl_verify.results }}"
 
       rescue:
-        - name: Rollback — restore ACLs from pre-deploy snapshot
+        - name: Rollback — remove partially applied ACLs
           cisco.ios.ios_config:
-            lines:
-              - "no ip access-list extended {{ item.name }}"
-          loop: "{{ acls_to_deploy }}"
+            lines: "no ip access-list extended {{ item.name }}"
+          loop: "{{ acl_definitions }}"
+          ignore_errors: true
+
+        - name: Rollback — display pre-deployment snapshot for manual recovery
+          ansible.builtin.debug:
+            msg: |
+              Pre-deployment ACL state on {{ inventory_hostname }}:
+              {{ acl_snapshot.stdout[0] }}
 
         - name: Fail with rollback notice
           ansible.builtin.fail:
-            msg: "ACL deployment failed on {{ inventory_hostname }}. Rolled back to pre-deploy state."
-
-    - name: Display deploy change summary
-      ansible.builtin.debug:
-        msg:
-          - "Host: {{ inventory_hostname }}"
-          - "Changed: {{ acl_deploy_result.changed }}"
-          - "Commands sent: {{ acl_deploy_result.commands | default([]) }}"
-
-    - name: Display post-deploy ACL state
-      cisco.ios.ios_command:
-        commands:
-          - show ip access-lists
-      register: acl_snapshot_after
-
-    - name: Show ACL state diff summary
-      ansible.builtin.debug:
-        msg: "Post-deploy ACL output for {{ inventory_hostname }}: {{ acl_snapshot_after.stdout[0] }}
+            msg: >
+              ACL deployment failed on {{ inventory_hostname }}.
+              Partial config has been removed. Verify manually:
+              show ip access-lists
