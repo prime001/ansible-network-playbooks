@@ -1,128 +1,110 @@
 ---
-# static_routes_deploy.yml
-# Deploys and verifies IPv4 static routes on Cisco IOS/IOS-XE devices.
-# Supports idempotent merged-state configuration via ios_static_routes.
+# ospf_config.yml
+# Configures OSPF routing process on Cisco IOS/IOS-XE devices.
+# Supports per-host router-id, multi-area network statements, and passive interfaces.
 #
-# Credentials managed via Ansible Vault — never store plaintext secrets.
-# Run: ansible-playbook static_routes_deploy.yml --ask-vault-pass
+# Inventory example:
+#   [routers]
+#   core-rtr-01  ansible_host=10.0.0.1  ospf_router_id=10.255.0.1
+#   core-rtr-02  ansible_host=10.0.0.2  ospf_router_id=10.255.0.2
+#   dist-rtr-01  ansible_host=10.0.1.1  ospf_router_id=10.255.1.1
 #
-# Inventory example (inventory/network.yml):
-#   all:
-#     vars:
-#       ansible_network_os: ios
-#       ansible_connection: network_cli
-#       ansible_user: "{{ vault_net_user }}"
-#       ansible_password: "{{ vault_net_password }}"
-#       ansible_become: true
-#       ansible_become_method: enable
-#       ansible_become_password: "{{ vault_enable_password }}"
-#     children:
-#       routers:
-#         hosts:
-#           core-rtr-01:
-#             ansible_host: 10.0.0.1
-#           branch-rtr-01:
-#             ansible_host: 10.1.0.1
+#   [routers:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_ssh_user }}
+#   ansible_password={{ vault_ssh_pass }}
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_enable_pass }}
 
-- name: Deploy static IPv4 routes on IOS/IOS-XE devices
-  hosts: "{{ target_hosts | default('routers') }}"
+- name: Configure OSPF routing process on Cisco IOS devices
+  hosts: routers
   gather_facts: false
-  connection: network_cli
-
   vars:
-    # Vault references — secrets live in vault.yml, never in plaintext
-    ansible_user: "{{ vault_net_user }}"
-    ansible_password: "{{ vault_net_password }}"
-    ansible_become_password: "{{ vault_enable_password }}"
-
-    static_routes:
-      - dest: "10.10.10.0/24"
-        next_hop: "192.168.1.254"
-        distance: 1
-        name: "corp-segment-a"
-      - dest: "172.16.0.0/16"
-        next_hop: "192.168.1.254"
-        distance: 1
-        name: "branch-aggregate"
-      - dest: "0.0.0.0/0"
-        next_hop: "203.0.113.1"
-        distance: 254
-        name: "isp-default-route"
+    # Credentials sourced from Ansible Vault — see group_vars/routers/vault.yml
+    ospf_process_id: 1
+    ospf_reference_bandwidth: 10000
+    ospf_networks:
+      - network: "10.0.0.0"
+        wildcard: "0.0.255.255"
+        area: 0
+      - network: "192.168.0.0"
+        wildcard: "0.0.0.255"
+        area: 1
+    ospf_passive_interfaces:
+      - Loopback0
+      - GigabitEthernet0/2
 
   tasks:
-    - name: Verify device is reachable before making changes
-      cisco.ios.ios_command:
-        commands:
-          - "show version | include uptime"
-      register: device_check
+    - name: Verify device reachability before making changes
+      ios_command:
+        commands: show version
+      register: ver_output
       retries: 3
-      delay: 5
-      until: device_check is not failed
+      delay: 10
+      until: ver_output is not failed
 
-    - name: Capture pre-change static route table
-      cisco.ios.ios_command:
-        commands:
-          - "show ip route static"
-      register: routes_before
-
-    - name: Display current static routes
-      ansible.builtin.debug:
-        msg: "Pre-change routes on {{ inventory_hostname }}: {{ routes_before.stdout_lines[0] }}"
-
-    - name: Deploy static routes
+    - name: Apply OSPF configuration
       block:
-        - name: Configure static routes via ios_static_routes
-          cisco.ios.ios_static_routes:
-            config:
-              - address_families:
-                  - afi: ipv4
-                    routes:
-                      - dest: "{{ item.dest }}"
-                        next_hops:
-                          - forward_router_address: "{{ item.next_hop }}"
-                            distance_metric: "{{ item.distance }}"
-                            name: "{{ item.name }}"
-            state: merged
-          loop: "{{ static_routes }}"
-          register: route_result
+        - name: Configure OSPF process, router-id, and reference bandwidth
+          ios_config:
+            lines:
+              - "router-id {{ ospf_router_id }}"
+              - "auto-cost reference-bandwidth {{ ospf_reference_bandwidth }}"
+              - log-adjacency-changes detail
+            parents: "router ospf {{ ospf_process_id }}"
+          register: ospf_global_cfg
 
-        - name: Save running config to startup-config
-          cisco.ios.ios_config:
-            save_when: modified
+        - name: Configure OSPF network statements
+          ios_config:
+            lines:
+              - "network {{ item.network }} {{ item.wildcard }} area {{ item.area }}"
+            parents: "router ospf {{ ospf_process_id }}"
+          loop: "{{ ospf_networks }}"
+          register: ospf_net_cfg
+
+        - name: Set passive interfaces to suppress hellos on stub segments
+          ios_config:
+            lines:
+              - "passive-interface {{ item }}"
+            parents: "router ospf {{ ospf_process_id }}"
+          loop: "{{ ospf_passive_interfaces }}"
 
       rescue:
-        - name: Display failure context
-          ansible.builtin.debug:
-            msg: >
-              Route deployment failed on {{ inventory_hostname }}.
-              Error: {{ ansible_failed_result.msg | default('see task output above') }}
+        - name: Report configuration failure details
+          debug:
+            msg: >-
+              FAILED on {{ inventory_hostname }}:
+              task={{ ansible_failed_task.name }}
+              error={{ ansible_failed_result.msg | default('see task output') }}
+        - name: Abort playbook for this host
+          fail:
+            msg: "OSPF configuration aborted for {{ inventory_hostname }} — manual review required"
 
-        - name: Capture route table at time of failure
-          cisco.ios.ios_command:
-            commands:
-              - "show ip route static"
-          register: routes_on_failure
-          ignore_errors: true
-
-        - name: Show route state at time of failure
-          ansible.builtin.debug:
-            var: routes_on_failure.stdout_lines
-
-        - name: Fail with actionable message
-          ansible.builtin.fail:
-            msg: "Static route deployment failed on {{ inventory_hostname }} — manual review required before retrying"
-
-    - name: Verify configured routes appear in routing table
-      cisco.ios.ios_command:
+    - name: Verify OSPF process is running
+      ios_command:
         commands:
-          - "show ip route static"
-      register: routes_after
-      failed_when: routes_after.stdout[0] | length == 0
+          - "show ip ospf {{ ospf_process_id }}"
+          - show ip ospf neighbor
+      register: ospf_state
+      failed_when: "'Routing Process' not in ospf_state.stdout[0]"
 
-    - name: Display deployment summary
-      ansible.builtin.debug:
-        msg:
-          - "Host: {{ inventory_hostname }}"
-          - "Routes applied (changed): {{ route_result.results | selectattr('changed') | list | length }} of {{ static_routes | length }}"
-          - "Current static route table:"
-          - "{{ routes_after.stdout_lines[0] }}
+    - name: Display current OSPF neighbor adjacency table
+      debug:
+        msg: "{{ ospf_state.stdout_lines[1] }}"
+
+    - name: Save running configuration to NVRAM
+      ios_command:
+        commands:
+          - command: write memory
+            prompt: '\[confirm\]'
+            answer: "\r"
+      register: write_result
+      failed_when: >-
+        'OK' not in write_result.stdout[0] and
+        '[OK]' not in write_result.stdout[0]
+
+    - name: Confirm configuration was persisted
+      debug:
+        msg: "{{ inventory_hostname }}: {{ write_result.stdout[0] | trim }}
