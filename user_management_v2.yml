@@ -1,113 +1,148 @@
+```yaml
 ---
-# aaa_config.yml
-# Configures AAA authentication/authorization using TACACS+ on Cisco IOS devices.
-# Distinct from user_management.yml (local accounts) — this manages centralized
-# auth-server policy, method lists, accounting, and VTY login binding.
+# VLAN Management Playbook
+# Configures and manages VLANs across Cisco IOS, IOS-XR, and NX-OS devices
 #
-# Inventory example:
-#   [core_routers]
-#   rtr-core-01 ansible_host=10.0.0.1
-#   rtr-core-02 ansible_host=10.0.0.2
+# Inventory Example:
+# all:
+#   children:
+#     network_devices:
+#       children:
+#         ios_devices:
+#           hosts:
+#             switch01:
+#               ansible_host: 192.168.1.10
+#               ansible_network_os: ios
+#         nxos_devices:
+#           hosts:
+#             switch02:
+#               ansible_host: 192.168.1.11
+#               ansible_network_os: nxos
 #
-#   [core_routers:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user={{ vault_net_user }}
-#   ansible_password={{ vault_net_password }}
-#   ansible_become=true
-#   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_password }}
+# Usage:
+# ansible-playbook vlan_management.yml -i hosts.yml
 
-- name: Configure AAA centralized authentication and accounting (TACACS+)
-  hosts: core_routers
-  gather_facts: false
+- name: Manage VLANs across network infrastructure
+  hosts: network_devices
+  gather_facts: no
+  connection: network_cli
 
   vars:
-    # All sensitive values come from Ansible Vault — see group_vars/all/vault.yml
-    tacacs_primary_ip: "{{ vault_tacacs_primary_ip }}"
-    tacacs_secondary_ip: "{{ vault_tacacs_secondary_ip }}"
-    tacacs_key: "{{ vault_tacacs_key }}"
-    aaa_method_list: "NETOPS"
+    # Device credentials - reference vault for production deployment
+    # ansible_user: "{{ vault_device_username }}"
+    # ansible_password: "{{ vault_device_password }}"
+    
+    vlans_to_create:
+      - vlan_id: 10
+        name: Management
+      - vlan_id: 20
+        name: Production
+      - vlan_id: 30
+        name: Development
+      - vlan_id: 40
+        name: Guest
+    
+    vlan_interfaces:
+      - interface: GigabitEthernet0/0/1
+        vlan_id: 10
+      - interface: GigabitEthernet0/0/2
+        vlan_id: 20
+      - interface: GigabitEthernet0/0/3
+        vlan_id: 30
 
   tasks:
-    - name: Check device reachability and capture IOS version
-      cisco.ios.ios_command:
-        commands:
-          - show version | include IOS Software
-      register: ios_version
+    - name: Create VLANs on IOS devices
+      cisco.ios.ios_vlan:
+        vlan_id: "{{ item.vlan_id }}"
+        name: "{{ item.name }}"
+        state: present
+      loop: "{{ vlans_to_create }}"
+      register: ios_vlan_result
       retries: 3
       delay: 5
-      until: not ios_version.failed
-      failed_when: ios_version.stdout[0] == ""
+      until: ios_vlan_result is not failed
+      when: ansible_network_os == 'ios'
+      tags:
+        - vlan_create
 
-    - name: Display target device info
-      ansible.builtin.debug:
-        msg: "Configuring AAA on {{ inventory_hostname }} — {{ ios_version.stdout[0] }}"
+    - name: Create VLANs on NX-OS devices
+      cisco.nxos.nxos_vlan:
+        vlan_id: "{{ item.vlan_id }}"
+        name: "{{ item.name }}"
+        state: present
+      loop: "{{ vlans_to_create }}"
+      register: nxos_vlan_result
+      retries: 3
+      delay: 5
+      until: nxos_vlan_result is not failed
+      when: ansible_network_os == 'nxos'
+      tags:
+        - vlan_create
 
-    - name: Apply TACACS+ server definitions and AAA policy
-      block:
-        - name: Configure TACACS+ servers
-          cisco.ios.ios_config:
-            lines:
-              - "tacacs server TACACS-PRIMARY"
-              - " address ipv4 {{ tacacs_primary_ip }}"
-              - " key {{ tacacs_key }}"
-              - " timeout 3"
-              - "tacacs server TACACS-SECONDARY"
-              - " address ipv4 {{ tacacs_secondary_ip }}"
-              - " key {{ tacacs_key }}"
-              - " timeout 3"
-            save_when: modified
-          register: tacacs_server_result
+    - name: Assign VLANs to interfaces (IOS)
+      cisco.ios.ios_l2_interface:
+        name: "{{ item.interface }}"
+        mode: access
+        access_vlan: "{{ item.vlan_id }}"
+        state: present
+      loop: "{{ vlan_interfaces }}"
+      register: ios_interface_result
+      retries: 2
+      delay: 3
+      until: ios_interface_result is not failed
+      when: ansible_network_os == 'ios'
+      tags:
+        - vlan_assign
 
-        - name: Enable AAA and configure method lists
-          cisco.ios.ios_config:
-            lines:
-              - "aaa new-model"
-              - "aaa authentication login {{ aaa_method_list }} group tacacs+ local"
-              - "aaa authorization exec {{ aaa_method_list }} group tacacs+ local if-authenticated"
-              - "aaa authorization commands 15 {{ aaa_method_list }} group tacacs+ local"
-              - "aaa accounting exec default start-stop group tacacs+"
-              - "aaa accounting commands 15 default start-stop group tacacs+"
-              - "line vty 0 15"
-              - " login authentication {{ aaa_method_list }}"
-              - " authorization commands 15 {{ aaa_method_list }}"
-            save_when: modified
-          register: aaa_policy_result
-
-        - name: Verify TACACS+ server connectivity
-          cisco.ios.ios_command:
-            commands:
-              - show tacacs
-          register: tacacs_status
-          failed_when: "'No TACACS' in tacacs_status.stdout[0]"
-
-      rescue:
-        - name: Log failure details
-          ansible.builtin.debug:
-            msg: >
-              AAA config failed on {{ inventory_hostname }}.
-              Verify TACACS+ servers are reachable before applying.
-              Error: {{ ansible_failed_result.msg | default('unknown error') }}
-
-        - name: Revert VTY lines to local auth fallback
-          cisco.ios.ios_config:
-            lines:
-              - "line vty 0 15"
-              - " login local"
-
-        - name: Raise failure so pipeline reports the error
-          ansible.builtin.fail:
-            msg: "AAA configuration failed on {{ inventory_hostname }} — reverted VTY to local auth."
-
-    - name: Capture AAA and TACACS sections for audit
+    - name: Verify VLAN configuration on IOS
       cisco.ios.ios_command:
         commands:
-          - show running-config | section aaa
-          - show running-config | section tacacs
-          - show tacacs
-      register: aaa_audit
+          - show vlan brief
+      register: vlan_output
+      failed_when: '"VLAN Name" not in vlan_output.stdout[0]'
+      when: ansible_network_os == 'ios'
+      tags:
+        - verify
 
-    - name: Display post-change AAA summary
-      ansible.builtin.debug:
-        var: aaa_audit.stdout_lines
+    - name: Verify VLAN configuration on NX-OS
+      cisco.nxos.nxos_command:
+        commands:
+          - show vlan brief
+      register: nxos_vlan_output
+      failed_when: '"VLAN Name" not in nxos_vlan_output.stdout[0]'
+      when: ansible_network_os == 'nxos'
+      tags:
+        - verify
+
+    - name: Display VLAN configuration summary
+      debug:
+        msg: |
+          VLAN Configuration Report - {{ inventory_hostname }}
+          ====================================================
+          Device OS: {{ ansible_network_os }}
+          VLANs Configured: {{ vlans_to_create | length }}
+          Interfaces Updated: {{ vlan_interfaces | length }}
+          Status: Completed successfully
+      tags:
+        - report
+
+  rescue:
+    - name: Capture error details
+      debug:
+        msg: |
+          VLAN configuration failed on {{ inventory_hostname }}
+          Error: {{ ansible_failed_result.msg | default('Unknown error') }}
+          Device OS: {{ ansible_network_os }}
+
+    - name: Attempt device recovery
+      cisco.ios.ios_command:
+        commands:
+          - show interfaces status
+      register: device_status
+      ignore_errors: yes
+
+    - name: Report device status
+      debug:
+        var: device_status.stdout_lines
+      when: device_status is not skipped
+```
