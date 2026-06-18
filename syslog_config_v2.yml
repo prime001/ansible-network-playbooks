@@ -1,126 +1,112 @@
 ---
-# Playbook: VLAN Configuration Management
-# Description: Deploy and manage VLANs across network infrastructure
-# Supports: Cisco IOS, IOS-XR, NXOS
+# ip_sla_config.yml
 #
-# INVENTORY EXAMPLE:
-# [ios_devices]
-# switch-1 ansible_host=192.168.1.10
+# Configures IP SLA ICMP echo probes on Cisco IOS routers for continuous
+# path monitoring. Tracking objects bind to probe reachability state,
+# enabling automatic floating static route or PBR failover without
+# additional scripts or daemons.
 #
-# [iosxr_devices]
-# router-1 ansible_host=192.168.2.10
+# Inventory example:
+#   [routers]
+#   core-rtr-01   ansible_host=192.168.1.1
+#   branch-rtr-01 ansible_host=192.168.1.2
 #
-# [nxos_devices]
-# switch-nx-1 ansible_host=192.168.3.10
-#
-# VARIABLES (use ansible-vault for credentials):
-# ansible_user: admin
-# ansible_password: password123
-# vlans:
-#   - vlan_id: 10
-#     name: Management
-#   - vlan_id: 20
-#     name: Production
+#   [routers:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user="{{ vault_net_user }}"          # ansible-vault encrypted
+#   ansible_password="{{ vault_net_password }}"   # ansible-vault encrypted
+#   ansible_become=true
+#   ansible_become_method=enable
+#   ansible_become_password="{{ vault_enable_secret }}"
 
-- name: Deploy VLAN Configuration
-  hosts: network_devices
-  gather_facts: no
+- name: Deploy IP SLA probes for path monitoring and failover tracking
+  hosts: routers
+  gather_facts: false
   vars:
-    # Vault reference for credentials in production
-    # ansible_user: "{{ vault_username }}"
-    # ansible_password: "{{ vault_password }}"
-    vlans:
-      - vlan_id: 10
-        name: Management
-      - vlan_id: 20
-        name: Production
-      - vlan_id: 30
-        name: Guest
+    sla_probes:
+      - { id: 10, target: "8.8.8.8",  frequency: 60, threshold: 500, timeout: 2000, tag: "isp1-primary",   track_id: 10 }
+      - { id: 20, target: "1.1.1.1",  frequency: 60, threshold: 500, timeout: 2000, tag: "isp2-secondary", track_id: 20 }
+      - { id: 30, target: "9.9.9.9",  frequency: 60, threshold: 500, timeout: 2000, tag: "dns-quad9",      track_id: 30 }
+    sla_history_buckets: 5
 
   tasks:
-    - name: Configure VLANs on Cisco IOS
+    - name: Verify device is reachable and capture IOS version
+      cisco.ios.ios_command:
+        commands: "show version | include Cisco IOS"
+      register: ios_ver
+      retries: 3
+      delay: 10
+      until: ios_ver is not failed
+
+    - name: Log target device version
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ ios_ver.stdout[0] | trim }}"
+
+    - name: Configure IP SLA probes, schedules, and tracking objects
       block:
-        - name: Create VLANs
-          ios_vlan:
-            vlan_id: "{{ item.vlan_id }}"
-            name: "{{ item.name }}"
-            state: present
-          loop: "{{ vlans }}"
-          register: ios_result
-          retries: 3
-          delay: 5
-          until: ios_result is succeeded
-        
-        - name: Show VLAN Configuration Results
-          debug:
-            msg: "Created VLAN {{ item.vlan_id }}: {{ item.name }}"
-          loop: "{{ vlans }}"
-      
+        - name: Push SLA probe {{ item.id }} ({{ item.tag }})
+          ansible.netcommon.cli_config:
+            config: |
+              ip sla {{ item.id }}
+               icmp-echo {{ item.target }}
+                tag {{ item.tag }}
+                threshold {{ item.threshold }}
+                timeout {{ item.timeout }}
+                frequency {{ item.frequency }}
+                history buckets-kept {{ sla_history_buckets }}
+              ip sla schedule {{ item.id }} life forever start-time now
+          loop: "{{ sla_probes }}"
+          register: sla_cfg
+
+        - name: Bind track {{ item.track_id }} to SLA {{ item.id }} reachability
+          ansible.netcommon.cli_config:
+            config: |
+              track {{ item.track_id }} ip sla {{ item.id }} reachability
+               delay down 10 up 15
+          loop: "{{ sla_probes }}"
+
       rescue:
-        - name: Handle VLAN Configuration Error
-          debug:
-            msg: "Error configuring VLANs on {{ inventory_hostname }}: {{ ansible_failed_result.msg }}"
-      
-      when: inventory_hostname in groups.get('ios_devices', [])
+        - name: Surface configuration failure detail
+          ansible.builtin.debug:
+            msg: "SLA config failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('no detail available') }}"
 
-    - name: Configure VLANs on Cisco IOS-XR
-      block:
-        - name: Create VLANs
-          iosxr_vlan:
-            vlan_id: "{{ item.vlan_id }}"
-            name: "{{ item.name }}"
-            state: present
-          loop: "{{ vlans }}"
-          register: iosxr_result
-          retries: 3
-          delay: 5
-          until: iosxr_result is succeeded
-        
-        - name: Show VLAN Configuration Results
-          debug:
-            msg: "Created VLAN {{ item.vlan_id }}: {{ item.name }} on IOS-XR"
-          loop: "{{ vlans }}"
-      
-      rescue:
-        - name: Handle VLAN Configuration Error
-          debug:
-            msg: "Error configuring VLANs on IOS-XR {{ inventory_hostname }}: {{ ansible_failed_result.msg }}"
-      
-      when: inventory_hostname in groups.get('iosxr_devices', [])
+        - name: Abort with actionable message
+          ansible.builtin.fail:
+            msg: "IP SLA deployment failed on {{ inventory_hostname }} — verify privilege level (enable) and IOS feature support."
 
-    - name: Configure VLANs on Cisco NXOS
-      block:
-        - name: Create VLANs
-          nxos_vlan:
-            vlan_id: "{{ item.vlan_id }}"
-            name: "{{ item.name }}"
-            state: present
-          loop: "{{ vlans }}"
-          register: nxos_result
-          retries: 3
-          delay: 5
-          until: nxos_result is succeeded
-        
-        - name: Show VLAN Configuration Results
-          debug:
-            msg: "Created VLAN {{ item.vlan_id }}: {{ item.name }} on NXOS"
-          loop: "{{ vlans }}"
-      
-      rescue:
-        - name: Handle VLAN Configuration Error
-          debug:
-            msg: "Error configuring VLANs on NXOS {{ inventory_hostname }}: {{ ansible_failed_result.msg }}"
-      
-      when: inventory_hostname in groups.get('nxos_devices', [])
+    - name: Pause for initial probe measurement cycle
+      ansible.builtin.pause:
+        seconds: 20
 
-    - name: Verify VLAN Configuration
-      ios_command:
-        commands: "show vlan brief"
-      register: vlan_check
-      failed_when: vlan_check.rc != 0
-      when: inventory_hostname in groups.get('ios_devices', [])
+    - name: Collect IP SLA statistics and tracking state
+      cisco.ios.ios_command:
+        commands:
+          - "show ip sla statistics"
+          - "show track brief"
+      register: sla_stats
 
-    - name: Display VLAN Verification
-      debug:
-        var: vlan_check.stdout_lines
-      when: vlan_check is defined and vlan_check.stdout_lines is defined
+    - name: Verify each probe has recorded RTT measurements
+      cisco.ios.ios_command:
+        commands: "show ip sla statistics {{ item.id }} | include Latest RTT"
+      register: probe_rtt
+      failed_when: "'Latest RTT' not in probe_rtt.stdout[0]"
+      loop: "{{ sla_probes }}"
+      loop_control:
+        label: "probe {{ item.id }} -> {{ item.target }}"
+
+    - name: Display SLA probe and tracking object summary
+      ansible.builtin.debug:
+        msg:
+          - "=== {{ inventory_hostname }} IP SLA Statistics ==="
+          - "{{ sla_stats.stdout[0] }}"
+          - "=== Tracking Object Status ==="
+          - "{{ sla_stats.stdout[1] }}"
+
+    - name: Persist configuration to NVRAM
+      cisco.ios.ios_command:
+        commands: "write memory"
+      register: save_result
+      failed_when: >
+        'OK' not in save_result.stdout[0] and
+        'Building' not in save_result.stdout[0]
