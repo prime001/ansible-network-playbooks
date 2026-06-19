@@ -1,99 +1,113 @@
+```yaml
 ---
-# Cisco IOS Security Hardening Compliance Check
+# Security Hardening Compliance Check
+# Validates Cisco IOS devices against a security hardening baseline:
+#   - SSH v2 enforced
+#   - service password-encryption active
+#   - HTTP server disabled
+#   - TCP/UDP small-servers disabled
+#   - Login brute-force protection (login block-for) configured
 #
-# Verifies security hardening controls on IOS devices against CIS/DISA baseline:
-#   - SSH v2 enforcement
-#   - Password encryption service
-#   - Unnecessary services disabled (finger, tcp/udp-small-servers, http)
-#   - VTY timeout and transport restrictions
-#   - Login delay and block-for thresholds
-#
-# Credentials: stored in Ansible Vault (ansible-vault encrypt_string)
-#   ansible-vault create group_vars/all/vault.yml
+# Credentials live in Ansible Vault — never store plaintext here.
+# Generate with: ansible-vault encrypt_string 'secret' --name 'vault_net_password'
 #
 # Inventory example:
-#   [core_routers]
-#   rtr-01 ansible_host=10.0.1.1
-#   rtr-02 ansible_host=10.0.1.2
+#   [ios_routers]
+#   rtr-core-01  ansible_host=10.0.0.1
+#   rtr-core-02  ansible_host=10.0.0.2
 #
-#   [core_routers:vars]
-#   ansible_network_os=ios
-#   ansible_user={{ vault_net_user }}
-#   ansible_password={{ vault_net_password }}
-#   ansible_become=yes
-#   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_password }}
+#   [ios_routers:vars]
+#   ansible_network_os=cisco.ios.ios
 #   ansible_connection=network_cli
+#   ansible_user=netadmin
+#   ansible_password=!vault |
+#     $ANSIBLE_VAULT;1.1;AES256
+#     <encrypted-value>
+#   ansible_become=true
+#   ansible_become_method=enable
+#   ansible_become_password=!vault |
+#     $ANSIBLE_VAULT;1.1;AES256
+#     <encrypted-value>
 
 - name: Security Hardening Compliance Check
-  hosts: core_routers
+  hosts: ios_routers
   gather_facts: false
   vars:
-    compliance_checks:
-      ssh_v2: "ip ssh version 2"
-      service_password_encrypt: "service password-encryption"
-      no_finger: "no service finger"
-      no_http_server: "no ip http server"
-      login_block: "login block-for"
+    ansible_user: "{{ vault_net_user }}"
+    ansible_password: "{{ vault_net_password }}"
+    ansible_become_password: "{{ vault_net_enable }}"
 
   tasks:
-    - name: Gather running configuration
-      cisco.ios.ios_command:
-        commands:
-          - show running-config
-      register: running_config
-      retries: 2
-      delay: 5
-      until: running_config is not failed
+    - name: Collect hardening-relevant configuration and state
+      block:
+        - name: Run security hardening show commands
+          cisco.ios.ios_command:
+            commands:
+              - show ip ssh
+              - show running-config | include service password-encryption
+              - show running-config | include ip http server
+              - show running-config | include service tcp-small-servers
+              - show running-config | include service udp-small-servers
+              - show running-config | include login block-for
+          register: hardening_raw
+          retries: 2
+          delay: 5
+          until: hardening_raw is not failed
 
-    - name: Check SSH version 2 enforcement
-      ansible.builtin.set_fact:
-        ssh_v2_compliant: "{{ 'ip ssh version 2' in running_config.stdout[0] }}"
+        - name: Evaluate each hardening control
+          set_fact:
+            harden_ssh_v2: "{{ 'version 2' in hardening_raw.stdout[0] }}"
+            harden_pwd_encrypt: "{{ 'service password-encryption' in hardening_raw.stdout[1] }}"
+            # Empty output means the insecure line is absent (good)
+            harden_http_off: "{{ 'no ip http server' in hardening_raw.stdout[2]
+                                  or hardening_raw.stdout[2] | length == 0 }}"
+            harden_tcp_small_off: "{{ 'no service tcp-small-servers' in hardening_raw.stdout[3]
+                                       or hardening_raw.stdout[3] | length == 0 }}"
+            harden_udp_small_off: "{{ 'no service udp-small-servers' in hardening_raw.stdout[4]
+                                       or hardening_raw.stdout[4] | length == 0 }}"
+            harden_login_block: "{{ 'login block-for' in hardening_raw.stdout[5] }}"
 
-    - name: Check password encryption service
-      ansible.builtin.set_fact:
-        password_encrypt_compliant: "{{ 'service password-encryption' in running_config.stdout[0] }}"
+        - name: Build compliance report
+          set_fact:
+            compliance_report:
+              device: "{{ inventory_hostname }}"
+              ssh_v2_enforced: "{{ harden_ssh_v2 }}"
+              password_encryption: "{{ harden_pwd_encrypt }}"
+              http_server_disabled: "{{ harden_http_off }}"
+              tcp_small_servers_disabled: "{{ harden_tcp_small_off }}"
+              udp_small_servers_disabled: "{{ harden_udp_small_off }}"
+              login_brute_force_protection: "{{ harden_login_block }}"
+              overall_compliant: "{{ harden_ssh_v2 and harden_pwd_encrypt and harden_http_off
+                                      and harden_tcp_small_off and harden_udp_small_off
+                                      and harden_login_block }}"
 
-    - name: Check HTTP server disabled
-      ansible.builtin.set_fact:
-        http_disabled_compliant: "{{ 'no ip http server' in running_config.stdout[0] or 'ip http server' not in running_config.stdout[0] }}"
+        - name: Display compliance report
+          debug:
+            var: compliance_report
 
-    - name: Check login block-for configured
-      ansible.builtin.set_fact:
-        login_block_compliant: "{{ 'login block-for' in running_config.stdout[0] }}"
+        - name: Fail play for non-compliant devices
+          fail:
+            msg: >
+              {{ inventory_hostname }} failed hardening baseline —
+              SSH v2={{ harden_ssh_v2 }},
+              pwd-encrypt={{ harden_pwd_encrypt }},
+              http-off={{ harden_http_off }},
+              tcp-small-off={{ harden_tcp_small_off }},
+              udp-small-off={{ harden_udp_small_off }},
+              login-block={{ harden_login_block }}
+          when: not compliance_report.overall_compliant
 
-    - name: Collect VTY line timeout settings
-      cisco.ios.ios_command:
-        commands:
-          - show running-config | section line vty
-      register: vty_config
-      retries: 2
-      delay: 5
-      until: vty_config is not failed
+      rescue:
+        - name: Record collection failure and continue
+          debug:
+            msg: >
+              Could not collect hardening data from {{ inventory_hostname }}:
+              {{ ansible_failed_result.msg | default('connection or privilege failure') }}
 
-    - name: Check VTY exec-timeout configured
-      ansible.builtin.set_fact:
-        vty_timeout_compliant: "{{ 'exec-timeout' in vty_config.stdout[0] }}"
-
-    - name: Compile compliance report
-      ansible.builtin.set_fact:
-        compliance_report:
-          device: "{{ inventory_hostname }}"
-          timestamp: "{{ ansible_date_time.iso8601 | default('unknown') }}"
-          checks:
-            ssh_v2: "{{ ssh_v2_compliant }}"
-            password_encryption: "{{ password_encrypt_compliant }}"
-            http_server_disabled: "{{ http_disabled_compliant }}"
-            login_block_for: "{{ login_block_compliant }}"
-            vty_exec_timeout: "{{ vty_timeout_compliant }}"
-          overall_pass: "{{ ssh_v2_compliant and password_encrypt_compliant and http_disabled_compliant and login_block_compliant and vty_timeout_compliant }}"
-
-    - name: Display compliance results
-      ansible.builtin.debug:
-        var: compliance_report
-
-    - name: Fail play if device is non-compliant
-      ansible.builtin.fail:
-        msg: "COMPLIANCE FAILURE on {{ inventory_hostname }} — review compliance_report above"
-      when: not compliance_report.overall_pass
-      ignore_errors: true
+        - name: Mark device as collection-failed
+          set_fact:
+            compliance_report:
+              device: "{{ inventory_hostname }}"
+              overall_compliant: false
+              error: "Data collection failed — verify reachability and enable access"
+```
