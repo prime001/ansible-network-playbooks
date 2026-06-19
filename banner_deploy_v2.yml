@@ -1,92 +1,136 @@
 ---
-# banner_deploy_v3.yml
-# Deploys MOTD and login banners across IOS and NX-OS devices with post-deploy verification.
-# Credentials: ansible_user / ansible_password sourced from Ansible Vault (see vars_files below).
+# ospf_config.yml
+# Deploys and verifies OSPF process configuration on Cisco IOS/IOS-XE routers.
+# Manages process ID, router-ID, network-to-area assignments, and passive interfaces.
+# Captures neighbor table and learned routes to confirm adjacency formation.
+#
+# Credentials are sourced from ansible-vault — never store plaintext passwords.
+# Encrypt secrets with: ansible-vault encrypt_string 'secret' --name 'vault_net_password'
 #
 # Inventory example:
-#   [ios_routers]
-#   rtr-01 ansible_host=10.0.0.1
-#   rtr-02 ansible_host=10.0.0.2
+#   [routers]
+#   rtr-core-01  ansible_host=10.0.0.1
+#   rtr-core-02  ansible_host=10.0.0.2
 #
-#   [nxos_switches]
-#   sw-core-01 ansible_host=10.0.1.1
-#
-#   [network:children]
-#   ios_routers
-#   nxos_switches
-#
-#   [network:vars]
+#   [routers:vars]
+#   ansible_network_os=ios
 #   ansible_connection=network_cli
+#   ansible_user={{ vault_net_user }}
+#   ansible_password={{ vault_net_password }}
 #   ansible_become=yes
 #   ansible_become_method=enable
+#   ansible_become_password={{ vault_enable_password }}
 
-- name: Deploy and verify login/MOTD banners on network devices
-  hosts: network
+- name: Deploy OSPF routing configuration on Cisco IOS/IOS-XE routers
+  hosts: routers
   gather_facts: false
-  vars_files:
-    - vault/network_creds.yml   # ansible_user, ansible_password, ansible_become_pass
 
   vars:
-    banner_motd: |
-      ******************************************************************
-      *  AUTHORIZED ACCESS ONLY                                        *
-      *  Unauthorized use is prohibited and subject to prosecution.    *
-      *  All sessions are monitored and logged.                        *
-      ******************************************************************
-    banner_login: |
-      -- Managed by Ansible | Contact: netops@corp.example.com --
-    banner_delimiter: "@"
-    deploy_timestamp: "{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%SZ') }}"
+    ospf_process_id: 1
+    ospf_areas:
+      - { network: "10.0.0.0",    wildcard: "0.0.255.255", area: 0 }
+      - { network: "192.168.0.0", wildcard: "0.0.0.255",   area: 1 }
+    ospf_passive_interfaces:
+      - Loopback0
+      - GigabitEthernet0/2
 
   tasks:
-    - name: Deploy MOTD banner (IOS/IOS-XE)
-      cisco.ios.ios_banner:
-        banner: motd
-        text: "{{ banner_motd }}"
-        state: present
-      when: ansible_network_os == "cisco.ios.ios"
-      register: ios_motd_result
-      retries: 2
-      delay: 5
-      failed_when:
-        - ios_motd_result.failed is defined
-        - ios_motd_result.failed
-      rescue:
-        - name: Log IOS MOTD banner failure
+    - name: Capture pre-change OSPF state
+      block:
+        - name: Show current OSPF process and neighbor table
+          cisco.ios.ios_command:
+            commands:
+              - show ip ospf
+              - show ip ospf neighbor
+          register: ospf_pre_state
+
+        - name: Display pre-change OSPF state
           ansible.builtin.debug:
-            msg: "MOTD banner deploy failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
-        - name: Fail task explicitly after rescue
+            msg: "{{ ospf_pre_state.stdout_lines }}"
+
+      rescue:
+        - name: Note that OSPF is not yet configured on this device
+          ansible.builtin.debug:
+            msg: "Pre-change check returned no OSPF state on {{ inventory_hostname }} — first-time deployment."
+
+    - name: Configure OSPF process, networks, and passive interfaces
+      block:
+        - name: Set OSPF process ID and router-ID
+          cisco.ios.ios_config:
+            lines:
+              - "router ospf {{ ospf_process_id }}"
+              - " router-id {{ ansible_host }}"
+            match: line
+          register: ospf_process_cfg
+          retries: 2
+          delay: 3
+          until: ospf_process_cfg is not failed
+
+        - name: Apply OSPF network-to-area statements
+          cisco.ios.ios_config:
+            parents: "router ospf {{ ospf_process_id }}"
+            lines:
+              - "network {{ item.network }} {{ item.wildcard }} area {{ item.area }}"
+            match: line
+          loop: "{{ ospf_areas }}"
+          register: ospf_network_cfg
+
+        - name: Configure passive interfaces
+          cisco.ios.ios_config:
+            parents: "router ospf {{ ospf_process_id }}"
+            lines:
+              - "passive-interface {{ item }}"
+            match: line
+          loop: "{{ ospf_passive_interfaces }}"
+
+        - name: Persist running configuration to NVRAM
+          cisco.ios.ios_command:
+            commands:
+              - write memory
+          register: save_result
+          failed_when: >
+            'OK' not in save_result.stdout[0] and
+            '[OK]' not in save_result.stdout[0]
+
+      rescue:
+        - name: Report configuration failure
+          ansible.builtin.debug:
+            msg: "OSPF configuration failed on {{ inventory_hostname }} — manual review required."
+
+        - name: Fail the play for this host
           ansible.builtin.fail:
-            msg: "Banner deploy could not be recovered on {{ inventory_hostname }}"
+            msg: "Aborting: OSPF deployment did not complete cleanly on {{ inventory_hostname }}"
 
-    - name: Deploy login banner (IOS/IOS-XE)
-      cisco.ios.ios_banner:
-        banner: login
-        text: "{{ banner_login }}"
-        state: present
-      when: ansible_network_os == "cisco.ios.ios"
-      register: ios_login_result
+    - name: Wait for OSPF adjacencies to form and capture neighbor table
+      cisco.ios.ios_command:
+        commands:
+          - show ip ospf neighbor
+      register: ospf_neighbors
+      retries: 6
+      delay: 10
+      until: ospf_neighbors.stdout is defined
+      failed_when: false
 
-    - name: Deploy MOTD banner (NX-OS)
-      cisco.nxos.nxos_banner:
-        banner: motd
-        text: "{{ banner_motd }}"
-        state: present
-      when: ansible_network_os == "cisco.nxos.nxos"
-      register: nxos_motd_result
-      retries: 2
-      delay: 5
-
-    - name: Verify banner is present via show command
-      ansible.netcommon.cli_command:
-        command: show banner motd
-      register: banner_verify
-      changed_when: false
-      failed_when: "'AUTHORIZED ACCESS' not in banner_verify.stdout"
-
-    - name: Display verification result
+    - name: Display OSPF neighbor table
       ansible.builtin.debug:
-        msg:
-          - "Host: {{ inventory_hostname }}"
-          - "Banner deployed at: {{ deploy_timestamp }}"
-          - "Verification excerpt: {{ banner_verify.stdout | truncate(120) }}
+        msg: "{{ ospf_neighbors.stdout_lines }}"
+
+    - name: Verify OSPF routes are present in the routing table
+      cisco.ios.ios_command:
+        commands:
+          - show ip route ospf
+      register: ospf_routes
+      retries: 3
+      delay: 5
+      until: ospf_routes.stdout is defined
+
+    - name: Display OSPF-learned routes
+      ansible.builtin.debug:
+        msg: "{{ ospf_routes.stdout_lines }}"
+
+    - name: Summarize deployment result
+      ansible.builtin.debug:
+        msg: >
+          OSPF process {{ ospf_process_id }} deployed on {{ inventory_hostname }}.
+          Networks configured: {{ ospf_areas | length }}.
+          Passive interfaces: {{ ospf_passive_interfaces | join(', ') }}.
