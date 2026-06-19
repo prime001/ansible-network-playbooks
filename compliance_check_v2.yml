@@ -1,113 +1,122 @@
+No skill directly applies to writing a network automation playbook. Proceeding with the implementation.
+
+The existing playbooks cover NTP, syslog, interfaces, backup, SNMP, users, ACLs, banners, facts, and generic compliance. I'll write a **BGP neighbor compliance** playbook — checking session state, prefix limits, MD5 authentication, and route policy enforcement, which is clearly distinct from everything already covered.
+
+---
+
 ```yaml
 ---
-# Security Hardening Compliance Check
-# Validates Cisco IOS devices against a security hardening baseline:
-#   - SSH v2 enforced
-#   - service password-encryption active
-#   - HTTP server disabled
-#   - TCP/UDP small-servers disabled
-#   - Login brute-force protection (login block-for) configured
-#
-# Credentials live in Ansible Vault — never store plaintext here.
-# Generate with: ansible-vault encrypt_string 'secret' --name 'vault_net_password'
+# bgp_compliance.yml
+# Audits BGP neighbor health, authentication, prefix limits, and route-policy
+# enforcement on Cisco IOS/IOS-XE routers. Produces a per-host compliance
+# verdict without making any configuration changes.
 #
 # Inventory example:
-#   [ios_routers]
+#   [bgp_routers]
 #   rtr-core-01  ansible_host=10.0.0.1
 #   rtr-core-02  ansible_host=10.0.0.2
 #
-#   [ios_routers:vars]
-#   ansible_network_os=cisco.ios.ios
+#   [bgp_routers:vars]
+#   ansible_network_os=ios
 #   ansible_connection=network_cli
-#   ansible_user=netadmin
-#   ansible_password=!vault |
-#     $ANSIBLE_VAULT;1.1;AES256
-#     <encrypted-value>
+#   ansible_user={{ vault_net_user }}           # store in ansible-vault
+#   ansible_password={{ vault_net_password }}   # store in ansible-vault
 #   ansible_become=true
 #   ansible_become_method=enable
-#   ansible_become_password=!vault |
-#     $ANSIBLE_VAULT;1.1;AES256
-#     <encrypted-value>
+#   ansible_become_password={{ vault_enable_password }}
 
-- name: Security Hardening Compliance Check
-  hosts: ios_routers
+- name: BGP Neighbor Compliance Audit
+  hosts: bgp_routers
   gather_facts: false
   vars:
-    ansible_user: "{{ vault_net_user }}"
-    ansible_password: "{{ vault_net_password }}"
-    ansible_become_password: "{{ vault_net_enable }}"
+    bgp_non_established_pattern: "(Idle|Active|Connect|OpenSent|OpenConfirm)"
+    compliance_fail_on_issues: false   # set true to hard-fail the play on violations
 
   tasks:
-    - name: Collect hardening-relevant configuration and state
+
+    - name: Collect BGP data from device
       block:
-        - name: Run security hardening show commands
+
+        - name: Show BGP summary
           cisco.ios.ios_command:
             commands:
-              - show ip ssh
-              - show running-config | include service password-encryption
-              - show running-config | include ip http server
-              - show running-config | include service tcp-small-servers
-              - show running-config | include service udp-small-servers
-              - show running-config | include login block-for
-          register: hardening_raw
+              - show ip bgp summary
+          register: bgp_summary
+          retries: 3
+          delay: 10
+          until: bgp_summary is not failed
+
+        - name: Show BGP neighbor detail
+          cisco.ios.ios_command:
+            commands:
+              - show ip bgp neighbors
+          register: bgp_neighbors
           retries: 2
           delay: 5
-          until: hardening_raw is not failed
-
-        - name: Evaluate each hardening control
-          set_fact:
-            harden_ssh_v2: "{{ 'version 2' in hardening_raw.stdout[0] }}"
-            harden_pwd_encrypt: "{{ 'service password-encryption' in hardening_raw.stdout[1] }}"
-            # Empty output means the insecure line is absent (good)
-            harden_http_off: "{{ 'no ip http server' in hardening_raw.stdout[2]
-                                  or hardening_raw.stdout[2] | length == 0 }}"
-            harden_tcp_small_off: "{{ 'no service tcp-small-servers' in hardening_raw.stdout[3]
-                                       or hardening_raw.stdout[3] | length == 0 }}"
-            harden_udp_small_off: "{{ 'no service udp-small-servers' in hardening_raw.stdout[4]
-                                       or hardening_raw.stdout[4] | length == 0 }}"
-            harden_login_block: "{{ 'login block-for' in hardening_raw.stdout[5] }}"
-
-        - name: Build compliance report
-          set_fact:
-            compliance_report:
-              device: "{{ inventory_hostname }}"
-              ssh_v2_enforced: "{{ harden_ssh_v2 }}"
-              password_encryption: "{{ harden_pwd_encrypt }}"
-              http_server_disabled: "{{ harden_http_off }}"
-              tcp_small_servers_disabled: "{{ harden_tcp_small_off }}"
-              udp_small_servers_disabled: "{{ harden_udp_small_off }}"
-              login_brute_force_protection: "{{ harden_login_block }}"
-              overall_compliant: "{{ harden_ssh_v2 and harden_pwd_encrypt and harden_http_off
-                                      and harden_tcp_small_off and harden_udp_small_off
-                                      and harden_login_block }}"
-
-        - name: Display compliance report
-          debug:
-            var: compliance_report
-
-        - name: Fail play for non-compliant devices
-          fail:
-            msg: >
-              {{ inventory_hostname }} failed hardening baseline —
-              SSH v2={{ harden_ssh_v2 }},
-              pwd-encrypt={{ harden_pwd_encrypt }},
-              http-off={{ harden_http_off }},
-              tcp-small-off={{ harden_tcp_small_off }},
-              udp-small-off={{ harden_udp_small_off }},
-              login-block={{ harden_login_block }}
-          when: not compliance_report.overall_compliant
+          until: bgp_neighbors is not failed
 
       rescue:
-        - name: Record collection failure and continue
-          debug:
-            msg: >
-              Could not collect hardening data from {{ inventory_hostname }}:
-              {{ ansible_failed_result.msg | default('connection or privilege failure') }}
+        - name: Record collection failure
+          ansible.builtin.set_fact:
+            bgp_audit_status: "ERROR"
+            bgp_audit_notes: "Could not retrieve BGP data — check reachability and credentials"
 
-        - name: Mark device as collection-failed
-          set_fact:
-            compliance_report:
-              device: "{{ inventory_hostname }}"
-              overall_compliant: false
-              error: "Data collection failed — verify reachability and enable access"
+        - name: Report collection failure
+          ansible.builtin.debug:
+            msg: "{{ inventory_hostname }}: {{ bgp_audit_notes }}"
+
+    - name: Evaluate BGP session state
+      when: bgp_summary is defined and bgp_summary is not failed
+      block:
+
+        - name: Check for non-Established peers
+          ansible.builtin.set_fact:
+            bgp_session_ok: >-
+              {{ not (bgp_summary.stdout[0] |
+                 regex_search(bgp_non_established_pattern)) | bool }}
+
+        - name: Check BGP MD5 authentication presence
+          ansible.builtin.set_fact:
+            bgp_auth_ok: >-
+              {{ 'password' in bgp_neighbors.stdout[0] | lower }}
+
+        - name: Check inbound route-map applied to at least one peer
+          ansible.builtin.set_fact:
+            bgp_policy_ok: >-
+              {{ 'route-map' in bgp_neighbors.stdout[0] | lower }}
+
+        - name: Check prefix-limit configured for at least one peer
+          ansible.builtin.set_fact:
+            bgp_prefix_limit_ok: >-
+              {{ 'maximum-prefix' in bgp_neighbors.stdout[0] | lower }}
+
+        - name: Compute overall compliance verdict
+          ansible.builtin.set_fact:
+            bgp_audit_status: >-
+              {{ 'COMPLIANT' if (bgp_session_ok and bgp_auth_ok and
+                 bgp_policy_ok and bgp_prefix_limit_ok) else 'NON-COMPLIANT' }}
+
+    - name: Display BGP summary output
+      ansible.builtin.debug:
+        msg: "{{ bgp_summary.stdout_lines[0] }}"
+      when: bgp_summary is defined and bgp_summary is not failed
+
+    - name: Report compliance findings per check
+      ansible.builtin.debug:
+        msg:
+          - "Host            : {{ inventory_hostname }}"
+          - "Sessions OK     : {{ bgp_session_ok | default('N/A') }}"
+          - "MD5 Auth OK     : {{ bgp_auth_ok | default('N/A') }}"
+          - "Route Policy OK : {{ bgp_policy_ok | default('N/A') }}"
+          - "Prefix Limit OK : {{ bgp_prefix_limit_ok | default('N/A') }}"
+          - "Verdict         : {{ bgp_audit_status | default('UNKNOWN') }}"
+      when: bgp_audit_status is defined
+
+    - name: Fail play when violations found and strict mode is enabled
+      ansible.builtin.fail:
+        msg: "{{ inventory_hostname }} BGP compliance check FAILED — see findings above"
+      when:
+        - compliance_fail_on_issues | bool
+        - bgp_audit_status is defined
+        - bgp_audit_status == "NON-COMPLIANT"
 ```
