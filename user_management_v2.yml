@@ -1,148 +1,123 @@
-```yaml
 ---
-# VLAN Management Playbook
-# Configures and manages VLANs across Cisco IOS, IOS-XR, and NX-OS devices
+# aaa_tacacs_config.yml
+# Configures TACACS+ AAA authentication, authorization, and accounting on Cisco IOS.
+# Distinct from user_management.yml (local users) — this manages centralized auth
+# via TACACS+ with a local emergency fallback account for out-of-band recovery.
 #
-# Inventory Example:
+# Credentials via Ansible Vault:
+#   ansible-vault create group_vars/network/vault.yml
+#   Required vault vars: vault_ansible_user, vault_ansible_password,
+#                        vault_enable_password, vault_tacacs_key,
+#                        vault_emergency_password
+#
+# Inventory example (inventory/hosts.yml):
 # all:
 #   children:
-#     network_devices:
-#       children:
-#         ios_devices:
-#           hosts:
-#             switch01:
-#               ansible_host: 192.168.1.10
-#               ansible_network_os: ios
-#         nxos_devices:
-#           hosts:
-#             switch02:
-#               ansible_host: 192.168.1.11
-#               ansible_network_os: nxos
-#
-# Usage:
-# ansible-playbook vlan_management.yml -i hosts.yml
+#     network:
+#       hosts:
+#         core-sw1:
+#           ansible_host: 10.0.1.1
+#         dist-sw1:
+#           ansible_host: 10.0.1.10
+#       vars:
+#         ansible_network_os: ios
+#         ansible_user: "{{ vault_ansible_user }}"
+#         ansible_password: "{{ vault_ansible_password }}"
+#         ansible_become: true
+#         ansible_become_method: enable
+#         ansible_become_password: "{{ vault_enable_password }}"
 
-- name: Manage VLANs across network infrastructure
-  hosts: network_devices
-  gather_facts: no
-  connection: network_cli
-
+- name: Configure TACACS+ AAA authentication and accounting on Cisco IOS
+  hosts: network
+  gather_facts: false
   vars:
-    # Device credentials - reference vault for production deployment
-    # ansible_user: "{{ vault_device_username }}"
-    # ansible_password: "{{ vault_device_password }}"
-    
-    vlans_to_create:
-      - vlan_id: 10
-        name: Management
-      - vlan_id: 20
-        name: Production
-      - vlan_id: 30
-        name: Development
-      - vlan_id: 40
-        name: Guest
-    
-    vlan_interfaces:
-      - interface: GigabitEthernet0/0/1
-        vlan_id: 10
-      - interface: GigabitEthernet0/0/2
-        vlan_id: 20
-      - interface: GigabitEthernet0/0/3
-        vlan_id: 30
+    tacacs_primary_host: "10.0.0.10"
+    tacacs_backup_host: "10.0.0.11"
+    tacacs_timeout: 5
+    local_fallback_user: "netops-recovery"
+    local_fallback_privilege: 15
 
   tasks:
-    - name: Create VLANs on IOS devices
-      cisco.ios.ios_vlan:
-        vlan_id: "{{ item.vlan_id }}"
-        name: "{{ item.name }}"
-        state: present
-      loop: "{{ vlans_to_create }}"
-      register: ios_vlan_result
+    - name: Verify device reachability before making changes
+      cisco.ios.ios_command:
+        commands: "show version"
+      register: version_output
       retries: 3
       delay: 5
-      until: ios_vlan_result is not failed
-      when: ansible_network_os == 'ios'
-      tags:
-        - vlan_create
+      until: version_output is not failed
 
-    - name: Create VLANs on NX-OS devices
-      cisco.nxos.nxos_vlan:
-        vlan_id: "{{ item.vlan_id }}"
-        name: "{{ item.name }}"
-        state: present
-      loop: "{{ vlans_to_create }}"
-      register: nxos_vlan_result
-      retries: 3
-      delay: 5
-      until: nxos_vlan_result is not failed
-      when: ansible_network_os == 'nxos'
-      tags:
-        - vlan_create
+    - name: Deploy TACACS+ AAA configuration
+      block:
+        - name: Enable AAA new-model
+          cisco.ios.ios_config:
+            lines:
+              - aaa new-model
 
-    - name: Assign VLANs to interfaces (IOS)
-      cisco.ios.ios_l2_interface:
-        name: "{{ item.interface }}"
-        mode: access
-        access_vlan: "{{ item.vlan_id }}"
-        state: present
-      loop: "{{ vlan_interfaces }}"
-      register: ios_interface_result
-      retries: 2
-      delay: 3
-      until: ios_interface_result is not failed
-      when: ansible_network_os == 'ios'
-      tags:
-        - vlan_assign
+        - name: Configure primary TACACS+ server
+          cisco.ios.ios_config:
+            parents: "tacacs server TACACS-PRIMARY"
+            lines:
+              - "address ipv4 {{ tacacs_primary_host }}"
+              - "key 0 {{ vault_tacacs_key }}"
+              - "timeout {{ tacacs_timeout }}"
+          no_log: true
 
-    - name: Verify VLAN configuration on IOS
+        - name: Configure backup TACACS+ server
+          cisco.ios.ios_config:
+            parents: "tacacs server TACACS-BACKUP"
+            lines:
+              - "address ipv4 {{ tacacs_backup_host }}"
+              - "key 0 {{ vault_tacacs_key }}"
+              - "timeout {{ tacacs_timeout }}"
+          no_log: true
+
+        - name: Create TACACS+ server group
+          cisco.ios.ios_config:
+            parents: "aaa group server tacacs+ TACACS-GROUP"
+            lines:
+              - "server name TACACS-PRIMARY"
+              - "server name TACACS-BACKUP"
+
+        - name: Configure AAA authentication and authorization with local fallback
+          cisco.ios.ios_config:
+            lines:
+              - "aaa authentication login default group TACACS-GROUP local"
+              - "aaa authentication enable default group TACACS-GROUP enable"
+              - "aaa authorization exec default group TACACS-GROUP local if-authenticated"
+              - "aaa authorization commands 15 default group TACACS-GROUP local if-authenticated"
+              - "aaa accounting exec default start-stop group TACACS-GROUP"
+              - "aaa accounting commands 15 default start-stop group TACACS-GROUP"
+
+        - name: Ensure local emergency recovery account exists
+          cisco.ios.ios_config:
+            lines:
+              - "username {{ local_fallback_user }} privilege {{ local_fallback_privilege }} algorithm-type scrypt secret {{ vault_emergency_password }}"
+          no_log: true
+
+        - name: Save configuration to NVRAM
+          cisco.ios.ios_config:
+            save_when: modified
+
+      rescue:
+        - name: Report failure with context
+          ansible.builtin.debug:
+            msg: "AAA deployment failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('check task output above') }}"
+
+        - name: Fail with remediation guidance
+          ansible.builtin.fail:
+            msg: >
+              TACACS+ AAA configuration failed on {{ inventory_hostname }}.
+              Verify: TACACS+ servers reachable, vault vars populated, device in enable mode.
+
+    - name: Collect AAA and TACACS+ operational status
       cisco.ios.ios_command:
         commands:
-          - show vlan brief
-      register: vlan_output
-      failed_when: '"VLAN Name" not in vlan_output.stdout[0]'
-      when: ansible_network_os == 'ios'
-      tags:
-        - verify
+          - show aaa servers
+          - show tacacs
+          - show running-config | section aaa
+      register: aaa_status
+      failed_when: false
 
-    - name: Verify VLAN configuration on NX-OS
-      cisco.nxos.nxos_command:
-        commands:
-          - show vlan brief
-      register: nxos_vlan_output
-      failed_when: '"VLAN Name" not in nxos_vlan_output.stdout[0]'
-      when: ansible_network_os == 'nxos'
-      tags:
-        - verify
-
-    - name: Display VLAN configuration summary
-      debug:
-        msg: |
-          VLAN Configuration Report - {{ inventory_hostname }}
-          ====================================================
-          Device OS: {{ ansible_network_os }}
-          VLANs Configured: {{ vlans_to_create | length }}
-          Interfaces Updated: {{ vlan_interfaces | length }}
-          Status: Completed successfully
-      tags:
-        - report
-
-  rescue:
-    - name: Capture error details
-      debug:
-        msg: |
-          VLAN configuration failed on {{ inventory_hostname }}
-          Error: {{ ansible_failed_result.msg | default('Unknown error') }}
-          Device OS: {{ ansible_network_os }}
-
-    - name: Attempt device recovery
-      cisco.ios.ios_command:
-        commands:
-          - show interfaces status
-      register: device_status
-      ignore_errors: yes
-
-    - name: Report device status
-      debug:
-        var: device_status.stdout_lines
-      when: device_status is not skipped
-```
+    - name: Display AAA operational status
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} AAA status:\n{{ aaa_status.stdout | join('\n---\n') }}
