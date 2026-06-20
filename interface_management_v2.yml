@@ -1,127 +1,115 @@
 ---
-# ospf_config.yml - Configure OSPFv2 process and area routing on Cisco IOS routers
+# EtherChannel Port-Channel Configuration Playbook
+# Configures LACP-based port-channel bundles on Cisco IOS distribution switches.
+# Provides idempotent LAG setup, LACP negotiation verification, and err-disable detection.
 #
-# Credentials sourced from Ansible Vault:
-#   ansible-vault edit group_vars/all/vault.yml
-#   Required keys: vault_ansible_user, vault_ansible_password,
-#                  vault_enable_password, vault_ospf_md5_key
+# Inventory example (inventories/distribution.yml):
+# ---
+# all:
+#   children:
+#     distribution:
+#       hosts:
+#         dist-sw-01:
+#           ansible_host: 10.0.1.1
+#           ansible_network_os: ios
+#           ansible_connection: network_cli
+#           ansible_user: "{{ vault_net_user }}"
+#           ansible_password: "{{ vault_net_pass }}"
+#           ansible_become: true
+#           ansible_become_method: enable
+#           ansible_become_password: "{{ vault_enable_pass }}"
+#         dist-sw-02:
+#           ansible_host: 10.0.1.2
+#           ansible_network_os: ios
+#           ansible_connection: network_cli
+#           ansible_user: "{{ vault_net_user }}"
+#           ansible_password: "{{ vault_net_pass }}"
+#           ansible_become: true
+#           ansible_become_method: enable
+#           ansible_become_password: "{{ vault_enable_pass }}"
 #
-# Inventory example:
-# [routers]
-# core-rtr-01  ansible_host=10.0.0.1  ospf_router_id=10.255.0.1
-# core-rtr-02  ansible_host=10.0.0.2  ospf_router_id=10.255.0.2
-#
-# [routers:vars]
-# ansible_network_os=ios
-# ansible_connection=network_cli
-# ansible_user={{ vault_ansible_user }}
-# ansible_password={{ vault_ansible_password }}
-# ansible_become=yes
-# ansible_become_method=enable
-# ansible_become_password={{ vault_enable_password }}
+# Credentials are sourced from Ansible Vault.
+# Encrypt with: ansible-vault encrypt_string 'secret' --name vault_net_user
+# Run with:    ansible-playbook etherchannel_config.yml -i inventories/distribution.yml --ask-vault-pass
 
-- name: Configure OSPFv2 process, area assignments, and MD5 authentication
-  hosts: routers
+- name: Configure EtherChannel Port-Channels (LACP) on IOS Distribution Switches
+  hosts: distribution
   gather_facts: false
+  connection: network_cli
+
   vars:
-    ansible_user: "{{ vault_ansible_user }}"
-    ansible_password: "{{ vault_ansible_password }}"
-    ansible_become_password: "{{ vault_enable_password }}"
-    ospf_process_id: 1
-    ospf_reference_bandwidth: 10000
-    ospf_networks:
-      - prefix: "10.0.0.0"
-        wildcard: "0.0.0.255"
-        area: "0"
-      - prefix: "192.168.100.0"
-        wildcard: "0.0.0.255"
-        area: "1"
-    ospf_active_interfaces:
-      - GigabitEthernet0/1
-      - GigabitEthernet0/2
+    ansible_user: "{{ vault_net_user }}"
+    ansible_password: "{{ vault_net_pass }}"
+    ansible_become_password: "{{ vault_enable_pass }}"
+
+    lag_bundles:
+      - name: "1"
+        members:
+          - member: GigabitEthernet1/0/1
+            mode: active
+          - member: GigabitEthernet1/0/2
+            mode: active
+      - name: "2"
+        members:
+          - member: GigabitEthernet1/0/3
+            mode: active
+          - member: GigabitEthernet1/0/4
+            mode: active
 
   tasks:
-    - name: Capture OSPF state before changes
-      cisco.ios.ios_command:
-        commands:
-          - show ip ospf
-          - show ip ospf neighbor summary
-      register: ospf_pre_state
-      retries: 2
-      delay: 5
-
-    - name: Display pre-change OSPF state
-      ansible.builtin.debug:
-        var: ospf_pre_state.stdout_lines
-
-    - name: Apply OSPF configuration
+    - name: Apply LACP port-channel configuration and verify
       block:
-        - name: Set OSPF process parameters and passive-interface default
-          cisco.ios.ios_config:
-            lines:
-              - "router-id {{ ospf_router_id }}"
-              - "auto-cost reference-bandwidth {{ ospf_reference_bandwidth }}"
-              - "passive-interface default"
-            parents: "router ospf {{ ospf_process_id }}"
-            save_when: changed
+        - name: Configure LAG member interfaces
+          cisco.ios.ios_lag_interfaces:
+            config: "{{ lag_bundles }}"
+            state: merged
+          register: lag_result
+          retries: 2
+          delay: 5
+          until: lag_result is not failed
 
-        - name: Activate OSPF on routed interfaces
-          cisco.ios.ios_config:
-            lines:
-              - "no passive-interface {{ item }}"
-            parents: "router ospf {{ ospf_process_id }}"
-            save_when: changed
-          loop: "{{ ospf_active_interfaces }}"
+        - name: Collect EtherChannel and LACP status
+          cisco.ios.ios_command:
+            commands:
+              - show etherchannel summary
+              - show lacp neighbor
+              - show interfaces port-channel 1 status
+          register: ec_status
+          retries: 3
+          delay: 10
+          until: ec_status is not failed
+          failed_when: >
+            'err-disabled' in (ec_status.stdout | join(' '))
 
-        - name: Advertise networks into OSPF areas
-          cisco.ios.ios_config:
-            lines:
-              - "network {{ item.prefix }} {{ item.wildcard }} area {{ item.area }}"
-            parents: "router ospf {{ ospf_process_id }}"
-            save_when: changed
-          loop: "{{ ospf_networks }}"
+        - name: Display EtherChannel operational state
+          ansible.builtin.debug:
+            msg: "{{ ec_status.stdout_lines }}"
 
-        - name: Enable MD5 authentication on active OSPF interfaces
-          cisco.ios.ios_config:
-            lines:
-              - "ip ospf message-digest-key 1 md5 {{ vault_ospf_md5_key }}"
-              - "ip ospf authentication message-digest"
-            parents: "interface {{ item }}"
-            save_when: changed
-          loop: "{{ ospf_active_interfaces }}"
-          no_log: true
+        - name: Report configuration outcome
+          ansible.builtin.debug:
+            msg: >
+              Port-channel configuration on {{ inventory_hostname }}
+              completed — changed: {{ lag_result.changed }}
 
       rescue:
-        - name: Report configuration failure details
+        - name: Collect interface diagnostics on failure
+          cisco.ios.ios_command:
+            commands:
+              - show interfaces GigabitEthernet1/0/1
+              - show interfaces GigabitEthernet1/0/2
+              - show lacp internal
+              - show logging | include LACP
+          register: diag_output
+          ignore_errors: true
+
+        - name: Log failure details and diagnostics
           ansible.builtin.debug:
-            msg: "OSPF config failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
+            msg:
+              - "EtherChannel configuration FAILED on {{ inventory_hostname }}"
+              - "Diagnostics: {{ diag_output.stdout_lines | default(['unavailable']) }}"
 
-        - name: Abort play for affected host
+        - name: Raise fatal error with context
           ansible.builtin.fail:
-            msg: "Halting: OSPF could not be applied to {{ inventory_hostname }}. Manual review required."
-
-    - name: Wait for OSPF adjacencies to reach FULL state
-      cisco.ios.ios_command:
-        commands:
-          - show ip ospf neighbor
-      register: ospf_neighbors
-      retries: 6
-      delay: 10
-      until: "'FULL' in ospf_neighbors.stdout[0]"
-
-    - name: Display OSPF neighbor table
-      ansible.builtin.debug:
-        var: ospf_neighbors.stdout_lines
-
-    - name: Confirm OSPF routes are present in the RIB
-      cisco.ios.ios_command:
-        commands:
-          - show ip route ospf
-      register: ospf_rib
-      failed_when:
-        - ospf_networks | length > 0
-        - "'O ' not in ospf_rib.stdout[0]"
-
-    - name: Display OSPF-learned routes
-      ansible.builtin.debug:
-        var: ospf_rib.stdout_lines
+            msg: >
+              Port-channel configuration failed on {{ inventory_hostname }}.
+              Check for err-disabled members, LACP mismatch, or reachability issues.
