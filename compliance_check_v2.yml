@@ -1,122 +1,148 @@
-No skill directly applies to writing a network automation playbook. Proceeding with the implementation.
-
-The existing playbooks cover NTP, syslog, interfaces, backup, SNMP, users, ACLs, banners, facts, and generic compliance. I'll write a **BGP neighbor compliance** playbook — checking session state, prefix limits, MD5 authentication, and route policy enforcement, which is clearly distinct from everything already covered.
-
 ---
+# Port Channel (LAG) Configuration Playbook
+# Configures link aggregation groups across multi-vendor network devices
+# Supports Cisco IOS, IOS-XR, Juniper, and NXOS platforms
+# Use case: Create redundant links and increase throughput between network devices
 
-```yaml
----
-# bgp_compliance.yml
-# Audits BGP neighbor health, authentication, prefix limits, and route-policy
-# enforcement on Cisco IOS/IOS-XE routers. Produces a per-host compliance
-# verdict without making any configuration changes.
-#
-# Inventory example:
-#   [bgp_routers]
-#   rtr-core-01  ansible_host=10.0.0.1
-#   rtr-core-02  ansible_host=10.0.0.2
-#
-#   [bgp_routers:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user={{ vault_net_user }}           # store in ansible-vault
-#   ansible_password={{ vault_net_password }}   # store in ansible-vault
-#   ansible_become=true
-#   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_password }}
-
-- name: BGP Neighbor Compliance Audit
-  hosts: bgp_routers
-  gather_facts: false
+- name: Configure Port Channel Aggregation
+  hosts: network_devices
+  gather_facts: no
   vars:
-    bgp_non_established_pattern: "(Idle|Active|Connect|OpenSent|OpenConfirm)"
-    compliance_fail_on_issues: false   # set true to hard-fail the play on violations
+    # Device credentials - store in ansible-vault for production
+    # ansible-vault encrypt group_vars/network_devices/secrets.yml
+    ansible_network_os: "{{ device_os }}"
+    ansible_user: "{{ vault_username }}"
+    ansible_password: "{{ vault_password }}"
+    ansible_connection: network_cli
+    ansible_command_timeout: 60
 
   tasks:
+    - name: Validate port channel configuration variables
+      assert:
+        that:
+          - lag_id is defined
+          - member_interfaces is defined
+          - member_interfaces | length >= 2
+        fail_msg: "lag_id and member_interfaces (minimum 2) are required"
 
-    - name: Collect BGP data from device
-      block:
+    - name: Configure port channel on Cisco IOS
+      ios_lag_interfaces:
+        config:
+          - name: "Port-channel{{ lag_id }}"
+            members:
+              - member: "{{ item }}"
+                mode: active
+        state: merged
+      loop: "{{ member_interfaces }}"
+      when: device_os == 'ios'
+      register: ios_result
+      retries: 3
+      delay: 5
+      until: ios_result is not failed
 
-        - name: Show BGP summary
-          cisco.ios.ios_command:
-            commands:
-              - show ip bgp summary
-          register: bgp_summary
-          retries: 3
-          delay: 10
-          until: bgp_summary is not failed
+    - name: Configure port channel on Cisco NXOS
+      nxos_lag_interfaces:
+        config:
+          - name: "port-channel{{ lag_id }}"
+            members:
+              - member: "{{ item }}"
+                mode: active
+        state: merged
+      loop: "{{ member_interfaces }}"
+      when: device_os == 'nxos'
+      register: nxos_result
+      retries: 3
+      delay: 5
+      until: nxos_result is not failed
 
-        - name: Show BGP neighbor detail
-          cisco.ios.ios_command:
-            commands:
-              - show ip bgp neighbors
-          register: bgp_neighbors
-          retries: 2
-          delay: 5
-          until: bgp_neighbors is not failed
+    - name: Configure port channel on Juniper
+      junos_lag_interfaces:
+        config:
+          - name: "ae{{ lag_id }}"
+            members: "{{ member_interfaces }}"
+        state: merged
+      when: device_os == 'junos'
+      register: junos_result
+      retries: 3
+      delay: 5
+      until: junos_result is not failed
 
-      rescue:
-        - name: Record collection failure
-          ansible.builtin.set_fact:
-            bgp_audit_status: "ERROR"
-            bgp_audit_notes: "Could not retrieve BGP data — check reachability and credentials"
+    - name: Enable LACP on member interfaces (IOS)
+      ios_config:
+        lines:
+          - "channel-group {{ lag_id }} mode active"
+        parents: "interface {{ item }}"
+      loop: "{{ member_interfaces }}"
+      when: device_os == 'ios'
+      register: lacp_config
 
-        - name: Report collection failure
-          ansible.builtin.debug:
-            msg: "{{ inventory_hostname }}: {{ bgp_audit_notes }}"
+    - name: Verify port channel operational status
+      cli_command:
+        command: >
+          {% if device_os == 'ios' %}
+          show etherchannel {{ lag_id }} summary
+          {% elif device_os == 'nxos' %}
+          show port-channel {{ lag_id }} summary
+          {% elif device_os == 'junos' %}
+          show interfaces ae{{ lag_id }} brief
+          {% endif %}
+      register: channel_status
+      failed_when: 
+        - "'up' not in channel_status.stdout | lower"
+        - "'active' not in channel_status.stdout | lower"
 
-    - name: Evaluate BGP session state
-      when: bgp_summary is defined and bgp_summary is not failed
-      block:
+    - name: Display port channel summary
+      debug:
+        msg: |
+          Port Channel Configuration Status
+          ===================================
+          Device: {{ inventory_hostname }}
+          Port Channel: {{ lag_id }}
+          Members: {{ member_interfaces | join(', ') }}
+          Operational: {{ 'YES' if channel_status is succeeded else 'NO' }}
 
-        - name: Check for non-Established peers
-          ansible.builtin.set_fact:
-            bgp_session_ok: >-
-              {{ not (bgp_summary.stdout[0] |
-                 regex_search(bgp_non_established_pattern)) | bool }}
+    - name: Backup configuration
+      cli_command:
+        command: >
+          {% if device_os == 'ios' %}
+          show running-config | include port-channel
+          {% elif device_os == 'nxos' %}
+          show running-config port-channel
+          {% else %}
+          show configuration interfaces ae{{ lag_id }}
+          {% endif %}
+      register: config_backup
 
-        - name: Check BGP MD5 authentication presence
-          ansible.builtin.set_fact:
-            bgp_auth_ok: >-
-              {{ 'password' in bgp_neighbors.stdout[0] | lower }}
+    - name: Save backup locally
+      copy:
+        content: "{{ config_backup.stdout }}"
+        dest: "backups/{{ inventory_hostname }}_lag_{{ lag_id }}.bak"
+      delegate_to: localhost
 
-        - name: Check inbound route-map applied to at least one peer
-          ansible.builtin.set_fact:
-            bgp_policy_ok: >-
-              {{ 'route-map' in bgp_neighbors.stdout[0] | lower }}
+  rescue:
+    - name: Capture configuration error
+      debug:
+        msg: "Port channel configuration failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('Unknown error') }}"
 
-        - name: Check prefix-limit configured for at least one peer
-          ansible.builtin.set_fact:
-            bgp_prefix_limit_ok: >-
-              {{ 'maximum-prefix' in bgp_neighbors.stdout[0] | lower }}
+    - name: Log error details
+      copy:
+        content: |
+          Timestamp: {{ ansible_date_time.iso8601 }}
+          Device: {{ inventory_hostname }}
+          LAG ID: {{ lag_id }}
+          Error: {{ ansible_failed_result.msg | default('Configuration failed') }}
+        dest: "logs/{{ inventory_hostname }}_lag_error.log"
+      delegate_to: localhost
 
-        - name: Compute overall compliance verdict
-          ansible.builtin.set_fact:
-            bgp_audit_status: >-
-              {{ 'COMPLIANT' if (bgp_session_ok and bgp_auth_ok and
-                 bgp_policy_ok and bgp_prefix_limit_ok) else 'NON-COMPLIANT' }}
-
-    - name: Display BGP summary output
-      ansible.builtin.debug:
-        msg: "{{ bgp_summary.stdout_lines[0] }}"
-      when: bgp_summary is defined and bgp_summary is not failed
-
-    - name: Report compliance findings per check
-      ansible.builtin.debug:
-        msg:
-          - "Host            : {{ inventory_hostname }}"
-          - "Sessions OK     : {{ bgp_session_ok | default('N/A') }}"
-          - "MD5 Auth OK     : {{ bgp_auth_ok | default('N/A') }}"
-          - "Route Policy OK : {{ bgp_policy_ok | default('N/A') }}"
-          - "Prefix Limit OK : {{ bgp_prefix_limit_ok | default('N/A') }}"
-          - "Verdict         : {{ bgp_audit_status | default('UNKNOWN') }}"
-      when: bgp_audit_status is defined
-
-    - name: Fail play when violations found and strict mode is enabled
-      ansible.builtin.fail:
-        msg: "{{ inventory_hostname }} BGP compliance check FAILED — see findings above"
-      when:
-        - compliance_fail_on_issues | bool
-        - bgp_audit_status is defined
-        - bgp_audit_status == "NON-COMPLIANT"
-```
+# Inventory Configuration Example:
+# [network_devices]
+# switch1.example.com ansible_host=10.0.0.10 device_os=ios lag_id=1 member_interfaces=['Gi0/0/1','Gi0/0/2']
+# switch2.example.com ansible_host=10.0.0.11 device_os=nxos lag_id=10 member_interfaces=['Eth1/1','Eth1/2','Eth1/3']
+# juniper-sw1.example.com ansible_host=10.0.0.20 device_os=junos lag_id=0 member_interfaces=['ge-0/0/0','ge-0/0/1']
+#
+# Required Variables (group_vars/network_devices/vars.yml):
+# vault_username: network_admin
+# vault_password: (encrypted with ansible-vault)
+# device_os: ios|nxos|junos|iosxr
+# lag_id: integer (1-4094)
+# member_interfaces: list of interface names
