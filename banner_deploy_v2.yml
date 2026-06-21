@@ -1,106 +1,119 @@
 ---
-- name: Configure Port Security on Network Devices
-  hosts: network_devices
-  gather_facts: no
+# banner_deploy_v3.yml
+# Deploys MOTD, login, and exec banners to Cisco IOS devices with pre/post
+# verification and Jinja2-rendered site-specific content. Supports per-site
+# banner customization via host_vars.
+#
+# Inventory example:
+#   [wan_routers]
+#   rtr-core-01 ansible_host=10.0.1.1 site_name="HQ" site_location="New York"
+#   rtr-edge-02 ansible_host=10.0.2.1 site_name="BR1" site_location="Chicago"
+#
+#   [wan_routers:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_net_user }}
+#   ansible_password={{ vault_net_password }}
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_pass={{ vault_enable_secret }}
+#
+# Vault: ansible-vault encrypt_string 'secret' --name 'vault_net_password'
+
+- name: Deploy and verify site-aware banners on IOS WAN routers
+  hosts: wan_routers
+  gather_facts: false
 
   vars:
-    # Device credentials (use: ansible-vault encrypt credentials.yml)
-    ansible_connection: network_cli
-    ansible_network_os: ios
-    ansible_user: "{{ vault_username }}"
-    ansible_password: "{{ vault_password }}"
+    # Vault-backed credentials — define in group_vars/all/vault.yml
+    ansible_user: "{{ vault_net_user }}"
+    ansible_password: "{{ vault_net_password }}"
+    ansible_become_pass: "{{ vault_enable_secret }}"
 
-    port_security_config:
-      - interface: "GigabitEthernet0/0/1"
-        max_mac: 2
-        violation_action: "shutdown"
-      - interface: "GigabitEthernet0/0/2"
-        max_mac: 1
-        violation_action: "restrict"
-      - interface: "GigabitEthernet0/0/3"
-        max_mac: 5
-        violation_action: "protect"
+    site_name: "{{ site_name | default('UNKNOWN') }}"
+    site_location: "{{ site_location | default('UNKNOWN') }}"
+    legal_entity: "Example Corp."
+
+    banner_motd: |
+      ******************************************************************
+      * AUTHORIZED ACCESS ONLY — {{ legal_entity }}
+      * Site: {{ site_name }} | Location: {{ site_location }}
+      * Unauthorized use is prohibited and subject to prosecution.
+      * All sessions are monitored and recorded.
+      ******************************************************************
+
+    banner_login: |
+      ******************************************************************
+      * {{ legal_entity }} — Restricted Network Device
+      * Authenticate with your assigned credentials.
+      ******************************************************************
+
+    banner_exec: |
+      -- Active session on {{ inventory_hostname }} ({{ site_name }}) --
 
   tasks:
-    - name: Gather current port security status
-      ios_command:
+    - name: Capture existing banner configuration before changes
+      cisco.ios.ios_command:
         commands:
-          - "show port-security"
-          - "show interface status"
-      register: port_sec_status
-      failed_when: false
-
-    - name: Display current port security configuration
-      debug:
-        msg: "Current status on {{ inventory_hostname }}: {{ port_sec_status.stdout_lines[0:5] }}"
-
-    - name: Enable port security on interfaces
-      ios_config:
-        lines:
-          - "switchport mode access"
-          - "switchport port-security"
-          - "switchport port-security maximum {{ item.max_mac }}"
-          - "switchport port-security violation {{ item.violation_action }}"
-          - "switchport port-security aging time 120"
-          - "switchport port-security aging type inactivity"
-        parents: "interface {{ item.interface }}"
-        save_when: modified
-      loop: "{{ port_security_config }}"
-      register: port_sec_deploy
+          - show running-config | section ^banner
+      register: pre_change_banners
       retries: 3
-      delay: 2
-      until: port_sec_deploy is not failed
+      delay: 5
+
+    - name: Deploy all banner types
+      block:
+        - name: Configure MOTD banner
+          cisco.ios.ios_banner:
+            banner: motd
+            text: "{{ banner_motd }}"
+            state: present
+          register: result_motd
+
+        - name: Configure login banner
+          cisco.ios.ios_banner:
+            banner: login
+            text: "{{ banner_login }}"
+            state: present
+          register: result_login
+
+        - name: Configure exec banner
+          cisco.ios.ios_banner:
+            banner: exec
+            text: "{{ banner_exec }}"
+            state: present
+          register: result_exec
+
       rescue:
-        - name: Log port security configuration error
-          debug:
-            msg: "Failed to configure port security on {{ item.interface }}: {{ port_sec_deploy.msg }}"
+        - name: Report banner deployment failure
+          ansible.builtin.debug:
+            msg: >
+              Banner deployment failed on {{ inventory_hostname }}.
+              Error: {{ ansible_failed_result.msg | default('See Ansible output') }}
 
-    - name: Verify port security configuration
-      ios_command:
+        - name: Abort play for this host
+          ansible.builtin.fail:
+            msg: "Manual remediation required on {{ inventory_hostname }}."
+
+    - name: Verify MOTD and login banners present post-change
+      cisco.ios.ios_command:
         commands:
-          - "show port-security interface GigabitEthernet0/0/1"
-      register: port_sec_verify
-      until: "'Port Security' in port_sec_verify.stdout"
-      retries: 3
-      delay: 2
-      failed_when: "'Port Security' not in port_sec_verify.stdout"
-
-    - name: Generate port security configuration report
-      debug:
-        msg: |
-          Port Security Deployment Summary
-          ==================================
-          Device: {{ inventory_hostname }}
-          Interfaces Configured: {{ port_security_config | length }}
-          Deployment Status: SUCCESS
-          Configurations Applied:
-          {% for intf in port_security_config %}
-          - {{ intf.interface }}: Max MAC={{ intf.max_mac }}, Violation={{ intf.violation_action }}
-          {% endfor %}
-
-    - name: Save running configuration to startup
-      ios_command:
-        commands:
-          - "write memory"
-      register: config_save
-      when: port_sec_deploy is changed
+          - show running-config | section ^banner
+      register: post_change_banners
+      failed_when: >
+        ('banner motd' not in post_change_banners.stdout[0]) or
+        ('banner login' not in post_change_banners.stdout[0])
       retries: 2
-      delay: 1
+      delay: 3
 
-    - name: Confirm configuration save
-      debug:
-        msg: "Configuration successfully saved on {{ inventory_hostname }}"
-      when: config_save is changed
+    - name: Persist configuration to NVRAM when changes were made
+      cisco.ios.ios_config:
+        save_when: changed
 
-# Inventory Example:
-# [network_devices]
-# switch01 ansible_host=10.1.1.10 ansible_network_os=ios
-# switch02 ansible_host=10.1.1.11 ansible_network_os=ios
-# switch03 ansible_host=10.1.1.12 ansible_network_os=ios
-#
-# [network_devices:vars]
-# ansible_connection=network_cli
-# vault_username=admin
-# vault_password=!vault |
-#   $ANSIBLE_VAULT;1.1;AES256;production
-#   (encrypted credentials here)
+    - name: Report deployment summary
+      ansible.builtin.debug:
+        msg:
+          - "Device       : {{ inventory_hostname }} ({{ site_name }}, {{ site_location }})"
+          - "MOTD changed : {{ result_motd.changed }}"
+          - "Login changed: {{ result_login.changed }}"
+          - "Exec changed : {{ result_exec.changed }}"
+          - "Verification : PASSED
