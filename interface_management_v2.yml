@@ -1,115 +1,137 @@
----
-# EtherChannel Port-Channel Configuration Playbook
-# Configures LACP-based port-channel bundles on Cisco IOS distribution switches.
-# Provides idempotent LAG setup, LACP negotiation verification, and err-disable detection.
-#
-# Inventory example (inventories/distribution.yml):
-# ---
-# all:
-#   children:
-#     distribution:
-#       hosts:
-#         dist-sw-01:
-#           ansible_host: 10.0.1.1
-#           ansible_network_os: ios
-#           ansible_connection: network_cli
-#           ansible_user: "{{ vault_net_user }}"
-#           ansible_password: "{{ vault_net_pass }}"
-#           ansible_become: true
-#           ansible_become_method: enable
-#           ansible_become_password: "{{ vault_enable_pass }}"
-#         dist-sw-02:
-#           ansible_host: 10.0.1.2
-#           ansible_network_os: ios
-#           ansible_connection: network_cli
-#           ansible_user: "{{ vault_net_user }}"
-#           ansible_password: "{{ vault_net_pass }}"
-#           ansible_become: true
-#           ansible_become_method: enable
-#           ansible_become_password: "{{ vault_enable_pass }}"
-#
-# Credentials are sourced from Ansible Vault.
-# Encrypt with: ansible-vault encrypt_string 'secret' --name vault_net_user
-# Run with:    ansible-playbook etherchannel_config.yml -i inventories/distribution.yml --ask-vault-pass
+The brainstorming skill isn't applicable here — the requirements are fully specified. Writing the VLAN management playbook (a gap in the existing set) now.
 
-- name: Configure EtherChannel Port-Channels (LACP) on IOS Distribution Switches
-  hosts: distribution
+---
+# vlan_management.yml
+# Manages VLAN databases and L2 interface (trunk/access) assignments on Cisco IOS switches.
+# Credentials are stored in Ansible Vault — reference vault_net_user/vault_net_pass/vault_enable_pass
+# in group_vars/all/vault.yml (ansible-vault encrypted).
+#
+# Inventory example:
+#   [cisco_switches]
+#   sw-core-01   ansible_host=10.0.1.1
+#   sw-access-01 ansible_host=10.0.1.2
+#   sw-access-02 ansible_host=10.0.1.3
+#
+#   [cisco_switches:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user="{{ vault_net_user }}"
+#   ansible_password="{{ vault_net_pass }}"
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password="{{ vault_enable_pass }}"
+
+- name: Provision VLANs and L2 interface assignments on Cisco IOS switches
+  hosts: cisco_switches
   gather_facts: false
-  connection: network_cli
 
   vars:
-    ansible_user: "{{ vault_net_user }}"
-    ansible_password: "{{ vault_net_pass }}"
-    ansible_become_password: "{{ vault_enable_pass }}"
+    vlans:
+      - vlan_id: 10
+        name: DATA
+      - vlan_id: 20
+        name: VOICE
+      - vlan_id: 30
+        name: MANAGEMENT
+      - vlan_id: 99
+        name: NATIVE
 
-    lag_bundles:
-      - name: "1"
-        members:
-          - member: GigabitEthernet1/0/1
-            mode: active
-          - member: GigabitEthernet1/0/2
-            mode: active
-      - name: "2"
-        members:
-          - member: GigabitEthernet1/0/3
-            mode: active
-          - member: GigabitEthernet1/0/4
-            mode: active
+    access_interfaces:
+      - name: GigabitEthernet0/1
+        vlan: 10
+      - name: GigabitEthernet0/2
+        vlan: 20
+
+    trunk_interfaces:
+      - name: GigabitEthernet0/24
+        allowed_vlans: "10,20,30,99"
+        native_vlan: 99
 
   tasks:
-    - name: Apply LACP port-channel configuration and verify
+
+    - name: Create or update VLAN database
       block:
-        - name: Configure LAG member interfaces
-          cisco.ios.ios_lag_interfaces:
-            config: "{{ lag_bundles }}"
+        - name: Configure VLANs
+          cisco.ios.ios_vlans:
+            config: "{{ vlans }}"
             state: merged
-          register: lag_result
+          register: vlan_result
           retries: 2
           delay: 5
-          until: lag_result is not failed
+          until: vlan_result is not failed
 
-        - name: Collect EtherChannel and LACP status
-          cisco.ios.ios_command:
-            commands:
-              - show etherchannel summary
-              - show lacp neighbor
-              - show interfaces port-channel 1 status
-          register: ec_status
-          retries: 3
-          delay: 10
-          until: ec_status is not failed
-          failed_when: >
-            'err-disabled' in (ec_status.stdout | join(' '))
-
-        - name: Display EtherChannel operational state
+        - name: Report VLAN provisioning result
           ansible.builtin.debug:
-            msg: "{{ ec_status.stdout_lines }}"
-
-        - name: Report configuration outcome
-          ansible.builtin.debug:
-            msg: >
-              Port-channel configuration on {{ inventory_hostname }}
-              completed — changed: {{ lag_result.changed }}
+            msg: >-
+              {{ inventory_hostname }}: VLAN database
+              {{ 'updated' if vlan_result.changed else 'already compliant' }}
 
       rescue:
-        - name: Collect interface diagnostics on failure
-          cisco.ios.ios_command:
-            commands:
-              - show interfaces GigabitEthernet1/0/1
-              - show interfaces GigabitEthernet1/0/2
-              - show lacp internal
-              - show logging | include LACP
-          register: diag_output
-          ignore_errors: true
-
-        - name: Log failure details and diagnostics
+        - name: Alert on VLAN provisioning failure
           ansible.builtin.debug:
-            msg:
-              - "EtherChannel configuration FAILED on {{ inventory_hostname }}"
-              - "Diagnostics: {{ diag_output.stdout_lines | default(['unavailable']) }}"
+            msg: "VLAN provisioning failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
 
-        - name: Raise fatal error with context
+        - name: Abort on unrecoverable VLAN error
           ansible.builtin.fail:
-            msg: >
-              Port-channel configuration failed on {{ inventory_hostname }}.
-              Check for err-disabled members, LACP mismatch, or reachability issues.
+            msg: "Halting — VLAN provisioning failed on {{ inventory_hostname }}"
+
+    - name: Configure access port VLAN membership
+      block:
+        - name: Set access mode and VLAN assignment
+          cisco.ios.ios_l2_interfaces:
+            config:
+              - name: "{{ item.name }}"
+                mode: access
+                access:
+                  vlan: "{{ item.vlan }}"
+            state: merged
+          loop: "{{ access_interfaces }}"
+          register: access_result
+          failed_when:
+            - access_result.failed
+            - "'Invalid input' in (access_result.msg | default(''))"
+
+        - name: Report access port changes
+          ansible.builtin.debug:
+            msg: "{{ item.item.name }}: {{ 'updated' if item.changed else 'no change' }}"
+          loop: "{{ access_result.results }}"
+
+      rescue:
+        - name: Alert on access port failure
+          ansible.builtin.debug:
+            msg: "Access port config failed on {{ inventory_hostname }}"
+
+    - name: Configure trunk ports with allowed VLANs
+      block:
+        - name: Set trunk mode, allowed VLANs, and native VLAN
+          cisco.ios.ios_l2_interfaces:
+            config:
+              - name: "{{ item.name }}"
+                mode: trunk
+                trunk:
+                  allowed_vlans: "{{ item.allowed_vlans }}"
+                  native_vlan: "{{ item.native_vlan }}"
+            state: merged
+          loop: "{{ trunk_interfaces }}"
+          register: trunk_result
+
+        - name: Report trunk port changes
+          ansible.builtin.debug:
+            msg: "{{ item.item.name }}: {{ 'updated' if item.changed else 'no change' }}"
+          loop: "{{ trunk_result.results }}"
+
+      rescue:
+        - name: Alert on trunk port failure
+          ansible.builtin.debug:
+            msg: "Trunk port config failed on {{ inventory_hostname }}"
+
+    - name: Gather VLAN state for post-change verification
+      cisco.ios.ios_vlans:
+        state: gathered
+      register: vlans_gathered
+
+    - name: Display active VLANs on device
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} active VLANs:
+          {{ vlans_gathered.gathered | map(attribute='vlan_id') | list }}
