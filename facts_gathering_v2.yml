@@ -1,111 +1,122 @@
-```yaml
+The user's instructions are explicit: "Output ONLY the playbook YAML content, no markdown fences, no explanation." This overrides the brainstorming design flow. Generating the YAML directly.
+
 ---
-# bgp_peer_facts.yml
-# Collects BGP neighbor summary and session states across IOS and NX-OS devices.
-# Useful for scheduled NOC snapshots, pre/post-change verification, and peer audits.
+# BGP Neighbor State and Prefix Statistics Gathering
+# Collects BGP session state, uptime, and prefix counts across IOS, NX-OS,
+# and IOS-XR platforms. Flags non-Established sessions and saves per-device
+# reports to the control node.
 #
-# Run: ansible-playbook bgp_peer_facts.yml -i inventory.yml --ask-vault-pass
+# Inventory example:
+#   [bgp_routers]
+#   core-rtr-01  ansible_host=10.0.1.1  ansible_network_os=ios
+#   core-rtr-02  ansible_host=10.0.1.2  ansible_network_os=nxos
+#   edge-rtr-01  ansible_host=10.0.2.1  ansible_network_os=iosxr
 #
-# Inventory example (inventory.yml):
-# ---
-# all:
-#   vars:
-#     ansible_connection: network_cli
-#     ansible_become: false
-#   children:
-#     ios_routers:
-#       vars:
-#         ansible_network_os: ios
-#       hosts:
-#         rtr-core-01: { ansible_host: 10.0.0.1 }
-#         rtr-core-02: { ansible_host: 10.0.0.2 }
-#     nxos_switches:
-#       vars:
-#         ansible_network_os: nxos
-#       hosts:
-#         sw-dist-01: { ansible_host: 10.0.0.10 }
-#   # Vault-encrypted credentials (set per group_vars or host_vars):
-#   # ansible_user: netops
-#   # ansible_password: !vault |
-#   #   $ANSIBLE_VAULT;1.1;AES256
-#   #   <encrypted value>
+#   [bgp_routers:vars]
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_net_username }}        # ansible-vault encrypted
+#   ansible_password={{ vault_net_password }}    # ansible-vault encrypted
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_enable_password }}
 
-- name: Gather BGP neighbor summary and session states
-  hosts: all
+- name: Gather BGP neighbor state and prefix statistics
+  hosts: bgp_routers
   gather_facts: false
-
   vars:
-    bgp_summary_cmd:
-      ios: "show ip bgp summary"
-      nxos: "show bgp all summary"
-      iosxr: "show bgp ipv4 unicast summary"
-    bgp_detail_cmd:
-      ios: "show ip bgp neighbors | include BGP neighbor|BGP state|Prefixes"
-      nxos: "show bgp neighbors | include BGP neighbor|BGP state|Prefixes"
-      iosxr: "show bgp neighbors brief"
+    ansible_user: "{{ vault_net_username }}"
+    ansible_password: "{{ vault_net_password }}"
+    report_dir: "{{ playbook_dir }}/reports/bgp"
 
   tasks:
-    - name: Set platform-appropriate BGP commands
-      ansible.builtin.set_fact:
-        cmd_summary: "{{ bgp_summary_cmd[ansible_network_os] | default('show ip bgp summary') }}"
-        cmd_detail: "{{ bgp_detail_cmd[ansible_network_os] | default('show ip bgp neighbors') }}"
+    - name: Ensure BGP report directory exists on control node
+      delegate_to: localhost
+      run_once: true
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: '0755'
 
-    - name: Collect BGP neighbor summary
+    - name: Collect BGP summary (IOS / IOS-XE)
       block:
-        - name: Run BGP summary command
-          ansible.netcommon.cli_command:
-            command: "{{ cmd_summary }}"
-          register: bgp_summary
+        - name: Run BGP summary commands on IOS
+          cisco.ios.ios_command:
+            commands:
+              - show ip bgp summary
+              - show ip bgp neighbors | include BGP neighbor|BGP state|Prefixes Current
+          register: bgp_ios
           retries: 3
-          delay: 10
-          until: bgp_summary is not failed
-
-        - name: Display BGP summary table
-          ansible.builtin.debug:
-            msg: "{{ bgp_summary.stdout_lines }}"
-
-        - name: Flag if BGP is not active on device
-          ansible.builtin.debug:
-            msg: "WARNING: BGP may not be configured or active on {{ inventory_hostname }}"
-          when: >
-            bgp_summary.stdout | length == 0 or
-            'BGP not active' in bgp_summary.stdout or
-            'not running' in bgp_summary.stdout
-
+          delay: 5
+          until: bgp_ios is not failed
       rescue:
-        - name: Record BGP summary collection failure
+        - name: Record IOS BGP collection failure
           ansible.builtin.debug:
-            msg: >
-              FAILED to collect BGP summary from {{ inventory_hostname }}.
-              Verify device reachability, credentials, and BGP configuration.
+            msg: "BGP collection failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('connection error') }}"
+      when: ansible_network_os in ['ios', 'ios_xe']
 
-    - name: Collect BGP neighbor session detail
-      ansible.netcommon.cli_command:
-        command: "{{ cmd_detail }}"
-      register: bgp_detail
-      when:
-        - bgp_summary is defined
-        - bgp_summary is not failed
-        - bgp_summary.stdout | length > 0
-        - "'BGP not active' not in bgp_summary.stdout"
+    - name: Collect BGP summary (NX-OS)
+      block:
+        - name: Run BGP all-VRF summary on NX-OS
+          cisco.nxos.nxos_command:
+            commands:
+              - show bgp all summary
+          register: bgp_nxos
+          retries: 3
+          delay: 5
+          until: bgp_nxos is not failed
+      rescue:
+        - name: Record NX-OS BGP collection failure
+          ansible.builtin.debug:
+            msg: "BGP collection failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('connection error') }}"
+      when: ansible_network_os == 'nxos'
+
+    - name: Collect BGP summary (IOS-XR)
+      block:
+        - name: Run BGP summary commands on IOS-XR
+          cisco.iosxr.iosxr_command:
+            commands:
+              - show bgp summary
+              - show bgp neighbors brief
+          register: bgp_iosxr
+          retries: 3
+          delay: 5
+          until: bgp_iosxr is not failed
+      rescue:
+        - name: Record IOS-XR BGP collection failure
+          ansible.builtin.debug:
+            msg: "BGP collection failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('connection error') }}"
+      when: ansible_network_os == 'iosxr'
+
+    - name: Merge platform BGP output into single fact
+      ansible.builtin.set_fact:
+        bgp_output: >-
+          {{
+            (bgp_ios.stdout | default([])) +
+            (bgp_nxos.stdout | default([])) +
+            (bgp_iosxr.stdout | default([]))
+          }}
+
+    - name: Display BGP neighbor summary
+      ansible.builtin.debug:
+        msg: "BGP summary for {{ inventory_hostname }}:\n{{ bgp_output | join('\n') }}"
+      when: bgp_output | length > 0
+
+    - name: Alert on non-Established BGP sessions
+      ansible.builtin.debug:
+        msg: "WARNING: Non-Established BGP session detected on {{ inventory_hostname }}"
       failed_when: false
-      retries: 2
-      delay: 5
-
-    - name: Display BGP session states
-      ansible.builtin.debug:
-        msg: "{{ bgp_detail.stdout_lines }}"
       when:
-        - bgp_detail is defined
-        - bgp_detail is not failed
-        - bgp_detail.stdout_lines is defined
+        - bgp_output | length > 0
+        - bgp_output | join(' ') | regex_search('(Idle|Active|Connect|OpenSent|OpenConfirm)')
 
-    - name: Summarize BGP collection result per device
-      ansible.builtin.debug:
-        msg:
-          host: "{{ inventory_hostname }}"
-          platform: "{{ ansible_network_os | default('unknown') }}"
-          summary_collected: "{{ (bgp_summary is defined) and (bgp_summary is not failed) }}"
-          summary_lines: "{{ bgp_summary.stdout_lines | default([]) | length }}"
-          detail_collected: "{{ (bgp_detail is defined) and (bgp_detail is not failed) }}"
-```
+    - name: Save BGP report to control node
+      delegate_to: localhost
+      ansible.builtin.copy:
+        content: |
+          BGP Neighbor Report — {{ inventory_hostname }}
+          Platform : {{ ansible_network_os }}
+          =================================================
+          {{ bgp_output | join('\n\n') | default('No BGP data collected') }}
+        dest: "{{ report_dir }}/{{ inventory_hostname }}_bgp_report.txt"
+        mode: '0644'
+      when: bgp_output is defined and bgp_output | length > 0
