@@ -1,125 +1,111 @@
 ---
-# Ansible Playbook: QoS Policy Deployment
-# Purpose: Deploy DiffServ classification, marking, and queuing policies on IOS WAN edge routers
-# Modules: cisco.ios.ios_config, cisco.ios.ios_command, cisco.ios.ios_facts
-#
 # Inventory example:
-# [wan_edges]
-# core-r1 ansible_host=10.0.0.1 wan_interface=GigabitEthernet0/0/0
-# core-r2 ansible_host=10.0.0.2 wan_interface=GigabitEthernet0/0/1
+# [routers]
+# core-rtr-01 ansible_host=10.0.1.1
+# core-rtr-02 ansible_host=10.0.1.2
 #
-# [wan_edges:vars]
+# [routers:vars]
 # ansible_network_os=ios
 # ansible_connection=network_cli
-# ansible_user={{ vault_net_username }}
-# ansible_password={{ vault_net_password }}
+# ansible_user={{ vault_net_username }}      # store in ansible-vault encrypted vars
+# ansible_password={{ vault_net_password }}  # ansible-vault encrypt_string 'secret'
 # ansible_become=yes
 # ansible_become_method=enable
 # ansible_become_password={{ vault_enable_password }}
 
-- name: Deploy DiffServ QoS policies on WAN edge routers
-  hosts: wan_edges
+- name: Deploy OSPF routing configuration to Cisco IOS devices
+  hosts: routers
   gather_facts: false
+
   vars:
-    # Credentials loaded from Ansible Vault — ansible-vault encrypt_string 'value' --name 'vault_net_password'
-    qos_policy_name: "WAN-EDGE-OUT"
-    wan_interface: "{{ hostvars[inventory_hostname]['wan_interface'] | default('GigabitEthernet0/0/0') }}"
+    ospf_process_id: 1
+    ospf_router_id: "{{ ansible_host }}"
+    ospf_areas:
+      - area: 0
+        networks:
+          - prefix: "10.0.0.0"
+            wildcard: "0.0.255.255"
+      - area: 10
+        networks:
+          - prefix: "192.168.10.0"
+            wildcard: "0.0.0.255"
+    ospf_passive_interfaces:
+      - Loopback0
+    ospf_timers:
+      hello: 10
+      dead: 40
+    max_retries: 3
+    retry_delay: 5
 
   tasks:
-    - name: Collect interface and running-config facts
-      cisco.ios.ios_facts:
-        gather_subset:
-          - config
-          - interfaces
-      register: device_facts
+    - name: Verify device reachability before OSPF changes
+      cisco.ios.ios_command:
+        commands: show version
+      register: pre_check
+      retries: "{{ max_retries }}"
+      delay: "{{ retry_delay }}"
+      until: pre_check.failed is false
 
-    - name: Deploy QoS class maps and policy map
+    - name: Deploy OSPF process and network statements
       block:
-        - name: Configure DSCP-based class maps
+        - name: Configure OSPF process, router-id, and network advertisements
           cisco.ios.ios_config:
             lines:
-              - "class-map match-any QOS-VOICE"
-              - " match dscp ef"
-              - " match dscp cs5"
-              - "class-map match-any QOS-VIDEO"
-              - " match dscp af41"
-              - " match dscp cs4"
-              - "class-map match-any QOS-CRITICAL"
-              - " match dscp af31"
-              - " match dscp af32"
-              - " match dscp cs3"
-              - "class-map match-any QOS-BULK"
-              - " match dscp af11"
-              - " match dscp af12"
-            match: exact
-          register: classmap_result
-          retries: 2
-          delay: 5
-          until: classmap_result is not failed
+              - "router-id {{ ospf_router_id }}"
+              - "auto-cost reference-bandwidth 10000"
+              - "{% for area in ospf_areas %}{% for net in area.networks %}network {{ net.prefix }} {{ net.wildcard }} area {{ area.area }}\n{% endfor %}{% endfor %}"
+              - "{% for iface in ospf_passive_interfaces %}passive-interface {{ iface }}\n{% endfor %}"
+              - "timers throttle spf 50 200 5000"
+            parents: "router ospf {{ ospf_process_id }}"
+          register: ospf_config_result
+          notify: Save running config
 
-        - name: Configure hierarchical QoS policy map
-          cisco.ios.ios_config:
-            lines:
-              - "policy-map {{ qos_policy_name }}"
-              - " class QOS-VOICE"
-              - "  priority percent 20"
-              - "  police rate percent 20 conform-action transmit exceed-action drop"
-              - " class QOS-VIDEO"
-              - "  bandwidth percent 25"
-              - "  random-detect dscp-based"
-              - " class QOS-CRITICAL"
-              - "  bandwidth percent 20"
-              - " class QOS-BULK"
-              - "  bandwidth percent 10"
-              - "  shape average percent 10"
-              - " class class-default"
-              - "  fair-queue"
-              - "  bandwidth percent 25"
-            match: exact
-          register: policymap_result
-          retries: 2
-          delay: 5
-          until: policymap_result is not failed
-
-        - name: Apply service policy to WAN egress interface
-          cisco.ios.ios_config:
-            lines:
-              - "service-policy output {{ qos_policy_name }}"
-            parents: "interface {{ wan_interface }}"
-          register: servicepolicy_result
-
-        - name: Persist configuration to NVRAM
-          cisco.ios.ios_config:
-            save_when: changed
+        - name: Set OSPF hello/dead timers per area network interface
+          cisco.ios.ios_command:
+            commands:
+              - "show ip ospf neighbor"
+              - "show ip ospf"
+          register: ospf_verify
+          failed_when: >
+            ospf_verify.stdout[1] is not search('Routing Process') or
+            ospf_verify.failed
 
       rescue:
-        - name: Report deployment failure details
+        - name: Log OSPF configuration failure
           ansible.builtin.debug:
-            msg: "QoS deployment failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
+            msg: >
+              OSPF deployment failed on {{ inventory_hostname }} ({{ ansible_host }}).
+              Error: {{ ansible_failed_result.msg | default('unknown error') }}
 
-        - name: Remove partial QoS policy on rollback
+        - name: Attempt OSPF rollback by removing process
           cisco.ios.ios_config:
             lines:
-              - "no policy-map {{ qos_policy_name }}"
-            match: line
+              - "no router ospf {{ ospf_process_id }}"
           ignore_errors: true
 
-        - name: Abort with rollback notice
+        - name: Abort play for failed host
           ansible.builtin.fail:
-            msg: "QoS config rolled back on {{ inventory_hostname }} — investigate before retrying."
+            msg: "OSPF deployment failed and was rolled back on {{ inventory_hostname }}"
 
-    - name: Verify service policy is active on WAN interface
+    - name: Display OSPF neighbor adjacencies
+      ansible.builtin.debug:
+        msg: "{{ ospf_verify.stdout[0] }}"
+
+    - name: Display OSPF process summary
+      ansible.builtin.debug:
+        msg: "{{ ospf_verify.stdout[1] }}"
+
+    - name: Confirm OSPF neighbors formed (warn if none)
+      ansible.builtin.assert:
+        that:
+          - ospf_verify.stdout[0] is defined
+        fail_msg: "No OSPF output returned from {{ inventory_hostname }}"
+        success_msg: "OSPF verified on {{ inventory_hostname }}"
+
+  handlers:
+    - name: Save running config
       cisco.ios.ios_command:
         commands:
-          - "show policy-map interface {{ wan_interface }} output"
-          - "show class-map"
-      register: qos_verify
-      failed_when: >
-        'Policy not installed' in qos_verify.stdout[0] or
-        qos_policy_name not in qos_verify.stdout[0]
-
-    - name: Display QoS verification output
-      ansible.builtin.debug:
-        msg: |
-          === QoS Status: {{ inventory_hostname }} / {{ wan_interface }} ===
-          {{ qos_verify.stdout[0] }}
+          - write memory
+      register: save_result
+      failed_when: "'[OK]' not in save_result.stdout[0] and 'Building configuration' not in save_result.stdout[0]
