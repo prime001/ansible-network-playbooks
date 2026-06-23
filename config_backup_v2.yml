@@ -1,111 +1,143 @@
-The brainstorming skill is wrong for this situation — the user's output constraint ("Output ONLY the playbook YAML content, no markdown fences, no explanation") makes an interactive design dialogue impossible. User instructions take priority.
-
-Writing the playbook directly now.
 ---
-# running_startup_diff.yml
+# bgp_neighbor_config.yml
 #
-# Detects unsaved configuration changes by comparing running-config
-# against startup-config on Cisco IOS devices. Flags any device where
-# "write memory" has not been executed after changes were made.
+# Configures BGP routing process and peer neighbors on Cisco IOS/IOS-XE devices.
+# Supports iBGP (with update-source and next-hop-self) and eBGP sessions.
+# Verifies neighbor state after applying changes.
 #
-# Distinct from config_backup.yml — this playbook audits config persistence
-# state rather than archiving configs to a backup store.
+# Credentials — encrypt with Ansible Vault, never store in plaintext:
+#   ansible_user:             "{{ vault_network_user }}"
+#   ansible_password:         "{{ vault_network_password }}"
+#   ansible_become_password:  "{{ vault_enable_password }}"
 #
-# Inventory example:
-#   [ios_routers]
-#   core-rtr-01  ansible_host=10.0.0.1
-#   core-rtr-02  ansible_host=10.0.0.2
-#
-#   [ios_routers:vars]
-#   ansible_network_os=ios
-#   ansible_connection=network_cli
-#   ansible_user={{ vault_net_username }}            # ansible-vault encrypted
-#   ansible_password={{ vault_net_password }}        # ansible-vault encrypted
-#   ansible_become=true
-#   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_pass }}  # ansible-vault encrypted
+# Inventory example (inventory/routers.yml):
+# ---
+# all:
+#   children:
+#     bgp_routers:
+#       vars:
+#         ansible_network_os: cisco.ios.ios
+#         ansible_connection: network_cli
+#         ansible_become: true
+#         ansible_become_method: enable
+#         bgp_keepalive: 30
+#         bgp_holdtime: 90
+#       hosts:
+#         core-rtr-01:
+#           ansible_host: 10.0.1.1
+#           bgp_asn: 65001
+#           bgp_router_id: 1.1.1.1
+#           bgp_neighbors:
+#             - peer_ip: 10.0.0.2
+#               peer_asn: 65002
+#               description: eBGP-to-ISP-A
+#             - peer_ip: 1.1.1.2
+#               peer_asn: 65001
+#               description: iBGP-to-core-rtr-02
+#               update_source: Loopback0
+#               next_hop_self: true
 
-- name: Detect running vs startup configuration drift on Cisco IOS
-  hosts: ios_routers
+- name: Configure BGP Neighbors on Cisco IOS/IOS-XE
+  hosts: bgp_routers
   gather_facts: false
-  connection: network_cli
-
-  vars:
-    report_dir: "/tmp/config_drift"
-    # Set enforce_save=true to fail the play when unsaved changes are found
-    enforce_save: false
 
   tasks:
-    - name: Create local drift report directory
-      delegate_to: localhost
-      run_once: true
-      ansible.builtin.file:
-        path: "{{ report_dir }}"
-        state: directory
-        mode: "0750"
 
-    - name: Collect running and startup configurations
+    - name: Capture pre-change BGP summary
+      cisco.ios.ios_command:
+        commands:
+          - show ip bgp summary
+      register: bgp_pre_state
+      failed_when: false
+
+    - name: Display current BGP state
+      ansible.builtin.debug:
+        msg: "{{ bgp_pre_state.stdout_lines[0] | default(['BGP not yet configured on ' + inventory_hostname]) }}"
+
+    - name: Configure BGP process and neighbors
       block:
-        - name: Fetch running-config
-          cisco.ios.ios_command:
-            commands:
-              - show running-config
-          register: running_cfg
-          retries: 3
-          delay: 10
-          until: running_cfg is not failed
 
-        - name: Fetch startup-config
+        - name: Set BGP router-id, log changes, and global timers
+          cisco.ios.ios_config:
+            parents: "router bgp {{ bgp_asn }}"
+            lines:
+              - "bgp router-id {{ bgp_router_id }}"
+              - "bgp log-neighbor-changes"
+              - "timers bgp {{ bgp_keepalive | default(30) }} {{ bgp_holdtime | default(90) }}"
+          register: bgp_global_result
+
+        - name: Configure base neighbor remote-as and description
+          cisco.ios.ios_config:
+            parents: "router bgp {{ bgp_asn }}"
+            lines:
+              - "neighbor {{ item.peer_ip }} remote-as {{ item.peer_asn }}"
+              - "neighbor {{ item.peer_ip }} description {{ item.description | default('BGP-peer') }}"
+          loop: "{{ bgp_neighbors }}"
+          loop_control:
+            label: "peer {{ item.peer_ip }} AS{{ item.peer_asn }}"
+
+        - name: Configure update-source for iBGP neighbors using loopback
+          cisco.ios.ios_config:
+            parents: "router bgp {{ bgp_asn }}"
+            lines:
+              - "neighbor {{ item.peer_ip }} update-source {{ item.update_source }}"
+          loop: "{{ bgp_neighbors }}"
+          when: item.update_source is defined
+          loop_control:
+            label: "peer {{ item.peer_ip }}"
+
+        - name: Configure next-hop-self on iBGP neighbors
+          cisco.ios.ios_config:
+            parents: "router bgp {{ bgp_asn }}"
+            lines:
+              - "neighbor {{ item.peer_ip }} next-hop-self"
+          loop: "{{ bgp_neighbors }}"
+          when: item.next_hop_self | default(false)
+          loop_control:
+            label: "peer {{ item.peer_ip }}"
+
+        - name: Activate neighbors in IPv4 unicast address-family
+          cisco.ios.ios_config:
+            parents:
+              - "router bgp {{ bgp_asn }}"
+              - "address-family ipv4"
+            lines:
+              - "neighbor {{ item.peer_ip }} activate"
+          loop: "{{ bgp_neighbors }}"
+          loop_control:
+            label: "peer {{ item.peer_ip }}"
+
+        - name: Save running configuration to NVRAM
           cisco.ios.ios_command:
             commands:
-              - show startup-config
-          register: startup_cfg
+              - write memory
+          register: save_result
           retries: 3
-          delay: 10
-          until: startup_cfg is not failed
+          delay: 5
+          until: "'OK' in save_result.stdout[0] or '[OK]' in save_result.stdout[0]"
 
       rescue:
-        - name: Log collection failure
+
+        - name: Alert on BGP configuration failure
           ansible.builtin.debug:
-            msg: "Cannot retrieve config from {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
+            msg: >-
+              BGP configuration failed on {{ inventory_hostname }}.
+              ASN: {{ bgp_asn }}. Verify neighbor IPs and ASNs are reachable.
+              No automatic rollback performed — review 'show ip bgp summary' manually.
 
-        - name: Abort this host
+        - name: Abort play for this host
           ansible.builtin.fail:
-            msg: "Config fetch failed for {{ inventory_hostname }} after retries — skipping."
+            msg: "BGP configuration aborted on {{ inventory_hostname }} — manual review required."
 
-    - name: Evaluate configuration drift
-      ansible.builtin.set_fact:
-        has_drift: "{{ running_cfg.stdout[0] | trim != startup_cfg.stdout[0] | trim }}"
-        running_line_count: "{{ running_cfg.stdout[0].splitlines() | length }}"
-        startup_line_count: "{{ startup_cfg.stdout[0].splitlines() | length }}"
+    - name: Verify BGP summary post-configuration
+      cisco.ios.ios_command:
+        commands:
+          - show ip bgp summary
+      register: bgp_post_state
+      retries: 3
+      delay: 10
+      until: bgp_post_state is not failed
 
-    - name: Write drift report for devices with unsaved changes
-      delegate_to: localhost
-      ansible.builtin.copy:
-        dest: "{{ report_dir }}/{{ inventory_hostname }}_unsaved_changes.txt"
-        mode: "0640"
-        content: |
-          Device        : {{ inventory_hostname }}
-          Status        : UNSAVED CHANGES DETECTED
-          Running lines : {{ running_line_count }}
-          Startup lines : {{ startup_line_count }}
-          Remediation   : Connect to device and run 'write memory'
-      when: has_drift | bool
-
-    - name: Display drift status per device
+    - name: Display post-change BGP neighbor table
       ansible.builtin.debug:
-        msg: >-
-          {{ inventory_hostname }}:
-          {% if has_drift | bool %}UNSAVED CHANGES — running-config differs from startup-config
-          ({{ running_line_count }} running / {{ startup_line_count }} startup lines).
-          Report: {{ report_dir }}/{{ inventory_hostname }}_unsaved_changes.txt
-          {% else %}CLEAN — running-config matches startup-config.{% endif %}
-
-    - name: Fail play when unsaved changes detected and enforce_save is enabled
-      ansible.builtin.fail:
-        msg: >-
-          {{ inventory_hostname }} has unsaved configuration changes.
-          Run 'write memory' on the device, or re-run with -e enforce_save=false to suppress.
-      when:
-        - has_drift | bool
-        - enforce_save | bool
+        msg: "{{ bgp_post_state.stdout_lines[0] }}
