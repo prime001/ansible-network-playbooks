@@ -1,123 +1,99 @@
 ---
-# aaa_tacacs_config.yml
-# Configures TACACS+ AAA authentication, authorization, and accounting on Cisco IOS.
-# Distinct from user_management.yml (local users) — this manages centralized auth
-# via TACACS+ with a local emergency fallback account for out-of-band recovery.
+# Inventory example:
+# [cisco_ios]
+# rtr-core-01 ansible_host=10.0.1.1
+# rtr-core-02 ansible_host=10.0.1.2
 #
-# Credentials via Ansible Vault:
-#   ansible-vault create group_vars/network/vault.yml
-#   Required vault vars: vault_ansible_user, vault_ansible_password,
-#                        vault_enable_password, vault_tacacs_key,
-#                        vault_emergency_password
-#
-# Inventory example (inventory/hosts.yml):
-# all:
-#   children:
-#     network:
-#       hosts:
-#         core-sw1:
-#           ansible_host: 10.0.1.1
-#         dist-sw1:
-#           ansible_host: 10.0.1.10
-#       vars:
-#         ansible_network_os: ios
-#         ansible_user: "{{ vault_ansible_user }}"
-#         ansible_password: "{{ vault_ansible_password }}"
-#         ansible_become: true
-#         ansible_become_method: enable
-#         ansible_become_password: "{{ vault_enable_password }}"
+# [cisco_ios:vars]
+# ansible_network_os=ios
+# ansible_connection=network_cli
+# ansible_user={{ vault_ssh_user }}         # stored in ansible-vault
+# ansible_password={{ vault_ssh_password }} # stored in ansible-vault
+# ansible_become=true
+# ansible_become_method=enable
+# ansible_become_password={{ vault_enable_password }}
 
-- name: Configure TACACS+ AAA authentication and accounting on Cisco IOS
-  hosts: network
+- name: Deploy SSH public keys for local user accounts on IOS devices
+  hosts: cisco_ios
   gather_facts: false
   vars:
-    tacacs_primary_host: "10.0.0.10"
-    tacacs_backup_host: "10.0.0.11"
-    tacacs_timeout: 5
-    local_fallback_user: "netops-recovery"
-    local_fallback_privilege: 15
+    ansible_user: "{{ vault_ssh_user }}"
+    ansible_password: "{{ vault_ssh_password }}"
+    # SSH RSA public keys per service account — values from ansible-vault
+    # Generate with: ssh-keygen -t rsa -b 4096 -f ~/.ssh/netops_rsa
+    ssh_key_accounts:
+      - username: netops-svc
+        privilege: 15
+        sshkey: "{{ vault_netops_rsa_pubkey }}"
+      - username: readonly-auditor
+        privilege: 5
+        sshkey: "{{ vault_auditor_rsa_pubkey }}"
 
   tasks:
-    - name: Verify device reachability before making changes
+    - name: Confirm SSH service is enabled before key deployment
       cisco.ios.ios_command:
-        commands: "show version"
-      register: version_output
+        commands: show ip ssh
+      register: ssh_check
       retries: 3
-      delay: 5
-      until: version_output is not failed
+      delay: 10
+      until: ssh_check is not failed
+      failed_when: "'SSH Enabled' not in ssh_check.stdout[0]"
+      changed_when: false
 
-    - name: Deploy TACACS+ AAA configuration
+    - name: Deploy RSA public keys to local user accounts
       block:
-        - name: Enable AAA new-model
-          cisco.ios.ios_config:
-            lines:
-              - aaa new-model
+        - name: Apply SSH public key per service account
+          cisco.ios.ios_user:
+            name: "{{ item.username }}"
+            privilege: "{{ item.privilege }}"
+            sshkey: "{{ item.sshkey }}"
+            state: present
+          loop: "{{ ssh_key_accounts }}"
+          loop_control:
+            label: "{{ item.username }} (priv {{ item.privilege }})"
+          register: key_push_results
 
-        - name: Configure primary TACACS+ server
-          cisco.ios.ios_config:
-            parents: "tacacs server TACACS-PRIMARY"
-            lines:
-              - "address ipv4 {{ tacacs_primary_host }}"
-              - "key 0 {{ vault_tacacs_key }}"
-              - "timeout {{ tacacs_timeout }}"
-          no_log: true
+        - name: Verify keys appear in running config
+          cisco.ios.ios_command:
+            commands: "show running-config | section username {{ item.username }}"
+          register: key_verify
+          loop: "{{ ssh_key_accounts }}"
+          loop_control:
+            label: "{{ item.username }}"
+          changed_when: false
+          failed_when: item.username not in key_verify.stdout[0]
 
-        - name: Configure backup TACACS+ server
-          cisco.ios.ios_config:
-            parents: "tacacs server TACACS-BACKUP"
-            lines:
-              - "address ipv4 {{ tacacs_backup_host }}"
-              - "key 0 {{ vault_tacacs_key }}"
-              - "timeout {{ tacacs_timeout }}"
-          no_log: true
-
-        - name: Create TACACS+ server group
-          cisco.ios.ios_config:
-            parents: "aaa group server tacacs+ TACACS-GROUP"
-            lines:
-              - "server name TACACS-PRIMARY"
-              - "server name TACACS-BACKUP"
-
-        - name: Configure AAA authentication and authorization with local fallback
-          cisco.ios.ios_config:
-            lines:
-              - "aaa authentication login default group TACACS-GROUP local"
-              - "aaa authentication enable default group TACACS-GROUP enable"
-              - "aaa authorization exec default group TACACS-GROUP local if-authenticated"
-              - "aaa authorization commands 15 default group TACACS-GROUP local if-authenticated"
-              - "aaa accounting exec default start-stop group TACACS-GROUP"
-              - "aaa accounting commands 15 default start-stop group TACACS-GROUP"
-
-        - name: Ensure local emergency recovery account exists
-          cisco.ios.ios_config:
-            lines:
-              - "username {{ local_fallback_user }} privilege {{ local_fallback_privilege }} algorithm-type scrypt secret {{ vault_emergency_password }}"
-          no_log: true
-
-        - name: Save configuration to NVRAM
-          cisco.ios.ios_config:
-            save_when: modified
+        - name: Report per-account deployment outcome
+          ansible.builtin.debug:
+            msg: >-
+              {{ item.item.username }}: {{ 'key updated' if item.changed else 'key already current' }}
+          loop: "{{ key_push_results.results }}"
+          loop_control:
+            label: "{{ item.item.username }}"
 
       rescue:
-        - name: Report failure with context
+        - name: Report failed device
           ansible.builtin.debug:
-            msg: "AAA deployment failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('check task output above') }}"
+            msg: "SSH key deployment FAILED on {{ inventory_hostname }} — check SSH version (must be v2) and AAA config."
 
-        - name: Fail with remediation guidance
+        - name: Abort with detail
           ansible.builtin.fail:
-            msg: >
-              TACACS+ AAA configuration failed on {{ inventory_hostname }}.
-              Verify: TACACS+ servers reachable, vault vars populated, device in enable mode.
+            msg: >-
+              Key deployment aborted on {{ inventory_hostname }}.
+              Ensure 'ip ssh version 2' and 'aaa new-model' are configured.
 
-    - name: Collect AAA and TACACS+ operational status
+    - name: Audit all local users with SSH keys present
       cisco.ios.ios_command:
         commands:
-          - show aaa servers
-          - show tacacs
-          - show running-config | section aaa
-      register: aaa_status
-      failed_when: false
+          - show running-config | section ^username
+          - show ip ssh
+      register: post_audit
+      changed_when: false
 
-    - name: Display AAA operational status
+    - name: Display post-deployment user and SSH summary
       ansible.builtin.debug:
-        msg: "{{ inventory_hostname }} AAA status:\n{{ aaa_status.stdout | join('\n---\n') }}
+        msg:
+          - "=== Local Users ({{ inventory_hostname }}) ==="
+          - "{{ post_audit.stdout_lines[0] }}"
+          - "=== SSH Status ==="
+          - "{{ post_audit.stdout_lines[1] }}
