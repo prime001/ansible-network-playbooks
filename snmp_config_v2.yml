@@ -1,133 +1,115 @@
 ---
-# snmp_trap_config.yml
-# Configures SNMP trap destinations, notification types, and trap source interface.
-# Complements snmp_config.yml (community strings / polling) by managing the trap/event plane.
-# Supports Cisco IOS/IOS-XE and NX-OS.
+# Ansible Playbook: SNMP Trap Host and Notification Configuration
+# Configures SNMP trap destinations, notification types, and engineID on Cisco IOS
+# Distinct from snmp_config.yml (community/v3 users) — focuses on trap delivery pipeline
 #
-# Credentials are stored in Ansible Vault — encrypt with:
-#   ansible-vault encrypt_string 'value' --name 'vault_net_password'
+# Inventory example (inventory/network_devices.ini):
+# [core_routers]
+# rtr-core-01 ansible_host=10.0.1.1
+# rtr-core-02 ansible_host=10.0.1.2
 #
-# Inventory example:
-#   [core_routers]
-#   rtr-core-01 ansible_host=10.0.1.1 ansible_network_os=ios
-#   rtr-core-02 ansible_host=10.0.1.2 ansible_network_os=ios
+# [core_routers:vars]
+# ansible_network_os=ios
+# ansible_connection=network_cli
+# ansible_user={{ vault_net_user }}
+# ansible_password={{ vault_net_password }}
+# ansible_become=yes
+# ansible_become_method=enable
+# ansible_become_password={{ vault_enable_password }}
 #
-#   [access_switches]
-#   sw-access-01 ansible_host=10.0.2.1 ansible_network_os=nxos
-#
-#   [network_devices:children]
-#   core_routers
-#   access_switches
-#
-#   [network_devices:vars]
-#   ansible_connection=network_cli
-#   ansible_user={{ vault_net_username }}
-#   ansible_password={{ vault_net_password }}
-#   ansible_become=yes
-#   ansible_become_method=enable
-#   ansible_become_password={{ vault_net_enable_secret }}
+# Vault: ansible-vault encrypt_string '<secret>' --name 'vault_net_password'
 
-- name: Configure SNMP trap destinations and notification types
-  hosts: network_devices
+- name: Configure SNMP trap destinations and notification settings
+  hosts: core_routers
   gather_facts: false
 
   vars:
-    # Vault-encrypted — never store plaintext credentials in playbooks
-    snmp_trap_community: "{{ vault_snmp_trap_community }}"
-    snmp_trap_version: "2c"
-    snmp_trap_host: "10.100.0.50"
-    snmp_source_interface: "Loopback0"
-
-    ios_trap_notifications:
+    # Override via host_vars or extra-vars; secrets come from vault
+    snmp_trap_hosts:
+      - host: "10.100.0.50"
+        version: "3"
+        security_name: "trap_user"
+        priv: "priv"
+      - host: "10.100.0.51"
+        version: "2c"
+        community: "{{ vault_snmp_trap_community }}"
+    snmp_trap_source_interface: "Loopback0"
+    snmp_engineid: ""
+    snmp_notification_types:
       - "bgp"
       - "config"
-      - "cpu threshold"
-      - "eigrp"
-      - "ospf state-change"
-      - "snmp linkdown"
-      - "snmp linkup"
+      - "envmon"
+      - "hsrp"
+      - "ospf"
       - "syslog"
+    max_retries: 2
+    retry_delay: 5
 
   tasks:
-    - name: Confirm device is reachable before making changes
-      ansible.netcommon.cli_command:
-        command: show version
-      register: pre_check
-      retries: 3
-      delay: 5
-      until: pre_check is not failed
-
-    - name: Apply SNMP trap configuration (IOS/IOS-XE)
+    - name: Apply SNMP trap configuration
       block:
-        - name: Set trap host and source interface
+        - name: Configure SNMP trap source interface
           cisco.ios.ios_config:
             lines:
-              - "snmp-server host {{ snmp_trap_host }} version {{ snmp_trap_version }} {{ snmp_trap_community }}"
-              - "snmp-server trap-source {{ snmp_source_interface }}"
-              - "snmp-server enable traps {{ item }}"
-          loop: "{{ ios_trap_notifications }}"
-          register: ios_trap_result
+              - "snmp-server trap-source {{ snmp_trap_source_interface }}"
+          register: trap_source_result
+          retries: "{{ max_retries }}"
+          delay: "{{ retry_delay }}"
+          until: trap_source_result is not failed
 
-        - name: Verify trap host appears in running config
+        - name: Configure SNMP notification types
+          cisco.ios.ios_config:
+            lines: "{{ ['snmp-server enable traps'] | product(snmp_notification_types) | map('join', ' ') | list }}"
+          register: notifications_result
+          retries: "{{ max_retries }}"
+          delay: "{{ retry_delay }}"
+          until: notifications_result is not failed
+
+        - name: Configure SNMP trap destinations
+          cisco.ios.ios_config:
+            lines: >-
+              {% if item.version == '3' %}
+              snmp-server host {{ item.host }} version 3 {{ item.priv }} {{ item.security_name }}
+              {% else %}
+              snmp-server host {{ item.host }} version {{ item.version }} {{ item.community }}
+              {% endif %}
+          loop: "{{ snmp_trap_hosts }}"
+          loop_control:
+            label: "{{ item.host }}"
+          register: trap_hosts_result
+          retries: "{{ max_retries }}"
+          delay: "{{ retry_delay }}"
+          until: trap_hosts_result is not failed
+
+        - name: Verify SNMP trap configuration
           cisco.ios.ios_command:
             commands:
               - show snmp host
-              - show running-config | include snmp-server enable traps
-          register: ios_verify
-          failed_when: snmp_trap_host not in ios_verify.stdout[0]
+              - show snmp trap
+          register: snmp_verification
+          failed_when: snmp_verification.stdout_lines | length == 0
 
-        - name: Display trap configuration summary
+        - name: Display SNMP trap host configuration
           ansible.builtin.debug:
-            msg:
-              - "Host: {{ inventory_hostname }}"
-              - "Trap receiver: {{ snmp_trap_host }}"
-              - "Active traps: {{ ios_verify.stdout_lines[1] }}"
+            msg: "{{ snmp_verification.stdout_lines }}"
 
       rescue:
-        - name: Report failure detail
+        - name: Log SNMP trap configuration failure
           ansible.builtin.debug:
-            msg: "IOS trap config failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('see task output') }}"
+            msg: "SNMP trap configuration failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown error') }}"
 
-        - name: Abort with actionable message
-          ansible.builtin.fail:
-            msg: "SNMP trap configuration could not be applied to {{ inventory_hostname }}. Verify reachability and vault credentials."
-
-      when: ansible_network_os == 'ios'
-
-    - name: Apply SNMP trap configuration (NX-OS)
-      block:
-        - name: Set trap receiver and source interface
-          cisco.nxos.nxos_config:
-            lines:
-              - "snmp-server host {{ snmp_trap_host }} traps version {{ snmp_trap_version }} {{ snmp_trap_community }}"
-              - "snmp-server source-interface traps {{ snmp_source_interface }}"
-              - "snmp-server enable traps bgp"
-              - "snmp-server enable traps config"
-              - "snmp-server enable traps link"
-            match: exact
-          register: nxos_trap_result
-
-        - name: Verify NX-OS trap receiver
-          cisco.nxos.nxos_command:
+        - name: Capture current SNMP state for diagnostics
+          cisco.ios.ios_command:
             commands:
-              - show snmp host
-          register: nxos_verify
-          failed_when: snmp_trap_host not in nxos_verify.stdout[0]
+              - show snmp
+              - show running-config | section snmp
+          register: snmp_diag
+          ignore_errors: true
 
-        - name: Display NX-OS trap summary
+        - name: Display diagnostic output
           ansible.builtin.debug:
-            msg:
-              - "Host: {{ inventory_hostname }}"
-              - "Trap receiver: {{ snmp_trap_host }}"
-              - "SNMP host output: {{ nxos_verify.stdout_lines[0] }}"
+            msg: "{{ snmp_diag.stdout_lines | default(['No diagnostic output available']) }}"
 
-      rescue:
-        - name: Report NX-OS failure
-          ansible.builtin.debug:
-            msg: "NX-OS trap config failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('see task output') }}"
-
-        - name: Abort with actionable message
+        - name: Fail with context
           ansible.builtin.fail:
-            msg: "SNMP trap configuration could not be applied to {{ inventory_hostname }}."
-
-      when: ansible_network_os == 'nxos'
+            msg: "SNMP trap configuration failed on {{ inventory_hostname }} — review diagnostic output above
