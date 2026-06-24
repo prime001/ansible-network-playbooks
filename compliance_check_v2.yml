@@ -1,148 +1,133 @@
 ---
-# Port Channel (LAG) Configuration Playbook
-# Configures link aggregation groups across multi-vendor network devices
-# Supports Cisco IOS, IOS-XR, Juniper, and NXOS platforms
-# Use case: Create redundant links and increase throughput between network devices
+# Security Hardening Compliance Check for Cisco IOS Devices
+# Validates devices against CIS Benchmark / NIST SP 800-53 controls:
+#   - SSH v2 enforcement
+#   - Service password-encryption enabled
+#   - Legacy TCP/UDP small-server services disabled
+#   - IP HTTP server disabled
+#   - IP source-routing disabled
+#   - VTY exec-timeout configured
+#
+# Credentials stored in Ansible Vault — see group_vars/all/vault.yml
+#   ansible-vault encrypt_string 'secret' --name 'vault_net_pass'
+#
+# Inventory example (inventory/network.yml):
+# ---
+# all:
+#   children:
+#     cisco_ios:
+#       hosts:
+#         core-rtr-01:
+#           ansible_host: 192.168.1.1
+#           ansible_network_os: ios
+#           ansible_connection: network_cli
+#           ansible_user: "{{ vault_net_user }}"
+#           ansible_password: "{{ vault_net_pass }}"
+#           ansible_become: true
+#           ansible_become_method: enable
+#           ansible_become_pass: "{{ vault_enable_pass }}"
 
-- name: Configure Port Channel Aggregation
-  hosts: network_devices
-  gather_facts: no
+- name: IOS Security Hardening Compliance Check
+  hosts: cisco_ios
+  gather_facts: false
+
   vars:
-    # Device credentials - store in ansible-vault for production
-    # ansible-vault encrypt group_vars/network_devices/secrets.yml
-    ansible_network_os: "{{ device_os }}"
-    ansible_user: "{{ vault_username }}"
-    ansible_password: "{{ vault_password }}"
-    ansible_connection: network_cli
-    ansible_command_timeout: 60
+    # Vault references — never store plaintext credentials in playbooks
+    # ansible_user: "{{ vault_net_user }}"
+    # ansible_password: "{{ vault_net_pass }}"
+    hardening_controls:
+      - name: SSH version 2 enforced
+        pattern: "ip ssh version 2"
+      - name: Service password-encryption enabled
+        pattern: "service password-encryption"
+      - name: IP source-routing disabled
+        pattern: "no ip source-route"
+      - name: IP HTTP server disabled
+        pattern: "no ip http server"
+      - name: IP HTTPS server disabled
+        pattern: "no ip http secure-server"
+      - name: TCP small-servers disabled
+        pattern: "no service tcp-small-servers"
+      - name: UDP small-servers disabled
+        pattern: "no service udp-small-servers"
+      - name: Finger service disabled
+        pattern: "no service finger|no ip finger"
 
   tasks:
-    - name: Validate port channel configuration variables
-      assert:
-        that:
-          - lag_id is defined
-          - member_interfaces is defined
-          - member_interfaces | length >= 2
-        fail_msg: "lag_id and member_interfaces (minimum 2) are required"
+    - name: Collect and evaluate hardening controls
+      block:
+        - name: Retrieve full running configuration
+          cisco.ios.ios_command:
+            commands:
+              - show running-config
+          register: running_config
+          retries: 3
+          delay: 5
+          until: running_config is not failed
 
-    - name: Configure port channel on Cisco IOS
-      ios_lag_interfaces:
-        config:
-          - name: "Port-channel{{ lag_id }}"
-            members:
-              - member: "{{ item }}"
-                mode: active
-        state: merged
-      loop: "{{ member_interfaces }}"
-      when: device_os == 'ios'
-      register: ios_result
-      retries: 3
-      delay: 5
-      until: ios_result is not failed
+        - name: Evaluate each hardening control against running-config
+          ansible.builtin.set_fact:
+            compliance_results: >-
+              {{
+                compliance_results | default([]) + [{
+                  'check': item.name,
+                  'status': 'PASS' if (running_config.stdout[0] | regex_search(item.pattern)) else 'FAIL'
+                }]
+              }}
+          loop: "{{ hardening_controls }}"
+          loop_control:
+            label: "{{ item.name }}"
 
-    - name: Configure port channel on Cisco NXOS
-      nxos_lag_interfaces:
-        config:
-          - name: "port-channel{{ lag_id }}"
-            members:
-              - member: "{{ item }}"
-                mode: active
-        state: merged
-      loop: "{{ member_interfaces }}"
-      when: device_os == 'nxos'
-      register: nxos_result
-      retries: 3
-      delay: 5
-      until: nxos_result is not failed
+        - name: Check VTY lines for exec-timeout
+          cisco.ios.ios_command:
+            commands:
+              - show running-config | section line vty
+          register: vty_config
+          retries: 2
+          delay: 3
+          until: vty_config is not failed
 
-    - name: Configure port channel on Juniper
-      junos_lag_interfaces:
-        config:
-          - name: "ae{{ lag_id }}"
-            members: "{{ member_interfaces }}"
-        state: merged
-      when: device_os == 'junos'
-      register: junos_result
-      retries: 3
-      delay: 5
-      until: junos_result is not failed
+        - name: Append VTY exec-timeout result
+          ansible.builtin.set_fact:
+            compliance_results: >-
+              {{
+                compliance_results + [{
+                  'check': 'VTY exec-timeout configured',
+                  'status': 'PASS' if (vty_config.stdout[0] | regex_search('exec-timeout [1-9]')) else 'FAIL'
+                }]
+              }}
 
-    - name: Enable LACP on member interfaces (IOS)
-      ios_config:
-        lines:
-          - "channel-group {{ lag_id }} mode active"
-        parents: "interface {{ item }}"
-      loop: "{{ member_interfaces }}"
-      when: device_os == 'ios'
-      register: lacp_config
+        - name: Display individual control results
+          ansible.builtin.debug:
+            msg: "[{{ item.status }}] {{ item.check }}"
+          loop: "{{ compliance_results }}"
+          loop_control:
+            label: "{{ item.check }}"
 
-    - name: Verify port channel operational status
-      cli_command:
-        command: >
-          {% if device_os == 'ios' %}
-          show etherchannel {{ lag_id }} summary
-          {% elif device_os == 'nxos' %}
-          show port-channel {{ lag_id }} summary
-          {% elif device_os == 'junos' %}
-          show interfaces ae{{ lag_id }} brief
-          {% endif %}
-      register: channel_status
-      failed_when: 
-        - "'up' not in channel_status.stdout | lower"
-        - "'active' not in channel_status.stdout | lower"
+        - name: Report failed controls
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }} FAILED controls:
+              {{ compliance_results | selectattr('status', 'eq', 'FAIL') | map(attribute='check') | list }}
+          when: compliance_results | selectattr('status', 'eq', 'FAIL') | list | length > 0
 
-    - name: Display port channel summary
-      debug:
-        msg: |
-          Port Channel Configuration Status
-          ===================================
-          Device: {{ inventory_hostname }}
-          Port Channel: {{ lag_id }}
-          Members: {{ member_interfaces | join(', ') }}
-          Operational: {{ 'YES' if channel_status is succeeded else 'NO' }}
+        - name: Fail play if any hardening control is non-compliant
+          ansible.builtin.assert:
+            that:
+              - compliance_results | selectattr('status', 'eq', 'FAIL') | list | length == 0
+            fail_msg: >-
+              {{ inventory_hostname }} failed
+              {{ compliance_results | selectattr('status', 'eq', 'FAIL') | list | length }}
+              hardening control(s). Remediate before next audit window.
+            success_msg: "{{ inventory_hostname }} is fully compliant with all hardening controls."
 
-    - name: Backup configuration
-      cli_command:
-        command: >
-          {% if device_os == 'ios' %}
-          show running-config | include port-channel
-          {% elif device_os == 'nxos' %}
-          show running-config port-channel
-          {% else %}
-          show configuration interfaces ae{{ lag_id }}
-          {% endif %}
-      register: config_backup
+      rescue:
+        - name: Report connection or execution failure
+          ansible.builtin.debug:
+            msg: >-
+              Compliance check aborted on {{ inventory_hostname }}:
+              {{ ansible_failed_result.msg | default('unknown error') }}
 
-    - name: Save backup locally
-      copy:
-        content: "{{ config_backup.stdout }}"
-        dest: "backups/{{ inventory_hostname }}_lag_{{ lag_id }}.bak"
-      delegate_to: localhost
-
-  rescue:
-    - name: Capture configuration error
-      debug:
-        msg: "Port channel configuration failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('Unknown error') }}"
-
-    - name: Log error details
-      copy:
-        content: |
-          Timestamp: {{ ansible_date_time.iso8601 }}
-          Device: {{ inventory_hostname }}
-          LAG ID: {{ lag_id }}
-          Error: {{ ansible_failed_result.msg | default('Configuration failed') }}
-        dest: "logs/{{ inventory_hostname }}_lag_error.log"
-      delegate_to: localhost
-
-# Inventory Configuration Example:
-# [network_devices]
-# switch1.example.com ansible_host=10.0.0.10 device_os=ios lag_id=1 member_interfaces=['Gi0/0/1','Gi0/0/2']
-# switch2.example.com ansible_host=10.0.0.11 device_os=nxos lag_id=10 member_interfaces=['Eth1/1','Eth1/2','Eth1/3']
-# juniper-sw1.example.com ansible_host=10.0.0.20 device_os=junos lag_id=0 member_interfaces=['ge-0/0/0','ge-0/0/1']
-#
-# Required Variables (group_vars/network_devices/vars.yml):
-# vault_username: network_admin
-# vault_password: (encrypted with ansible-vault)
-# device_os: ios|nxos|junos|iosxr
-# lag_id: integer (1-4094)
-# member_interfaces: list of interface names
+        - name: Abort with explicit failure for pipeline visibility
+          ansible.builtin.fail:
+            msg: "Hardening compliance check could not complete for {{ inventory_hostname }}.
