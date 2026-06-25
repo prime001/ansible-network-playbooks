@@ -1,35 +1,38 @@
-The user's instructions are explicit: "Output ONLY the playbook YAML content, no markdown fences, no explanation." This overrides the brainstorming design flow. Generating the YAML directly.
-
 ---
-# BGP Neighbor State and Prefix Statistics Gathering
-# Collects BGP session state, uptime, and prefix counts across IOS, NX-OS,
-# and IOS-XR platforms. Flags non-Established sessions and saves per-device
-# reports to the control node.
+# Playbook: cdp_lldp_discovery.yml
+# Purpose: Discover Layer 2 adjacencies via CDP and LLDP to map physical network topology.
+#          Targets neighbor/peering data specifically — complements generic facts_gathering.yml
+#          which collects device-level platform and interface facts.
+#
+# Vault: store credentials in group_vars/all/vault.yml (ansible-vault encrypted)
+#   vault_net_user: "netadmin"
+#   vault_net_password: "S3cureP@ss"
+#   vault_enable_password: "En@bleP@ss"
 #
 # Inventory example:
-#   [bgp_routers]
-#   core-rtr-01  ansible_host=10.0.1.1  ansible_network_os=ios
-#   core-rtr-02  ansible_host=10.0.1.2  ansible_network_os=nxos
-#   edge-rtr-01  ansible_host=10.0.2.1  ansible_network_os=iosxr
+#   [core_switches]
+#   core-sw-01  ansible_host=10.0.1.1  ansible_network_os=ios
+#   core-sw-02  ansible_host=10.0.1.2  ansible_network_os=nxos
+#   dist-sw-01  ansible_host=10.0.2.1  ansible_network_os=iosxe
 #
-#   [bgp_routers:vars]
+#   [all:vars]
 #   ansible_connection=network_cli
-#   ansible_user={{ vault_net_username }}        # ansible-vault encrypted
-#   ansible_password={{ vault_net_password }}    # ansible-vault encrypted
-#   ansible_become=yes
+#   ansible_user="{{ vault_net_user }}"
+#   ansible_password="{{ vault_net_password }}"
+#   ansible_become=true
 #   ansible_become_method=enable
-#   ansible_become_password={{ vault_enable_password }}
+#   ansible_become_password="{{ vault_enable_password }}"
 
-- name: Gather BGP neighbor state and prefix statistics
-  hosts: bgp_routers
+- name: CDP and LLDP Neighbor Topology Discovery
+  hosts: network_devices
   gather_facts: false
   vars:
-    ansible_user: "{{ vault_net_username }}"
+    ansible_user: "{{ vault_net_user }}"
     ansible_password: "{{ vault_net_password }}"
-    report_dir: "{{ playbook_dir }}/reports/bgp"
+    report_dir: "/tmp/topology_reports"
 
   tasks:
-    - name: Ensure BGP report directory exists on control node
+    - name: Create local topology report directory
       delegate_to: localhost
       run_once: true
       ansible.builtin.file:
@@ -37,86 +40,95 @@ The user's instructions are explicit: "Output ONLY the playbook YAML content, no
         state: directory
         mode: '0755'
 
-    - name: Collect BGP summary (IOS / IOS-XE)
+    - name: Collect IOS/IOS-XE neighbor tables
+      when: ansible_network_os in ['ios', 'iosxe']
       block:
-        - name: Run BGP summary commands on IOS
+        - name: Run CDP and LLDP show commands on IOS
           cisco.ios.ios_command:
             commands:
-              - show ip bgp summary
-              - show ip bgp neighbors | include BGP neighbor|BGP state|Prefixes Current
-          register: bgp_ios
-          retries: 3
-          delay: 5
-          until: bgp_ios is not failed
-      rescue:
-        - name: Record IOS BGP collection failure
-          ansible.builtin.debug:
-            msg: "BGP collection failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('connection error') }}"
-      when: ansible_network_os in ['ios', 'ios_xe']
+              - show cdp neighbors detail
+              - show lldp neighbors detail
+            retries: 3
+            interval: 10
+          register: ios_neighbors
+          failed_when: >
+            ios_neighbors.failed | default(false) and
+            'not enabled' not in (ios_neighbors.stdout | join(' '))
 
-    - name: Collect BGP summary (NX-OS)
+        - name: Display IOS neighbor summary
+          ansible.builtin.debug:
+            msg:
+              - "=== {{ inventory_hostname }} CDP Neighbors ==="
+              - "{{ ios_neighbors.stdout[0] | default('CDP not enabled or no neighbors found') }}"
+              - "=== {{ inventory_hostname }} LLDP Neighbors ==="
+              - "{{ ios_neighbors.stdout[1] | default('LLDP not enabled or no neighbors found') }}"
+
+      rescue:
+        - name: Warn on IOS neighbor collection failure
+          ansible.builtin.debug:
+            msg: "WARNING: Neighbor discovery failed on {{ inventory_hostname }} — host will be skipped in report"
+
+        - name: Stub neighbor data so report task does not fail
+          ansible.builtin.set_fact:
+            ios_neighbors:
+              stdout:
+                - "ERROR: collection failed"
+                - "ERROR: collection failed"
+
+    - name: Collect NX-OS neighbor tables
+      when: ansible_network_os == 'nxos'
       block:
-        - name: Run BGP all-VRF summary on NX-OS
+        - name: Run CDP and LLDP show commands on NX-OS
           cisco.nxos.nxos_command:
             commands:
-              - show bgp all summary
-          register: bgp_nxos
-          retries: 3
-          delay: 5
-          until: bgp_nxos is not failed
-      rescue:
-        - name: Record NX-OS BGP collection failure
+              - show cdp neighbors detail
+              - show lldp neighbors detail
+            retries: 3
+            interval: 10
+          register: nxos_neighbors
+
+        - name: Display NX-OS neighbor summary
           ansible.builtin.debug:
-            msg: "BGP collection failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('connection error') }}"
-      when: ansible_network_os == 'nxos'
+            msg:
+              - "=== {{ inventory_hostname }} CDP Neighbors ==="
+              - "{{ nxos_neighbors.stdout[0] | default('No CDP neighbors detected') }}"
+              - "=== {{ inventory_hostname }} LLDP Neighbors ==="
+              - "{{ nxos_neighbors.stdout[1] | default('No LLDP neighbors detected') }}"
 
-    - name: Collect BGP summary (IOS-XR)
-      block:
-        - name: Run BGP summary commands on IOS-XR
-          cisco.iosxr.iosxr_command:
-            commands:
-              - show bgp summary
-              - show bgp neighbors brief
-          register: bgp_iosxr
-          retries: 3
-          delay: 5
-          until: bgp_iosxr is not failed
       rescue:
-        - name: Record IOS-XR BGP collection failure
+        - name: Warn on NX-OS neighbor collection failure
           ansible.builtin.debug:
-            msg: "BGP collection failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('connection error') }}"
-      when: ansible_network_os == 'iosxr'
+            msg: "WARNING: NX-OS neighbor discovery failed on {{ inventory_hostname }}"
 
-    - name: Merge platform BGP output into single fact
-      ansible.builtin.set_fact:
-        bgp_output: >-
-          {{
-            (bgp_ios.stdout | default([])) +
-            (bgp_nxos.stdout | default([])) +
-            (bgp_iosxr.stdout | default([]))
-          }}
+        - name: Stub NX-OS neighbor data on failure
+          ansible.builtin.set_fact:
+            nxos_neighbors:
+              stdout:
+                - "ERROR: collection failed"
+                - "ERROR: collection failed"
 
-    - name: Display BGP neighbor summary
-      ansible.builtin.debug:
-        msg: "BGP summary for {{ inventory_hostname }}:\n{{ bgp_output | join('\n') }}"
-      when: bgp_output | length > 0
-
-    - name: Alert on non-Established BGP sessions
-      ansible.builtin.debug:
-        msg: "WARNING: Non-Established BGP session detected on {{ inventory_hostname }}"
-      failed_when: false
-      when:
-        - bgp_output | length > 0
-        - bgp_output | join(' ') | regex_search('(Idle|Active|Connect|OpenSent|OpenConfirm)')
-
-    - name: Save BGP report to control node
+    - name: Persist topology report to Ansible controller
       delegate_to: localhost
+      vars:
+        cdp_out: >-
+          {{ (ios_neighbors | default(nxos_neighbors | default({'stdout': ['N/A', 'N/A']}))).stdout[0] }}
+        lldp_out: >-
+          {{ (ios_neighbors | default(nxos_neighbors | default({'stdout': ['N/A', 'N/A']}))).stdout[1] }}
       ansible.builtin.copy:
         content: |
-          BGP Neighbor Report — {{ inventory_hostname }}
+          Topology Discovery Report
+          Host     : {{ inventory_hostname }}
           Platform : {{ ansible_network_os }}
-          =================================================
-          {{ bgp_output | join('\n\n') | default('No BGP data collected') }}
-        dest: "{{ report_dir }}/{{ inventory_hostname }}_bgp_report.txt"
+          ============================================================
+          CDP NEIGHBORS:
+          {{ cdp_out }}
+
+          LLDP NEIGHBORS:
+          {{ lldp_out }}
+        dest: "{{ report_dir }}/{{ inventory_hostname }}_topology.txt"
         mode: '0644'
-      when: bgp_output is defined and bgp_output | length > 0
+
+    - name: Print report path
+      delegate_to: localhost
+      ansible.builtin.debug:
+        msg: "Topology report saved to {{ report_dir }}/{{ inventory_hostname }}_topology.txt
