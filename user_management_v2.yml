@@ -1,99 +1,124 @@
 ---
-# Inventory example:
-# [cisco_ios]
-# rtr-core-01 ansible_host=10.0.1.1
-# rtr-core-02 ansible_host=10.0.1.2
+# Playbook: aaa_ssh_hardening.yml
+# Purpose: Configure AAA new-model, TACACS+, SSH v2 hardening, and VTY
+#          access controls — complements user_management.yml by establishing
+#          the authentication framework those accounts operate within.
 #
-# [cisco_ios:vars]
-# ansible_network_os=ios
-# ansible_connection=network_cli
-# ansible_user={{ vault_ssh_user }}         # stored in ansible-vault
-# ansible_password={{ vault_ssh_password }} # stored in ansible-vault
-# ansible_become=true
-# ansible_become_method=enable
-# ansible_become_password={{ vault_enable_password }}
+# Inventory example:
+#   [ios_routers]
+#   core-rtr-01 ansible_host=10.0.1.1
+#   edge-rtr-01 ansible_host=10.0.1.2
+#
+#   [ios_routers:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_ssh_username }}
+#   ansible_password={{ vault_ssh_password }}
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_enable_password }}
 
-- name: Deploy SSH public keys for local user accounts on IOS devices
-  hosts: cisco_ios
+- name: Harden AAA, SSH v2, and VTY access controls on Cisco IOS devices
+  hosts: ios_routers
   gather_facts: false
+  connection: network_cli
+
   vars:
-    ansible_user: "{{ vault_ssh_user }}"
-    ansible_password: "{{ vault_ssh_password }}"
-    # SSH RSA public keys per service account — values from ansible-vault
-    # Generate with: ssh-keygen -t rsa -b 4096 -f ~/.ssh/netops_rsa
-    ssh_key_accounts:
-      - username: netops-svc
-        privilege: 15
-        sshkey: "{{ vault_netops_rsa_pubkey }}"
-      - username: readonly-auditor
-        privilege: 5
-        sshkey: "{{ vault_auditor_rsa_pubkey }}"
+    aaa_list_name: "default"
+    tacacs_server_name: "TACACS-PRIMARY"
+    tacacs_server_ip: "{{ vault_tacacs_server_ip }}"   # stored in ansible-vault
+    tacacs_key: "{{ vault_tacacs_key }}"               # stored in ansible-vault
+    ssh_version: 2
+    ssh_timeout: 60
+    ssh_auth_retries: 3
+    vty_exec_timeout: "5 0"
 
   tasks:
-    - name: Confirm SSH service is enabled before key deployment
-      cisco.ios.ios_command:
-        commands: show ip ssh
-      register: ssh_check
-      retries: 3
-      delay: 10
-      until: ssh_check is not failed
-      failed_when: "'SSH Enabled' not in ssh_check.stdout[0]"
-      changed_when: false
+    - name: Enable service password-encryption globally
+      cisco.ios.ios_config:
+        lines:
+          - service password-encryption
+      register: pw_encrypt_result
 
-    - name: Deploy RSA public keys to local user accounts
+    - name: Configure TACACS+ server with local authentication fallback
       block:
-        - name: Apply SSH public key per service account
-          cisco.ios.ios_user:
-            name: "{{ item.username }}"
-            privilege: "{{ item.privilege }}"
-            sshkey: "{{ item.sshkey }}"
-            state: present
-          loop: "{{ ssh_key_accounts }}"
-          loop_control:
-            label: "{{ item.username }} (priv {{ item.privilege }})"
-          register: key_push_results
+        - name: Define TACACS+ server entry
+          cisco.ios.ios_config:
+            lines:
+              - "address ipv4 {{ tacacs_server_ip }}"
+              - "key {{ tacacs_key }}"
+              - timeout 5
+            parents: "tacacs server {{ tacacs_server_name }}"
+          register: tacacs_config_result
 
-        - name: Verify keys appear in running config
-          cisco.ios.ios_command:
-            commands: "show running-config | section username {{ item.username }}"
-          register: key_verify
-          loop: "{{ ssh_key_accounts }}"
-          loop_control:
-            label: "{{ item.username }}"
-          changed_when: false
-          failed_when: item.username not in key_verify.stdout[0]
-
-        - name: Report per-account deployment outcome
-          ansible.builtin.debug:
-            msg: >-
-              {{ item.item.username }}: {{ 'key updated' if item.changed else 'key already current' }}
-          loop: "{{ key_push_results.results }}"
-          loop_control:
-            label: "{{ item.item.username }}"
+        - name: Enable AAA new-model and configure method lists
+          cisco.ios.ios_config:
+            lines:
+              - aaa new-model
+              - "aaa authentication login {{ aaa_list_name }} group tacacs+ local"
+              - "aaa authorization exec {{ aaa_list_name }} group tacacs+ local if-authenticated"
+              - "aaa accounting exec {{ aaa_list_name }} start-stop group tacacs+"
+          register: aaa_config_result
 
       rescue:
-        - name: Report failed device
+        - name: Report TACACS+ failure and apply local-only fallback
           ansible.builtin.debug:
-            msg: "SSH key deployment FAILED on {{ inventory_hostname }} — check SSH version (must be v2) and AAA config."
-
-        - name: Abort with detail
-          ansible.builtin.fail:
             msg: >-
-              Key deployment aborted on {{ inventory_hostname }}.
-              Ensure 'ip ssh version 2' and 'aaa new-model' are configured.
+              TACACS+ config failed on {{ inventory_hostname }}
+              ({{ ansible_failed_result.msg | default('unknown error') }}).
+              Applying local-only authentication fallback.
 
-    - name: Audit all local users with SSH keys present
+        - name: Fallback to local-only authentication
+          cisco.ios.ios_config:
+            lines:
+              - aaa new-model
+              - "aaa authentication login {{ aaa_list_name }} local"
+              - "aaa authorization exec {{ aaa_list_name }} local if-authenticated"
+
+    - name: Enforce SSH version 2 with hardened parameters
+      cisco.ios.ios_config:
+        lines:
+          - "ip ssh version {{ ssh_version }}"
+          - "ip ssh time-out {{ ssh_timeout }}"
+          - "ip ssh authentication-retries {{ ssh_auth_retries }}"
+          - ip ssh logging events
+      register: ssh_harden_result
+      retries: 2
+      delay: 5
+      until: ssh_harden_result is not failed
+
+    - name: Restrict VTY lines 0-15 to SSH only with exec-timeout
+      cisco.ios.ios_config:
+        lines:
+          - transport input ssh
+          - "exec-timeout {{ vty_exec_timeout }}"
+          - logging synchronous
+          - "login authentication {{ aaa_list_name }}"
+        parents: line vty 0 15
+      register: vty_config_result
+
+    - name: Disable telnet on console line (belt-and-suspenders)
+      cisco.ios.ios_config:
+        lines:
+          - "exec-timeout {{ vty_exec_timeout }}"
+          - "login authentication {{ aaa_list_name }}"
+          - logging synchronous
+        parents: line con 0
+      register: con_config_result
+
+    - name: Verify SSH is enabled and AAA servers are configured
       cisco.ios.ios_command:
         commands:
-          - show running-config | section ^username
           - show ip ssh
-      register: post_audit
-      changed_when: false
+          - show aaa servers
+          - show running-config | include ^aaa
+      register: verify_output
+      failed_when: "'SSH Disabled' in verify_output.stdout[0]"
 
-    - name: Display post-deployment user and SSH summary
+    - name: Display post-configuration verification summary
       ansible.builtin.debug:
         msg:
-          - "=== Local Users ({{ inventory_hostname }}) ==="
-          - "{{ post_audit.stdout_lines[0] }}"
-          - "=== SSH Status ==="
-          - "{{ post_audit.stdout_lines[1] }}
+          - "=== {{ inventory_hostname }} AAA/SSH Hardening Summary ==="
+          - "SSH Status: {{ verify_output.stdout[0] | regex_search('SSH Enabled.*') | default('check output manually') }}"
+          - "AAA Config Lines: {{ verify_output.stdout[2].splitlines() | length }} entries"
+          - "AAA Servers: {{ verify_output.stdout[1] }}
