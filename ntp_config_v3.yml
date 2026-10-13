@@ -1,0 +1,125 @@
+---
+# ntp_auth_config.yml
+#
+# Hardens NTP by configuring MD5 authentication keys on Cisco IOS/IOS-XE devices,
+# then validates that the device achieves synchronization within an acceptable
+# stratum. Complements ntp_config.yml (server setup) with the authentication layer.
+#
+# Inventory example:
+#   [core_routers]
+#   rtr-core-01  ansible_host=10.1.1.1
+#   rtr-core-02  ansible_host=10.1.1.2
+#
+#   [core_routers:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_net_user }}              # ansible-vault encrypted
+#   ansible_password={{ vault_net_password }}      # ansible-vault encrypted
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_enable_password }}
+#
+# Usage:
+#   ansible-playbook ntp_auth_config.yml -i inventory.ini --ask-vault-pass
+
+- name: Configure NTP MD5 Authentication and Validate Synchronization
+  hosts: core_routers
+  gather_facts: false
+
+  vars:
+    ntp_key_id: 1
+    ntp_auth_key: "{{ vault_ntp_auth_key }}"    # ansible-vault: vault_ntp_auth_key
+    ntp_primary_server: "10.0.0.10"
+    ntp_secondary_server: "10.0.0.11"
+    ntp_max_stratum: 5                           # alert if device syncs above this stratum
+    ntp_sync_retries: 4
+    ntp_sync_delay: 15                           # seconds between sync checks
+
+  tasks:
+    - name: Apply NTP authentication configuration
+      block:
+        - name: Push NTP authenticate, key, trusted-key, and server association
+          cisco.ios.ios_config:
+            lines:
+              - "ntp authenticate"
+              - "ntp authentication-key {{ ntp_key_id }} md5 {{ ntp_auth_key }}"
+              - "ntp trusted-key {{ ntp_key_id }}"
+              - "ntp server {{ ntp_primary_server }} key {{ ntp_key_id }} prefer"
+              - "ntp server {{ ntp_secondary_server }} key {{ ntp_key_id }}"
+            save_when: changed
+          register: ntp_auth_result
+
+        - name: Verify NTP authentication lines present in running config
+          cisco.ios.ios_command:
+            commands:
+              - show running-config | include ^ntp
+          register: ntp_running_cfg
+          failed_when: >
+            'ntp authenticate' not in ntp_running_cfg.stdout[0] or
+            ('ntp trusted-key ' ~ ntp_key_id | string) not in ntp_running_cfg.stdout[0]
+
+      rescue:
+        - name: Report authentication configuration failure
+          ansible.builtin.debug:
+            msg: >
+              NTP auth config FAILED on {{ inventory_hostname }}:
+              {{ ansible_failed_result.msg | default('see task output above') }}
+
+        - name: Halt this host — config did not apply cleanly
+          ansible.builtin.fail:
+            msg: "Halting {{ inventory_hostname }} — NTP auth configuration error requires manual investigation."
+
+    - name: Poll NTP status until synchronized (post-auth change convergence)
+      cisco.ios.ios_command:
+        commands:
+          - show ntp status
+      register: ntp_sync_check
+      retries: "{{ ntp_sync_retries }}"
+      delay: "{{ ntp_sync_delay }}"
+      until: "'synchronized' in ntp_sync_check.stdout[0] | lower"
+      failed_when: false
+
+    - name: Extract stratum from NTP status output
+      ansible.builtin.set_fact:
+        ntp_is_synced: "{{ 'synchronized' in ntp_sync_check.stdout[0] | lower }}"
+        ntp_stratum_raw: "{{ ntp_sync_check.stdout[0] | regex_search('stratum\\s*(\\d+)') | default('stratum 99') }}"
+
+    - name: Resolve stratum integer for threshold comparison
+      ansible.builtin.set_fact:
+        ntp_stratum: "{{ ntp_stratum_raw.split()[-1] | int }}"
+
+    - name: Fail if NTP did not synchronize within retry window
+      ansible.builtin.fail:
+        msg: >
+          {{ inventory_hostname }} NTP unsynchronized after
+          {{ ntp_sync_retries * ntp_sync_delay }}s —
+          verify server reachability and key ID/value match on NTP source.
+      when: not ntp_is_synced
+
+    - name: Assert stratum is within policy threshold
+      ansible.builtin.assert:
+        that:
+          - ntp_stratum | int < ntp_max_stratum | int
+        fail_msg: >
+          {{ inventory_hostname }} NTP stratum {{ ntp_stratum }} exceeds
+          policy maximum of {{ ntp_max_stratum }} — check upstream NTP hierarchy.
+        success_msg: "{{ inventory_hostname }} NTP stratum {{ ntp_stratum }} is within policy (< {{ ntp_max_stratum }})."
+
+    - name: Collect NTP associations for audit record
+      cisco.ios.ios_command:
+        commands:
+          - show ntp associations
+          - show ntp status
+      register: ntp_audit_output
+
+    - name: Display NTP authentication and synchronization summary
+      ansible.builtin.debug:
+        msg:
+          - "=== NTP Auth & Sync Report: {{ inventory_hostname }} ==="
+          - "Config changed this run : {{ ntp_auth_result.changed }}"
+          - "NTP synchronized        : {{ ntp_is_synced }}"
+          - "Stratum                 : {{ ntp_stratum }}"
+          - "Primary server          : {{ ntp_primary_server }}"
+          - "Secondary server        : {{ ntp_secondary_server }}"
+          - "--- NTP Associations ---"
+          - "{{ ntp_audit_output.stdout[0] }}
