@@ -1,0 +1,133 @@
+```yaml
+---
+# routing_compliance_check.yml
+#
+# Verifies routing protocol health and critical route presence on Cisco IOS devices.
+# Checks BGP neighbor states, OSPF adjacencies, and required prefixes in the RIB.
+#
+# Inventory example:
+# [core_routers]
+# core-rtr-01 ansible_host=10.0.1.1
+# core-rtr-02 ansible_host=10.0.1.2
+#
+# [core_routers:vars]
+# ansible_network_os=ios
+# ansible_connection=network_cli
+# ansible_user={{ vault_net_user }}
+# ansible_password={{ vault_net_password }}
+# ansible_become=yes
+# ansible_become_method=enable
+# ansible_become_password={{ vault_enable_password }}
+
+- name: Routing Compliance Check — BGP, OSPF, and RIB Verification
+  hosts: core_routers
+  gather_facts: false
+
+  vars:
+    # Credentials sourced from Ansible Vault — ansible-vault encrypt_string
+    net_user: "{{ vault_net_user }}"
+    net_password: "{{ vault_net_password }}"
+    enable_password: "{{ vault_enable_password }}"
+
+    # Required routes that MUST be present in the routing table
+    required_routes:
+      - "10.0.0.0/8"
+      - "172.16.0.0/12"
+      - "192.168.100.0/24"
+
+    # Minimum acceptable BGP neighbor count before alerting
+    min_bgp_neighbors_established: 1
+
+    compliance_failures: []
+
+  tasks:
+    - name: Collect BGP summary
+      block:
+        - name: Run show ip bgp summary
+          cisco.ios.ios_command:
+            commands:
+              - show ip bgp summary
+          register: bgp_summary_raw
+          retries: 2
+          delay: 5
+          until: bgp_summary_raw is not failed
+
+        - name: Run show ip ospf neighbor
+          cisco.ios.ios_command:
+            commands:
+              - show ip ospf neighbor
+          register: ospf_neighbors_raw
+          retries: 2
+          delay: 5
+          until: ospf_neighbors_raw is not failed
+
+        - name: Run show ip route for each required prefix
+          cisco.ios.ios_command:
+            commands:
+              - "show ip route {{ item }}"
+          register: route_check_raw
+          loop: "{{ required_routes }}"
+          retries: 2
+          delay: 5
+          until: route_check_raw is not failed
+
+      rescue:
+        - name: Record collection failure
+          ansible.builtin.set_fact:
+            compliance_failures: "{{ compliance_failures + ['COLLECTION_ERROR: ' + ansible_host] }}"
+
+        - name: Fail with informative message
+          ansible.builtin.fail:
+            msg: "Failed to collect routing data from {{ inventory_hostname }} after retries."
+
+    - name: Evaluate BGP neighbor states
+      ansible.builtin.set_fact:
+        bgp_not_established: "{{ bgp_summary_raw.stdout[0] | regex_findall('(Idle|Active|Connect|OpenSent|OpenConfirm)') }}"
+
+    - name: Flag BGP neighbors not in Established state
+      ansible.builtin.set_fact:
+        compliance_failures: "{{ compliance_failures + ['BGP_NEIGHBOR_DOWN: ' + item] }}"
+      loop: "{{ bgp_not_established }}"
+      when: bgp_not_established | length > 0
+
+    - name: Evaluate OSPF neighbor adjacencies
+      ansible.builtin.set_fact:
+        ospf_not_full: "{{ ospf_neighbors_raw.stdout[0] | regex_findall('(?:INIT|2WAY|EXSTART|EXCHANGE|LOADING)') }}"
+
+    - name: Flag OSPF adjacencies not in FULL state
+      ansible.builtin.set_fact:
+        compliance_failures: "{{ compliance_failures + ['OSPF_NOT_FULL: ' + item] }}"
+      loop: "{{ ospf_not_full }}"
+      when: ospf_not_full | length > 0
+
+    - name: Evaluate route table presence for required prefixes
+      ansible.builtin.set_fact:
+        compliance_failures: >-
+          {{ compliance_failures + ['MISSING_ROUTE: ' + item.item] }}
+      loop: "{{ route_check_raw.results }}"
+      when: >
+        item.stdout[0] is defined and
+        ('% Network not in table' in item.stdout[0] or
+         '% Subnet not in table' in item.stdout[0])
+
+    - name: Display raw BGP summary
+      ansible.builtin.debug:
+        msg: "{{ bgp_summary_raw.stdout_lines[0] }}"
+
+    - name: Display raw OSPF neighbors
+      ansible.builtin.debug:
+        msg: "{{ ospf_neighbors_raw.stdout_lines[0] }}"
+
+    - name: Display compliance result
+      ansible.builtin.debug:
+        msg: >-
+          HOST={{ inventory_hostname }}
+          STATUS={{ 'FAIL' if compliance_failures | length > 0 else 'PASS' }}
+          FINDINGS={{ compliance_failures if compliance_failures | length > 0 else ['none'] }}
+
+    - name: Fail play if any compliance violations found
+      ansible.builtin.fail:
+        msg: "Routing compliance violations on {{ inventory_hostname }}: {{ compliance_failures | join(', ') }}"
+      when: compliance_failures | length > 0
+      failed_when: compliance_failures | length > 0
+```
