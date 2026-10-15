@@ -1,0 +1,132 @@
+---
+# Route Redistribution Configuration - OSPF to BGP
+# Configures route redistribution from OSPF into BGP with metric application
+# Supports Cisco IOS, IOS-XR, and NXOS network devices
+# Portfolio project demonstrating multi-vendor network automation
+
+- name: Deploy OSPF to BGP Route Redistribution
+  hosts: network_devices
+  gather_facts: no
+  
+  vars:
+    # Vault reference: ansible-vault edit group_vars/network_devices/vault.yml
+    # Contains: vault_username, vault_password
+    ansible_user: "{{ vault_username }}"
+    ansible_password: "{{ vault_password }}"
+    ansible_connection: network_cli
+    
+    bgp_asn: 65000
+    ospf_process_id: 1
+    redistribute_metric: 150
+  
+  tasks:
+    # Pre-change state capture
+    - name: Capture BGP state before configuration
+      ios_command:
+        commands:
+          - show bgp summary
+          - show ip route ospf
+      register: pre_state
+      when: ansible_network_os == 'ios'
+      retries: 2
+      delay: 3
+    
+    - name: Display pre-configuration BGP state
+      debug:
+        msg: "BGP Status on {{ inventory_hostname }}: {{ pre_state.stdout_lines }}"
+      when: pre_state is defined
+    
+    # Configure IOS devices
+    - name: Configure OSPF redistribution to BGP on Cisco IOS
+      ios_config:
+        lines:
+          - "router bgp {{ bgp_asn }}"
+          - " redistribute ospf {{ ospf_process_id }} metric {{ redistribute_metric }}"
+        match: strict
+        backup: yes
+      register: ios_result
+      when: ansible_network_os == 'ios'
+      retries: 3
+      delay: 5
+      failed_when:
+        - ios_result.failed
+    
+    # Configure IOS-XR devices
+    - name: Configure OSPF redistribution to BGP on Cisco IOS-XR
+      iosxr_config:
+        lines:
+          - "router bgp {{ bgp_asn }}"
+          - " address-family ipv4 unicast"
+          - "  redistribute ospf {{ ospf_process_id }} metric {{ redistribute_metric }}"
+        match: strict
+        backup: yes
+      register: iosxr_result
+      when: ansible_network_os == 'iosxr'
+      retries: 3
+      delay: 5
+    
+    # Configure NXOS devices
+    - name: Configure OSPF redistribution to BGP on Cisco NXOS
+      nxos_config:
+        lines:
+          - "router bgp {{ bgp_asn }}"
+          - " address-family ipv4 unicast"
+          - "  redistribute ospf {{ ospf_process_id }} metric {{ redistribute_metric }}"
+        match: strict
+        backup: yes
+      register: nxos_result
+      when: ansible_network_os == 'nxos'
+      retries: 3
+      delay: 5
+    
+    # Post-change validation
+    - name: Verify BGP redistribution configuration on IOS
+      ios_command:
+        commands:
+          - show bgp summary
+          - show ip route bgp summary
+      register: post_state
+      when: ansible_network_os == 'ios'
+      retries: 2
+      delay: 3
+      failed_when: "'router identifier' not in post_state.stdout[0]"
+    
+    - name: Display post-configuration BGP state
+      debug:
+        msg: |
+          Configuration Status for {{ inventory_hostname }}:
+          BGP Summary: {{ post_state.stdout_lines[0] | default('N/A') }}
+          BGP Routes: {{ post_state.stdout_lines[1] | default('N/A') }}
+      when: post_state is defined
+    
+  rescue:
+    - name: Handle configuration failure
+      block:
+        - name: Log configuration error
+          debug:
+            msg: |
+              CONFIGURATION FAILED on {{ inventory_hostname }}
+              Details: {{ ansible_failed_result.msg | default('Unknown error') }}
+        
+        - name: Rollback BGP configuration on IOS
+          ios_config:
+            lines:
+              - "no router bgp {{ bgp_asn }}"
+          when: ansible_network_os == 'ios'
+          ignore_errors: yes
+      always:
+        - name: Alert for manual review
+          debug:
+            msg: "ALERT: {{ inventory_hostname }} requires manual review after failure"
+  
+  # Inventory Example - hosts.yml:
+  # [network_devices]
+  # router_1 ansible_host=192.168.1.10 ansible_network_os=ios device_role=edge
+  # router_2 ansible_host=192.168.1.20 ansible_network_os=iosxr device_role=core
+  # switch_1 ansible_host=192.168.1.30 ansible_network_os=nxos device_role=access
+  #
+  # [network_devices:vars]
+  # ansible_connection=network_cli
+  # ansible_user="{{ vault_username }}"
+  # ansible_password="{{ vault_password }}"
+  # ansible_network_os=ios
