@@ -1,0 +1,138 @@
+The playbook content is ready. Here it is as the raw YAML output:
+
+```
+---
+# qos_policy_deploy.yml
+#
+# Deploys QoS class-maps, policy-maps, and service-policies on Cisco IOS/IOS-XE.
+# Classifies and prioritizes voice, video, and critical-data traffic on WAN
+# interfaces using DSCP markings; guarantees bandwidth per traffic class.
+#
+# Credentials stored in Ansible Vault:
+#   ansible-vault create group_vars/wan_routers/vault.yml
+#   vault_ansible_user: netadmin
+#   vault_ansible_password: <ssh_password>
+#   vault_ansible_become_pass: <enable_secret>
+#
+# Inventory example (inventory/hosts.yml):
+#   all:
+#     children:
+#       wan_routers:
+#         hosts:
+#           rtr-wan-01:
+#             ansible_host: 10.0.1.1
+#           rtr-wan-02:
+#             ansible_host: 10.0.1.2
+#         vars:
+#           ansible_network_os: ios
+#           ansible_connection: network_cli
+#           ansible_user: "{{ vault_ansible_user }}"
+#           ansible_password: "{{ vault_ansible_password }}"
+#           ansible_become: true
+#           ansible_become_method: enable
+#           ansible_become_pass: "{{ vault_ansible_become_pass }}"
+
+- name: Deploy QoS Policy-Maps and Service-Policies on WAN Routers
+  hosts: wan_routers
+  gather_facts: false
+
+  vars:
+    policy_map_name: WAN_EGRESS
+    wan_interfaces:
+      - GigabitEthernet0/0/1
+      - GigabitEthernet0/0/2
+
+  tasks:
+    - name: Configure DSCP-based class-maps
+      cisco.ios.ios_config:
+        lines:
+          - "match dscp {{ item.dscp }}"
+        parents: "class-map match-all {{ item.name }}"
+      loop:
+        - { name: CM_VOICE, dscp: ef }
+        - { name: CM_VIDEO, dscp: af41 }
+        - { name: CM_DATA,  dscp: af31 }
+      register: classmap_result
+      retries: 2
+      delay: 5
+      until: classmap_result is not failed
+
+    - name: Display class-map configuration results
+      ansible.builtin.debug:
+        msg: "{{ item.item.name }} — changed: {{ item.changed }}"
+      loop: "{{ classmap_result.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: Build and apply WAN QoS policy
+      block:
+        - name: Configure policy-map with bandwidth guarantees
+          cisco.ios.ios_config:
+            lines:
+              - "class CM_VOICE"
+              - " priority percent 20"
+              - "class CM_VIDEO"
+              - " bandwidth percent 30"
+              - "class CM_DATA"
+              - " bandwidth percent 25"
+              - "class class-default"
+              - " fair-queue"
+            parents: "policy-map {{ policy_map_name }}"
+          register: policy_map_result
+
+        - name: Apply service-policy outbound to WAN interfaces
+          cisco.ios.ios_config:
+            lines:
+              - "service-policy output {{ policy_map_name }}"
+            parents: "interface {{ item }}"
+          loop: "{{ wan_interfaces }}"
+          register: service_policy_result
+
+      rescue:
+        - name: Capture running policy-map config for diagnostics
+          cisco.ios.ios_command:
+            commands:
+              - "show running-config | section policy-map"
+          register: policy_diag
+          failed_when: false
+
+        - name: Display diagnostic output
+          ansible.builtin.debug:
+            var: policy_diag.stdout_lines
+
+        - name: Fail with descriptive context
+          ansible.builtin.fail:
+            msg: "QoS policy deployment failed on {{ inventory_hostname }} — review debug output above"
+
+    - name: Verify service-policy counters on WAN interfaces
+      cisco.ios.ios_command:
+        commands:
+          - "show policy-map interface {{ item }} output | include Service-policy|Class|packets|drops"
+      loop: "{{ wan_interfaces }}"
+      register: verify_output
+
+    - name: Display per-interface QoS verification
+      ansible.builtin.debug:
+        msg: "{{ item.stdout_lines }}"
+      loop: "{{ verify_output.results }}"
+      loop_control:
+        label: "Interface {{ item.item }}"
+
+    - name: Summarize deployment outcome
+      ansible.builtin.debug:
+        msg:
+          - "Host            : {{ inventory_hostname }}"
+          - "Policy-map      : {{ policy_map_name }}"
+          - "Interfaces      : {{ wan_interfaces | join(', ') }}"
+          - "Class-maps changed : {{ classmap_result.results | selectattr('changed') | list | length }}/{{ classmap_result.results | length }}"
+          - "Policy changed  : {{ policy_map_result.changed }}"
+```
+
+This is a **QoS policy deployment** playbook (~100 lines) that covers distinct ground from the existing SNMP/NTP/syslog/etc. playbooks. Key design choices:
+
+- **`cisco.ios.ios_config`** with `parents:` to scope config hierarchically (class-map → policy-map → interface)
+- **Loop + retry** on class-map config with `until: not failed` / `retries: 2`
+- **`block/rescue`** wraps the policy-map and interface application steps — on failure it captures `show running-config | section policy-map` for diagnostics, then fails cleanly
+- **`ios_command`** for post-apply verification (`show policy-map interface ... output`)
+- **Vault references** in inventory comments; credentials never hardcoded
+- **Summary debug task** at the end shows what changed vs. what was already idempotent
