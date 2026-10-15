@@ -1,0 +1,126 @@
+---
+# Syslog Hardening: source interface pinning, buffer tuning, rate limiting, and
+# facility mapping. Complements syslog_config.yml (server destinations) with
+# operational hardening — does NOT modify syslog server entries.
+#
+# Inventory example:
+#   [routers]
+#   rtr-core-01 ansible_host=10.0.1.1
+#   rtr-edge-01 ansible_host=10.0.1.5
+#
+#   [switches]
+#   sw-dist-01 ansible_host=10.0.2.1
+#
+#   [network:children]
+#   routers
+#   switches
+#
+#   [network:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user="{{ vault_net_username }}"       # ansible-vault encrypted
+#   ansible_password="{{ vault_net_password }}"   # ansible-vault encrypted
+#   ansible_become=yes
+#   ansible_become_method=enable
+
+- name: Syslog Hardening — Buffer, Rate Limiting, Source Interface, and Facility
+  hosts: network
+  gather_facts: false
+  vars:
+    # Credentials from Ansible Vault — see group_vars/network/vault.yml
+    ansible_user: "{{ vault_net_username }}"
+    ansible_password: "{{ vault_net_password }}"
+    ansible_become_password: "{{ vault_net_enable_password }}"
+    syslog_source_interface: "Loopback0"
+    log_buffer_size: 262144          # 256 KB; increase for high-traffic devices
+    log_buffer_severity: "informational"
+    log_rate_limit: 100              # messages/sec; warnings and above are exempt
+    log_facility: "local6"           # local6 = network infrastructure by convention
+
+  tasks:
+    - name: Capture pre-change logging state
+      cisco.ios.ios_command:
+        commands:
+          - show logging
+      register: pre_change_state
+
+    - name: Apply syslog hardening configuration
+      block:
+        - name: Set buffered log size and minimum severity
+          cisco.ios.ios_config:
+            lines:
+              - "logging buffered {{ log_buffer_size }} {{ log_buffer_severity }}"
+
+        - name: Pin syslog source to loopback (prevents source IP flapping on link failure)
+          cisco.ios.ios_config:
+            lines:
+              - "logging source-interface {{ syslog_source_interface }}"
+
+        - name: Set syslog facility for log categorization on the collector
+          cisco.ios.ios_config:
+            lines:
+              - "logging facility {{ log_facility }}"
+
+        - name: Apply rate limiting to prevent log storms from overwhelming syslog servers
+          cisco.ios.ios_config:
+            lines:
+              - "logging rate-limit {{ log_rate_limit }} except warnings"
+
+        - name: Suppress console logging to reduce CPU overhead on production devices
+          cisco.ios.ios_config:
+            lines:
+              - "no logging console"
+
+      rescue:
+        - name: Report configuration failure
+          ansible.builtin.debug:
+            msg: >
+              FAILED: Syslog hardening on {{ inventory_hostname }} encountered an error.
+              Review device connectivity and privilege level before retrying.
+          failed_when: true
+
+    - name: Verify source interface is operationally up
+      cisco.ios.ios_command:
+        commands:
+          - "show interface {{ syslog_source_interface }} | include line protocol"
+      register: source_iface_status
+      failed_when: false
+      retries: 2
+      delay: 3
+
+    - name: Alert if syslog source interface is down
+      ansible.builtin.debug:
+        msg: >
+          WARNING: {{ syslog_source_interface }} on {{ inventory_hostname }} is not up —
+          syslog traffic will egress with an unpredictable source address.
+      when: source_iface_status.stdout[0] is not search('line protocol is up')
+
+    - name: Collect post-change running configuration (logging statements only)
+      cisco.ios.ios_command:
+        commands:
+          - "show running-config | include ^logging"
+          - show logging
+      register: post_change_state
+      retries: 2
+      delay: 5
+      until: post_change_state is not failed
+
+    - name: Display configuration verification summary
+      ansible.builtin.debug:
+        msg:
+          - "Device         : {{ inventory_hostname }}"
+          - "Buffer size    : {{ log_buffer_size }} bytes / {{ log_buffer_severity }}"
+          - "Source iface   : {{ syslog_source_interface }}"
+          - "Facility       : {{ log_facility }}"
+          - "Rate limit     : {{ log_rate_limit }} msg/sec (warnings+ exempt)"
+          - "Active logging : {{ post_change_state.stdout[0] | trim }}"
+
+    - name: Persist hardened configuration to NVRAM
+      cisco.ios.ios_command:
+        commands:
+          - write memory
+      register: save_result
+      retries: 3
+      delay: 10
+      until: save_result is not failed
+      changed_when: false
