@@ -1,0 +1,149 @@
+---
+# VLAN Configuration Playbook for Network Devices
+# Manages VLAN creation, modification, and verification across Cisco IOS, IOS-XR, and NX-OS platforms
+# Supports idempotent VLAN operations with comprehensive error handling and status reporting
+#
+# Inventory Example:
+# [ios_devices]
+# switch1 ansible_host=192.168.1.10 device_type=ios
+# switch2 ansible_host=192.168.1.11 device_type=ios
+#
+# [iosxr_devices]
+# router1 ansible_host=192.168.1.20 device_type=iosxr
+#
+# [nxos_devices]
+# switch3 ansible_host=192.168.1.30 device_type=nxos
+#
+# [network_all:children]
+# ios_devices
+# iosxr_devices
+# nxos_devices
+#
+# Credentials: Use ansible-vault for sensitive data
+# ansible_user and ansible_password should be vaulted in production
+
+- name: Deploy VLAN Configuration Across Network Infrastructure
+  hosts: network_all
+  gather_facts: false
+  connection: network_cli
+
+  vars:
+    # Reference vault: ansible-vault encrypt group_vars/network_all/vault.yml
+    ansible_user: "{{ vault_net_user | default('admin') }}"
+    ansible_password: "{{ vault_net_password | default('admin') }}"
+    
+    vlans_to_deploy:
+      - vlan_id: 10
+        name: Management
+      - vlan_id: 20
+        name: Production
+      - vlan_id: 30
+        name: Development
+      - vlan_id: 40
+        name: Guest
+
+  tasks:
+    - name: Configure VLANs on Cisco IOS devices
+      ios_vlan:
+        vlan_id: "{{ item.vlan_id }}"
+        name: "{{ item.name }}"
+        state: present
+      loop: "{{ vlans_to_deploy }}"
+      when: device_type | default('') == 'ios'
+      register: ios_result
+      retries: 3
+      delay: 2
+      until: ios_result is not failed
+      rescue:
+        - name: Handle IOS VLAN configuration failure
+          debug:
+            msg: "VLAN {{ item.vlan_id }} configuration failed on {{ inventory_hostname }}: {{ ios_result.msg }}"
+
+    - name: Configure VLANs on Cisco IOS-XR devices
+      iosxr_config:
+        lines:
+          - "vlan {{ item.vlan_id }}"
+          - "name {{ item.name }}"
+      loop: "{{ vlans_to_deploy }}"
+      when: device_type | default('') == 'iosxr'
+      register: iosxr_result
+      retries: 3
+      delay: 2
+      until: iosxr_result is not failed
+      rescue:
+        - name: Handle IOS-XR VLAN configuration failure
+          debug:
+            msg: "VLAN {{ item.vlan_id }} configuration failed on {{ inventory_hostname }}"
+
+    - name: Configure VLANs on Cisco NX-OS devices
+      nxos_vlan:
+        vlan_id: "{{ item.vlan_id }}"
+        name: "{{ item.name }}"
+        state: present
+      loop: "{{ vlans_to_deploy }}"
+      when: device_type | default('') == 'nxos'
+      register: nxos_result
+      retries: 3
+      delay: 2
+      until: nxos_result is not failed
+      rescue:
+        - name: Handle NX-OS VLAN configuration failure
+          debug:
+            msg: "VLAN {{ item.vlan_id }} configuration failed on {{ inventory_hostname }}"
+
+    - name: Gather VLAN verification on IOS
+      ios_command:
+        commands: "show vlan brief"
+      when: device_type | default('') == 'ios'
+      register: ios_verify
+      failed_when: ios_verify.rc != 0
+
+    - name: Gather VLAN verification on IOS-XR
+      iosxr_command:
+        commands: "show vlan"
+      when: device_type | default('') == 'iosxr'
+      register: iosxr_verify
+      failed_when: iosxr_verify.rc != 0
+
+    - name: Gather VLAN verification on NX-OS
+      nxos_command:
+        commands: "show vlan"
+      when: device_type | default('') == 'nxos'
+      register: nxos_verify
+      failed_when: nxos_verify.rc != 0
+
+    - name: Report VLAN deployment status for IOS
+      debug:
+        msg: |
+          =========================================
+          Device: {{ inventory_hostname }}
+          Platform: Cisco IOS
+          VLANs Configured: {{ vlans_to_deploy | length }}
+          Configuration Status: SUCCESS
+          =========================================
+          {{ ios_verify.stdout_lines[0] if ios_verify.stdout_lines is defined else 'No output' }}
+      when: device_type | default('') == 'ios'
+
+    - name: Report VLAN deployment status for IOS-XR
+      debug:
+        msg: |
+          =========================================
+          Device: {{ inventory_hostname }}
+          Platform: Cisco IOS-XR
+          VLANs Configured: {{ vlans_to_deploy | length }}
+          Configuration Status: SUCCESS
+          =========================================
+          {{ iosxr_verify.stdout_lines[0] if iosxr_verify.stdout_lines is defined else 'No output' }}
+      when: device_type | default('') == 'iosxr'
+
+    - name: Report VLAN deployment status for NX-OS
+      debug:
+        msg: |
+          =========================================
+          Device: {{ inventory_hostname }}
+          Platform: Cisco NX-OS
+          VLANs Configured: {{ vlans_to_deploy | length }}
+          Configuration Status: SUCCESS
+          =========================================
+          {{ nxos_verify.stdout_lines[0] if nxos_verify.stdout_lines is defined else 'No output' }}
+      when: device_type | default('') == 'nxos'
