@@ -1,0 +1,119 @@
+```yaml
+---
+# VLAN Database Management Playbook
+# Manages VLAN creation, naming, and configuration on network devices
+# Supports: Cisco IOS, NX-OS, Juniper Junos, and IOS-XR
+
+- name: Configure VLANs on Network Devices
+  hosts: network_devices
+  gather_facts: no
+
+  vars:
+    # Device credentials - reference vault in production
+    # ansible_user: "{{ vault_network_username }}"
+    # ansible_password: "{{ vault_network_password }}"
+    ansible_connection: network_cli
+
+    # VLAN configuration
+    vlans_to_create:
+      - vlan_id: 10
+        name: "Management"
+      - vlan_id: 20
+        name: "Production"
+      - vlan_id: 30
+        name: "Guest"
+      - vlan_id: 40
+        name: "DMZ"
+
+  tasks:
+    - name: Create VLANs on Cisco IOS devices
+      cisco.ios.ios_vlans:
+        config:
+          - vlan_id: "{{ item.vlan_id }}"
+            name: "{{ item.name }}"
+            state: active
+        state: merged
+      loop: "{{ vlans_to_create }}"
+      register: ios_vlan_config
+      retries: 2
+      delay: 10
+      until: ios_vlan_config is not failed
+      when: ansible_network_os == 'ios'
+      failed_when: ios_vlan_config.failed and 'already exists' not in ios_vlan_config.msg | default('')
+      tags: ["vlan_create", "ios"]
+
+    - name: Create VLANs on Cisco NX-OS devices
+      cisco.nxos.nxos_vlans:
+        config:
+          - vlan_id: "{{ item.vlan_id }}"
+            name: "{{ item.name }}"
+            enabled: true
+        state: merged
+      loop: "{{ vlans_to_create }}"
+      register: nxos_vlan_config
+      retries: 2
+      delay: 10
+      until: nxos_vlan_config is not failed
+      when: ansible_network_os == 'nxos'
+      tags: ["vlan_create", "nxos"]
+
+    - name: Create VLANs on Juniper Junos devices
+      juniper.junos.junos_vlans:
+        config:
+          - vlan_id: "{{ item.vlan_id }}"
+            name: "{{ item.name }}"
+        state: merged
+      loop: "{{ vlans_to_create }}"
+      register: junos_vlan_config
+      retries: 2
+      delay: 10
+      until: junos_vlan_config is not failed
+      when: ansible_network_os == 'junos'
+      tags: ["vlan_create", "junos"]
+
+    - name: Display VLAN creation summary
+      debug:
+        msg: |
+          VLAN Configuration Summary:
+          Device: {{ inventory_hostname }}
+          Platform: {{ ansible_network_os | upper }}
+          VLANs Processed: {{ vlans_to_create | length }}
+          Configuration Status: {{ 'Applied' if (ios_vlan_config.changed or nxos_vlan_config.changed or junos_vlan_config.changed) else 'No Changes Required' }}
+          Timestamp: {{ ansible_date_time.iso8601 }}
+      register: summary_output
+      tags: ["report"]
+
+    - name: Save VLAN configuration summary to file
+      copy:
+        content: "{{ summary_output.msg }}\n"
+        dest: "/tmp/vlan_config_{{ inventory_hostname }}_{{ ansible_date_time.date }}.txt"
+      delegate_to: localhost
+      tags: ["report"]
+
+  rescue:
+    - name: Handle VLAN configuration errors
+      debug:
+        msg: |
+          VLAN Configuration Error:
+          Device: {{ inventory_hostname }}
+          Platform: {{ ansible_network_os | upper }}
+          Error Message: {{ ansible_failed_result.msg | default('Unknown Error') }}
+          Failed Task: {{ ansible_failed_task.name | default('Unknown') }}
+          Attempted VLANs: {{ vlans_to_create | map(attribute='vlan_id') | list | join(', ') }}
+      register: error_output
+      tags: ["error_handling"]
+
+# Inventory Example (place in hosts file or hosts/ directory):
+# [network_devices]
+# ios_router ansible_host=192.168.1.1 ansible_network_os=ios
+# nxos_switch ansible_host=192.168.1.2 ansible_network_os=nxos
+# junos_device ansible_host=192.168.1.3 ansible_network_os=junos
+#
+# [network_devices:vars]
+# ansible_connection=network_cli
+# ansible_user=netadmin
+# ansible_password=PASSWORD
+# # For vault-encrypted password:
+# # ansible_password="{{ vault_network_password }}"
+# # Encrypt with: ansible-vault encrypt group_vars/network_devices/vault.yml
+```
