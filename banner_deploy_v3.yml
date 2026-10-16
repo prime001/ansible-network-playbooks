@@ -1,0 +1,104 @@
+---
+# dynamic_banner_deploy.yml
+#
+# Deploys classification-aware MOTD and login banners on Cisco IOS/IOS-XE
+# with per-device variable substitution, post-apply verification, and a
+# per-host summary. Differentiates from banner_deploy_v2 by generating
+# banner text dynamically from host vars and verifying content post-push.
+#
+# Inventory example:
+#   [core_routers]
+#   rtr-core-01 ansible_host=10.0.1.1  banner_env=PRODUCTION  banner_classification=CONFIDENTIAL
+#   rtr-core-02 ansible_host=10.0.1.2  banner_env=PRODUCTION  banner_classification=CONFIDENTIAL
+#   [lab_routers]
+#   rtr-lab-01  ansible_host=10.0.2.1  banner_env=LAB         banner_classification=INTERNAL
+#
+#   [core_routers:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_net_username }}
+#   ansible_password={{ vault_net_password }}
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_net_enable }}
+#
+# Vault vars (ansible-vault encrypt_string):
+#   vault_net_username, vault_net_password, vault_net_enable
+
+- name: Dynamic classification-aware banner deployment — IOS/IOS-XE
+  hosts: routers
+  gather_facts: false
+  connection: network_cli
+
+  vars:
+    banner_env: "{{ banner_env | default('UNKNOWN') }}"
+    banner_classification: "{{ banner_classification | default('INTERNAL') }}"
+    motd_body: |
+      ****************************************************************************
+      *  {{ banner_classification }} // {{ banner_env }} ENVIRONMENT
+      *  Device: {{ inventory_hostname }}
+      *  AUTHORIZED ACCESS ONLY — activity is logged and monitored.
+      *  Unauthorized use is prohibited and subject to prosecution.
+      *  Contact NOC: noc@example.com | +1-800-555-0199
+      ****************************************************************************
+    login_body: |
+      ****************************************************************************
+      *  Authentication required.  Disconnect now if access is unauthorized.
+      ****************************************************************************
+
+  tasks:
+    - name: Apply MOTD banner
+      block:
+        - name: Push MOTD banner
+          cisco.ios.ios_banner:
+            banner: motd
+            text: "{{ motd_body }}"
+            state: present
+          register: result_motd
+          retries: 2
+          delay: 5
+
+        - name: Push login banner
+          cisco.ios.ios_banner:
+            banner: login
+            text: "{{ login_body }}"
+            state: present
+          register: result_login
+
+      rescue:
+        - name: Log banner push failure
+          ansible.builtin.debug:
+            msg: >
+              Banner push FAILED on {{ inventory_hostname }}:
+              {{ ansible_failed_result.msg | default('no detail available') }}
+
+        - name: Fail the host explicitly after rescue logging
+          ansible.builtin.fail:
+            msg: "Aborting — banner could not be applied on {{ inventory_hostname }}"
+
+    - name: Verify MOTD banner is present in running config
+      cisco.ios.ios_command:
+        commands:
+          - show running-config | section banner motd
+      register: verify_motd
+      failed_when: "'AUTHORIZED ACCESS ONLY' not in verify_motd.stdout[0]"
+      retries: 2
+      delay: 3
+
+    - name: Verify login banner is present in running config
+      cisco.ios.ios_command:
+        commands:
+          - show running-config | section banner login
+      register: verify_login
+      failed_when: "'Authentication required' not in verify_login.stdout[0]"
+
+    - name: Display deployment summary
+      ansible.builtin.debug:
+        msg:
+          - "Host           : {{ inventory_hostname }}"
+          - "Environment    : {{ banner_env }}"
+          - "Classification : {{ banner_classification }}"
+          - "MOTD changed   : {{ result_motd.changed }}"
+          - "Login changed  : {{ result_login.changed }}"
+          - "MOTD verified  : {{ 'AUTHORIZED ACCESS ONLY' in verify_motd.stdout[0] }}"
+          - "Login verified : {{ 'Authentication required' in verify_login.stdout[0] }}
