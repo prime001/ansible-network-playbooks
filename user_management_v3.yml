@@ -1,0 +1,149 @@
+The playbook content is ready — here it is as requested (output only):
+
+---
+# user_audit_remediate.yml
+#
+# Audits local user accounts on Cisco IOS devices against an approved list,
+# enforces correct privilege levels, and removes unauthorized accounts.
+# Complements user_management.yml (provisioning) by validating running state
+# and remediating drift -- orphaned accounts, incorrect privileges.
+#
+# Vault reference (group_vars/network/vault.yml):
+#   vault_network_user: "netauto"
+#   vault_network_password: "<encrypted>"
+#   vault_enable_password: "<encrypted>"
+#   vault_user_secrets:
+#     netadmin: "<encrypted>"
+#     netops:   "<encrypted>"
+#     monitor:  "<encrypted>"
+#
+# Inventory example:
+#   [ios_devices]
+#   rtr-core-01  ansible_host=10.0.1.1
+#   rtr-core-02  ansible_host=10.0.1.2
+#   sw-dist-01   ansible_host=10.0.2.1
+#
+#   [ios_devices:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_become=true
+#   ansible_become_method=enable
+
+- name: Audit and remediate local user accounts on Cisco IOS
+  hosts: ios_devices
+  gather_facts: false
+  connection: network_cli
+
+  vars:
+    ansible_user: "{{ vault_network_user }}"
+    ansible_password: "{{ vault_network_password }}"
+    ansible_become_password: "{{ vault_enable_password }}"
+
+    approved_users:
+      - { name: netadmin, privilege: 15, secret: "{{ vault_user_secrets.netadmin }}" }
+      - { name: netops,   privilege: 7,  secret: "{{ vault_user_secrets.netops }}" }
+      - { name: monitor,  privilege: 1,  secret: "{{ vault_user_secrets.monitor }}" }
+
+    # Break-glass and fallback accounts never removed by automation
+    protected_users:
+      - admin
+      - emergency
+
+  tasks:
+    - name: Collect current local user accounts from running config
+      cisco.ios.ios_command:
+        commands:
+          - show running-config | section ^username
+      register: users_raw
+      retries: 3
+      delay: 5
+      until: users_raw is not failed
+
+    - name: Parse usernames present on device
+      ansible.builtin.set_fact:
+        current_usernames: "{{ users_raw.stdout[0] | regex_findall('(?m)^username (\\S+)') | list }}"
+        approved_names: "{{ approved_users | map(attribute='name') | list }}"
+
+    - name: Report discovered accounts
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} local users: {{ current_usernames }}"
+
+    - name: Identify accounts not in approved list and not protected
+      ansible.builtin.set_fact:
+        unauthorized: >-
+          {{ current_usernames
+             | difference(approved_names)
+             | difference(protected_users)
+             | list }}
+
+    - name: Enforce approved users and remove unauthorized accounts
+      block:
+        - name: Apply approved user configuration with correct privilege
+          cisco.ios.ios_config:
+            lines:
+              - "username {{ item.name }} privilege {{ item.privilege }} secret {{ item.secret }}"
+          loop: "{{ approved_users }}"
+          loop_control:
+            label: "{{ item.name }} (priv={{ item.privilege }})"
+          register: enforce_result
+
+        - name: Remove unauthorized accounts
+          cisco.ios.ios_config:
+            lines:
+              - "no username {{ item }}"
+          loop: "{{ unauthorized }}"
+          when: unauthorized | length > 0
+          register: removal_result
+
+        - name: Verify each approved user is present post-enforcement
+          cisco.ios.ios_command:
+            commands:
+              - "show running-config | include ^username {{ item.name }} "
+          loop: "{{ approved_users }}"
+          loop_control:
+            label: "verify:{{ item.name }}"
+          register: verify_results
+          failed_when: item.name not in (verify_results.stdout | first | default(''))
+
+      rescue:
+        - name: Capture diagnostics on failure
+          cisco.ios.ios_command:
+            commands:
+              - show version | include Version
+              - show privilege
+              - show users
+          register: diag_out
+          ignore_errors: true
+
+        - name: Report failure details
+          ansible.builtin.debug:
+            msg:
+              - "REMEDIATION FAILED on {{ inventory_hostname }}"
+              - "Failed task: {{ ansible_failed_task.name }}"
+              - "Device diagnostics: {{ diag_out.stdout_lines | default([]) }}"
+
+        - name: Abort with actionable error
+          ansible.builtin.fail:
+            msg: >
+              User audit failed on {{ inventory_hostname }}.
+              Unauthorized accounts may remain: {{ unauthorized }}.
+              Manual review required before next automation run.
+
+    - name: Save configuration when changes were applied
+      cisco.ios.ios_command:
+        commands:
+          - write memory
+      when: >
+        enforce_result.changed or
+        (removal_result is defined and removal_result.changed)
+      register: save_out
+      failed_when: save_out.stdout[0] is not search('OK|Building configuration')
+
+    - name: Audit summary
+      ansible.builtin.debug:
+        msg:
+          - "=== User Audit: {{ inventory_hostname }} ==="
+          - "Approved accounts enforced : {{ approved_names }}"
+          - "Unauthorized accounts removed: {{ unauthorized | default([]) }}"
+          - "Protected accounts (skipped): {{ protected_users }}"
+          - "Config saved: {{ enforce_result.changed or (removal_result is defined and removal_result.changed) }}
