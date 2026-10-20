@@ -1,0 +1,107 @@
+Here is the playbook YAML:
+
+---
+# ospf_config.yml
+# Deploys OSPF routing process configuration on Cisco IOS devices and verifies
+# neighbor adjacency formation after convergence.
+#
+# Credentials sourced from Ansible Vault — run with:
+#   ansible-playbook ospf_config.yml --ask-vault-pass
+#
+# Inventory example:
+#   [core_routers]
+#   rtr-core-01 ansible_host=10.0.1.1
+#   rtr-edge-01 ansible_host=10.0.1.5
+#
+#   [core_routers:vars]
+#   ansible_connection=network_cli
+#   ansible_network_os=ios
+#   ansible_user="{{ vault_net_user }}"              # ansible-vault encrypted
+#   ansible_password="{{ vault_net_password }}"      # ansible-vault encrypted
+#   ansible_become=true
+#   ansible_become_method=enable
+#   ansible_become_password="{{ vault_enable_pass }}" # ansible-vault encrypted
+
+- name: Deploy OSPF routing process on Cisco IOS
+  hosts: core_routers
+  gather_facts: false
+
+  vars:
+    ospf_process_id: 1
+    # Match reference-bandwidth to fastest link in the domain (Mbps) so cost reflects real topology
+    ospf_reference_bandwidth: 10000
+    ospf_networks:
+      - prefix: "10.0.0.0"
+        wildcard: "0.0.255.255"
+        area: 0
+      - prefix: "192.168.100.0"
+        wildcard: "0.0.0.255"
+        area: 1
+
+  tasks:
+    - name: OSPF configuration and verification
+      block:
+        - name: Apply OSPF process-level settings
+          cisco.ios.ios_config:
+            parents: "router ospf {{ ospf_process_id }}"
+            lines:
+              - "router-id {{ ansible_host }}"
+              - "auto-cost reference-bandwidth {{ ospf_reference_bandwidth }}"
+              - "log-adjacency-changes detail"
+            match: line
+            save_when: changed
+          register: ospf_base_result
+
+        - name: Advertise networks into OSPF
+          cisco.ios.ios_config:
+            parents: "router ospf {{ ospf_process_id }}"
+            lines:
+              - "network {{ item.prefix }} {{ item.wildcard }} area {{ item.area }}"
+            match: line
+            save_when: changed
+          loop: "{{ ospf_networks }}"
+          register: ospf_network_result
+
+        - name: Wait for OSPF to converge and verify process is active
+          cisco.ios.ios_command:
+            commands:
+              - "show ip ospf {{ ospf_process_id }}"
+              - "show ip ospf neighbor"
+              - "show ip route ospf"
+          register: ospf_verify
+          retries: 3
+          delay: 10
+          until: "'OSPF Router with ID' in ospf_verify.stdout[0]"
+          failed_when: ospf_verify.stdout[0] == ""
+
+        - name: Report OSPF state and neighbor table
+          ansible.builtin.debug:
+            msg:
+              - "=== {{ inventory_hostname }} OSPF Process {{ ospf_process_id }} ==="
+              - "{{ ospf_verify.stdout[0] }}"
+              - "=== Neighbor Table ==="
+              - "{{ ospf_verify.stdout[1] }}"
+              - "=== OSPF Routes ==="
+              - "{{ ospf_verify.stdout[2] }}"
+
+      rescue:
+        - name: Collect diagnostics on failure
+          cisco.ios.ios_command:
+            commands:
+              - "show ip protocols"
+              - "show ip ospf {{ ospf_process_id }}"
+              - "show logging"
+          register: diag_output
+          ignore_errors: true
+
+        - name: Display diagnostic output
+          ansible.builtin.debug:
+            var: diag_output.stdout_lines
+          when: diag_output is defined and diag_output.stdout_lines is defined
+
+        - name: Fail with descriptive message
+          ansible.builtin.fail:
+            msg: >-
+              OSPF configuration failed on {{ inventory_hostname }}.
+              Review diagnostics above. Verify process ID {{ ospf_process_id }}
+              and that interface IPs match the configured network statements.
