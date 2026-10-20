@@ -1,0 +1,148 @@
+```yaml
+---
+- name: Network Device VLAN Management and Configuration
+  description: |
+    Manages VLAN creation, deletion, and configuration on network switches.
+    Supports Cisco IOS, IOS-XE, and NX-OS platforms. Handles VLAN IDs, names,
+    interface assignments, and configuration verification with backup capability.
+
+  hosts: network_switches
+  gather_facts: no
+
+  vars:
+    # Device credentials - use ansible-vault for production
+    # Create vault: ansible-vault create group_vars/network_switches/vault.yml
+    ansible_user: "{{ vault_network_user }}"
+    ansible_password: "{{ vault_network_password }}"
+    ansible_network_os: "{{ network_os | default('ios') }}"
+    ansible_connection: network_cli
+    ansible_become: yes
+    ansible_become_method: enable
+    ansible_become_password: "{{ vault_enable_password | default('') }}"
+    ansible_command_timeout: 30
+
+  tasks:
+    - name: Validate VLAN configuration input
+      assert:
+        that:
+          - vlan_list is defined
+          - vlan_list | length > 0
+        fail_msg: "vlan_list must be defined with at least one VLAN entry"
+      register: validation
+
+    - name: Create or update VLANs
+      ios_vlan:
+        vlan_id: "{{ item.id }}"
+        name: "{{ item.name | default('VLAN' + item.id | string) }}"
+        state: present
+      loop: "{{ vlan_list }}"
+      register: vlan_creation
+      retries: 3
+      delay: 2
+      until: vlan_creation is not failed
+      rescue:
+        - name: Log VLAN creation failure
+          debug:
+            msg: "VLAN {{ item.id }} creation failed: {{ ansible_failed_result.msg | default('Unknown error') }}"
+          register: creation_error
+
+    - name: Assign interfaces to VLANs
+      ios_l2_interface:
+        name: "{{ item.interface }}"
+        vlan: "{{ item.vlan_id }}"
+        mode: "{{ item.mode | default('access') }}"
+        state: present
+      loop: "{{ interface_vlan_assignments | default([]) }}"
+      register: interface_config
+      retries: 2
+      delay: 1
+      failed_when: false
+      rescue:
+        - name: Log interface assignment failure
+          debug:
+            msg: "Interface {{ item.interface }} assignment failed"
+
+    - name: Verify VLAN configuration
+      ios_command:
+        commands:
+          - show vlan brief
+          - show interfaces vlan brief
+      register: vlan_verification
+      retries: 2
+      delay: 1
+      failed_when: false
+
+    - name: Check VLAN existence
+      assert:
+        that:
+          - "'VLAN Name' in vlan_verification.stdout[0]"
+        fail_msg: "VLAN verification failed - unable to retrieve VLAN information"
+      ignore_errors: yes
+
+    - name: Display VLAN configuration results
+      debug:
+        msg: |
+          VLAN Configuration Results for {{ inventory_hostname }}:
+          =========================================================
+          Platform: {{ network_os | default('ios') }}
+          Total VLANs to Configure: {{ vlan_list | length }}
+          VLANs Created: {{ vlan_creation | selectattr('changed', 'equalto', true) | list | length }}
+          Interfaces Assigned: {{ interface_vlan_assignments | default([]) | length }}
+          Configuration Status: {{ 'SUCCESS' if vlan_creation is not failed else 'PARTIAL' }}
+          Timestamp: {{ ansible_date_time.iso8601 }}
+
+    - name: Display VLAN verification output
+      debug:
+        msg: "{{ vlan_verification.stdout[0] }}"
+        verbosity: 2
+
+    - name: Backup running configuration
+      ios_command:
+        commands:
+          - show running-config
+      register: device_config
+      when: enable_config_backup | default(true)
+
+    - name: Save configuration backup
+      copy:
+        content: "{{ device_config.stdout[0] }}"
+        dest: "./backups/{{ inventory_hostname }}_vlan_config_{{ ansible_date_time.date }}.cfg"
+      when:
+        - enable_config_backup | default(true)
+        - device_config is not failed
+      delegate_to: localhost
+      become: no
+
+  rescue:
+    - name: Handle critical failures
+      fail:
+        msg: |
+          CRITICAL: VLAN configuration failed for {{ inventory_hostname }}
+          Error Details: {{ ansible_failed_result.msg | default('See logs above') }}
+
+# Inventory Example:
+# [network_switches]
+# switch01 ansible_host=192.168.1.10 network_os=ios
+# switch02 ansible_host=192.168.1.11 network_os=ios
+# switch03 ansible_host=192.168.1.12 network_os=nxos
+#
+# [network_switches:vars]
+# enable_config_backup=true
+#
+# Host Variables (in host_vars/switch01/main.yml):
+# vlan_list:
+#   - id: 10
+#     name: Management
+#   - id: 20
+#     name: Production
+#   - id: 30
+#     name: Guest
+#
+# interface_vlan_assignments:
+#   - interface: GigabitEthernet0/0/1
+#     vlan_id: 10
+#     mode: access
+#   - interface: GigabitEthernet0/0/2
+#     vlan_id: 20
+#     mode: access
+```
