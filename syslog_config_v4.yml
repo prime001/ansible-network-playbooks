@@ -1,0 +1,145 @@
+```yaml
+---
+# Playbook: syslog_tuning.yml
+# Purpose: Configure syslog buffering, rate-limiting, discriminators,
+#          and source-interface binding. Complements syslog_config.yml
+#          (remote server targeting) with local buffering controls and
+#          noise-filtering for high-volume log environments.
+#
+# Credentials: ansible-vault encrypted group_vars/network/vault.yml
+#   vault_ansible_user, vault_ansible_password, vault_ansible_become_password
+#
+# Inventory example:
+#   [ios_routers]
+#   rtr-core-01  ansible_host=10.0.1.10  ansible_network_os=ios
+#   rtr-edge-01  ansible_host=10.0.1.11  ansible_network_os=ios
+#
+#   [nxos_switches]
+#   nxos-agg-01  ansible_host=10.0.2.10  ansible_network_os=nxos
+#
+#   [network:children]
+#   ios_routers
+#   nxos_switches
+#
+#   [network:vars]
+#   ansible_connection=network_cli
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_user={{ vault_ansible_user }}
+#   ansible_password={{ vault_ansible_password }}
+#   ansible_become_password={{ vault_ansible_become_password }}
+
+- name: Tune IOS syslog buffering, rate-limiting, and discriminators
+  hosts: ios_routers
+  gather_facts: false
+  vars:
+    log_buffer_size: 65536
+    log_buffer_severity: warnings
+    log_source_interface: Loopback0
+    log_rate_limit: 10000
+    log_discriminator_name: SUPPRESS_NOISE
+    config_timeout: 30
+
+  tasks:
+    - name: Capture pre-change logging state
+      cisco.ios.ios_command:
+        commands:
+          - show logging | include Syslog logging|Log Buffer|rate-limit|Source
+      register: pre_logging
+      retries: 2
+      delay: 5
+      until: pre_logging is not failed
+
+    - name: Display current logging summary
+      ansible.builtin.debug:
+        msg: "{{ pre_logging.stdout_lines[0] }}"
+
+    - block:
+        - name: Apply buffering, rate-limit, discriminator, and source binding
+          cisco.ios.ios_config:
+            lines:
+              - logging discriminator {{ log_discriminator_name }} severity drops 6
+              - logging buffered {{ log_buffer_size }} {{ log_buffer_severity }}
+              - logging buffered discriminator {{ log_discriminator_name }}
+              - logging rate-limit {{ log_rate_limit }} except errors
+              - logging source-interface {{ log_source_interface }}
+            save_when: changed
+          register: ios_syslog_tuning
+          timeout: "{{ config_timeout }}"
+
+        - name: Verify buffer size was accepted by device
+          cisco.ios.ios_command:
+            commands:
+              - show logging | include Log Buffer
+          register: ios_verify
+          failed_when: log_buffer_size | string not in ios_verify.stdout[0]
+
+        - name: Report applied configuration
+          ansible.builtin.debug:
+            msg: "{{ ios_verify.stdout_lines[0] }}"
+
+        - name: Save if changed
+          cisco.ios.ios_command:
+            commands:
+              - write memory
+          when: ios_syslog_tuning.changed
+
+      rescue:
+        - name: Record failure details
+          ansible.builtin.debug:
+            msg: "Tuning failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('unknown') }}"
+
+        - name: Revert to conservative defaults
+          cisco.ios.ios_config:
+            lines:
+              - logging buffered 16384
+              - no logging rate-limit
+              - no logging discriminator {{ log_discriminator_name }}
+          ignore_errors: true
+
+        - name: Fail with context
+          ansible.builtin.fail:
+            msg: "IOS syslog tuning failed on {{ inventory_hostname }} — reverted to defaults"
+
+- name: Tune NX-OS syslog logfile, timestamps, and source binding
+  hosts: nxos_switches
+  gather_facts: false
+  vars:
+    log_source_interface: loopback0
+    nxos_log_severity: 3
+    nxos_log_size: 65536
+
+  tasks:
+    - block:
+        - name: Configure NX-OS logfile size, severity, timestamps, and source
+          cisco.nxos.nxos_config:
+            lines:
+              - logging logfile messages {{ nxos_log_severity }} size {{ nxos_log_size }}
+              - logging source-interface {{ log_source_interface }}
+              - logging timestamp milliseconds
+            save_when: changed
+          register: nxos_syslog_tuning
+
+        - name: Verify NX-OS logfile configuration
+          cisco.nxos.nxos_command:
+            commands:
+              - show logging info
+          register: nxos_verify
+          retries: 2
+          delay: 3
+          until: nxos_verify is not failed
+          failed_when: "'logfile' not in nxos_verify.stdout[0]"
+
+        - name: Display NX-OS logging info
+          ansible.builtin.debug:
+            msg: "{{ nxos_verify.stdout_lines[0][:15] }}"
+
+      rescue:
+        - name: Report NX-OS failure
+          ansible.builtin.debug:
+            msg: "NX-OS syslog tuning failed on {{ inventory_hostname }}"
+
+        - name: Fail with context
+          ansible.builtin.fail:
+            msg: "NX-OS syslog tuning could not be applied on {{ inventory_hostname }}"
+```
