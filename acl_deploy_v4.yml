@@ -1,0 +1,128 @@
+---
+# QoS Service Policy Deployment — Cisco IOS / IOS-XE
+#
+# Configures DSCP-based class-maps, a WAN egress policy-map, and binds
+# the service-policy to a target interface. Includes a rescue block that
+# removes the interface binding on failure to avoid a half-applied state.
+#
+# Inventory example:
+# [wan_routers]
+# rtr-wan-01 ansible_host=10.0.1.1
+# rtr-wan-02 ansible_host=10.0.1.2
+#
+# [wan_routers:vars]
+# ansible_network_os=ios
+# ansible_connection=network_cli
+# ansible_user={{ vault_net_user }}
+# ansible_password={{ vault_net_password }}
+# ansible_become=true
+# ansible_become_method=enable
+# ansible_become_password={{ vault_net_enable }}
+
+- name: Deploy DSCP-based QoS service policies on Cisco IOS/IOS-XE WAN routers
+  hosts: wan_routers
+  gather_facts: false
+
+  vars:
+    # Credentials sourced from Ansible Vault — see group_vars/all/vault.yml
+    ansible_user: "{{ vault_net_user }}"
+    ansible_password: "{{ vault_net_password }}"
+    ansible_become_password: "{{ vault_net_enable }}"
+
+    qos_policy_name: WAN-EGRESS-QOS
+    qos_interface: GigabitEthernet0/1
+    qos_direction: output
+
+    # Each class maps a DSCP marking to a queuing action
+    qos_classes:
+      - name: CM-VOICE
+        dscp: ef
+        action: priority
+        value: "512"
+      - name: CM-VIDEO
+        dscp: af41
+        action: bandwidth remaining percent
+        value: "30"
+      - name: CM-CRITICAL-DATA
+        dscp: af21
+        action: bandwidth remaining percent
+        value: "20"
+
+  tasks:
+    - name: Confirm device is reachable before making changes
+      cisco.ios.ios_command:
+        commands:
+          - show version | include IOS
+      register: ios_version
+      retries: 3
+      delay: 10
+      until: not ios_version.failed
+
+    - name: Log target platform
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} — {{ ios_version.stdout[0] | trim }}"
+
+    - name: Configure DSCP class-maps, policy-map, and interface binding
+      block:
+        - name: Create DSCP class-maps
+          cisco.ios.ios_config:
+            lines:
+              - "match dscp {{ item.dscp }}"
+            parents: "class-map match-all {{ item.name }}"
+          loop: "{{ qos_classes }}"
+          register: classmap_result
+
+        - name: Assign queuing action per class inside policy-map
+          cisco.ios.ios_config:
+            lines:
+              - "{{ item.action }} {{ item.value }}"
+            parents:
+              - "policy-map {{ qos_policy_name }}"
+              - "class {{ item.name }}"
+          loop: "{{ qos_classes }}"
+          register: policymap_result
+
+        - name: Bind service-policy to WAN interface
+          cisco.ios.ios_config:
+            lines:
+              - "service-policy {{ qos_direction }} {{ qos_policy_name }}"
+            parents: "interface {{ qos_interface }}"
+            save_when: changed
+          register: bind_result
+
+        - name: Write configuration after successful bind
+          cisco.ios.ios_config:
+            save_when: always
+          when: bind_result.changed | default(false)
+
+      rescue:
+        - name: Report failure
+          ansible.builtin.debug:
+            msg: >-
+              QoS deployment failed on {{ inventory_hostname }}:
+              {{ ansible_failed_result.msg | default('see task output above') }}
+
+        - name: Remove service-policy binding to roll back interface state
+          cisco.ios.ios_config:
+            lines:
+              - "no service-policy {{ qos_direction }} {{ qos_policy_name }}"
+            parents: "interface {{ qos_interface }}"
+          ignore_errors: true
+
+        - name: Halt play after rollback
+          ansible.builtin.fail:
+            msg: >-
+              Rollback attempted on {{ inventory_hostname }}.
+              Verify device state before re-running this playbook.
+
+    - name: Confirm service-policy is active on interface
+      cisco.ios.ios_command:
+        commands:
+          - "show policy-map interface {{ qos_interface }}"
+          - "show policy-map {{ qos_policy_name }}"
+      register: qos_verify
+      failed_when: qos_policy_name not in qos_verify.stdout[0]
+
+    - name: Display live QoS counters
+      ansible.builtin.debug:
+        msg: "{{ qos_verify.stdout_lines[0] }}
