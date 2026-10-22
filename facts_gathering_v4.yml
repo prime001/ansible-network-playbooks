@@ -1,0 +1,117 @@
+The user wants just the raw YAML output — no file write needed.
+
+---
+# CDP/LLDP Neighbor Discovery
+# Queries CDP and LLDP adjacency tables to produce a topology snapshot of
+# directly-connected neighbors. Read-only — no configuration changes.
+# Useful for automated topology mapping, change-window audits, and
+# validating cabling after physical moves.
+#
+# Credentials live in Ansible Vault. Decrypt at runtime:
+#   ansible-playbook cdp_lldp_neighbor_discovery.yml --ask-vault-pass
+#
+# Inventory example:
+# [core_switches]
+# core-sw01 ansible_host=10.0.0.1
+# core-sw02 ansible_host=10.0.0.2
+#
+# [distribution_switches]
+# dist-sw01 ansible_host=10.0.1.1
+#
+# [network_devices:children]
+# core_switches
+# distribution_switches
+#
+# [network_devices:vars]
+# ansible_network_os=ios
+# ansible_user={{ vault_net_user }}         # defined in group_vars/all/vault.yml
+# ansible_password={{ vault_net_pass }}
+# ansible_become=true
+# ansible_become_method=enable
+# ansible_become_password={{ vault_net_enable }}
+# ansible_connection=network_cli
+
+- name: Discover CDP and LLDP Neighbors
+  hosts: network_devices
+  gather_facts: false
+
+  vars:
+    output_dir: "./neighbor_reports"
+
+  tasks:
+    - name: Create local output directory for reports
+      delegate_to: localhost
+      run_once: true
+      file:
+        path: "{{ output_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Collect neighbor protocol tables
+      block:
+        - name: Gather CDP neighbor detail
+          cisco.ios.ios_command:
+            commands:
+              - show cdp neighbors detail
+          register: cdp_result
+          retries: 2
+          delay: 5
+          until: cdp_result is not failed
+
+        - name: Gather LLDP neighbor detail
+          cisco.ios.ios_command:
+            commands:
+              - show lldp neighbors detail
+          register: lldp_result
+          retries: 2
+          delay: 5
+          until: lldp_result is not failed
+          # LLDP may be legitimately disabled — treat that as a soft failure
+          failed_when:
+            - lldp_result.failed
+            - "'LLDP is not enabled' not in (lldp_result.stdout | default(['']) | first)"
+
+      rescue:
+        - name: Report collection failure and continue
+          debug:
+            msg: >
+              Failed to collect neighbor data from {{ inventory_hostname }}:
+              {{ ansible_failed_result.msg | default('unknown error') }}
+
+        - name: Stub empty results so downstream tasks are safe
+          set_fact:
+            cdp_result: { stdout: [""], failed: true }
+            lldp_result: { stdout: [""], failed: true }
+
+    - name: Display CDP neighbors
+      debug:
+        msg: "{{ cdp_result.stdout | first }}"
+      when: (cdp_result.stdout | first | length) > 0
+
+    - name: Display LLDP neighbors
+      debug:
+        msg: "{{ lldp_result.stdout | first }}"
+      when: (lldp_result.stdout | first | default('') | length) > 0
+
+    - name: Write neighbor snapshot to report file
+      delegate_to: localhost
+      copy:
+        content: |
+          ============================================================
+          Neighbor Report: {{ inventory_hostname }}
+          ============================================================
+          --- CDP Neighbors ---
+          {{ cdp_result.stdout | first | default('(no CDP data collected)') }}
+
+          --- LLDP Neighbors ---
+          {{ lldp_result.stdout | first | default('(LLDP not enabled or no data)') }}
+        dest: "{{ output_dir }}/{{ inventory_hostname }}_neighbors.txt"
+      when: not (cdp_result.get('failed', false) and lldp_result.get('failed', false))
+
+    - name: Neighbor discovery summary per device
+      debug:
+        msg:
+          - "Device         : {{ inventory_hostname }}"
+          - "CDP collected  : {{ ((cdp_result.stdout | first | default('')) | length > 0) | ternary('yes', 'no') }}"
+          - "LLDP collected : {{ ((lldp_result.stdout | first | default('')) | length > 0) | ternary('yes', 'no') }}"
+          - "Report path    : {{ output_dir }}/{{ inventory_hostname }}_neighbors.txt
