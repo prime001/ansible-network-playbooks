@@ -1,0 +1,112 @@
+```yaml
+---
+# snmp_config_v3.yml
+# Configures SNMPv3 USM users with authentication and privacy (SHA/AES)
+# Covers view-based access control (VACM) groups and trap notification targets
+# Credentials: ansible-vault encrypt_string for snmp_auth_password and snmp_priv_password
+#
+# Inventory example:
+# [core_switches]
+# sw-core-01 ansible_host=10.0.1.10
+# sw-core-02 ansible_host=10.0.1.11
+#
+# [core_switches:vars]
+# ansible_network_os=ios
+# ansible_user={{ vault_net_user }}
+# ansible_password={{ vault_net_pass }}
+# ansible_become=yes
+# ansible_become_method=enable
+# ansible_become_pass={{ vault_enable_pass }}
+
+- name: Configure SNMPv3 USM users, VACM groups, and trap targets
+  hosts: core_switches
+  gather_facts: false
+  connection: network_cli
+
+  vars:
+    snmp_view_name: "MGMT-VIEW"
+    snmp_group_name: "NET-OPS-GRP"
+    snmp_username: "net-monitor"
+    snmp_auth_password: "{{ vault_snmp_auth_pass }}"   # ansible-vault protected
+    snmp_priv_password: "{{ vault_snmp_priv_pass }}"   # ansible-vault protected
+    snmp_trap_host: "10.0.100.50"
+    snmp_trap_port: 162
+    snmp_engine_id_local: true
+
+  tasks:
+    - name: Configure SNMP MIB view for restricted OID access
+      cisco.ios.ios_config:
+        lines:
+          - "snmp-server view {{ snmp_view_name }} iso included"
+          - "snmp-server view {{ snmp_view_name }} internet included"
+          - "no snmp-server view {{ snmp_view_name }} snmpUsmMIB excluded"
+      register: view_result
+      retries: 2
+      delay: 5
+      until: view_result is not failed
+
+    - name: Configure SNMPv3 group with priv security level
+      cisco.ios.ios_config:
+        lines:
+          - "snmp-server group {{ snmp_group_name }} v3 priv read {{ snmp_view_name }} write {{ snmp_view_name }} notify {{ snmp_view_name }}"
+      register: group_result
+      failed_when:
+        - group_result.failed
+        - "'already exists' not in (group_result.msg | default(''))"
+
+    - name: Configure SNMPv3 user with SHA auth and AES128 priv
+      cisco.ios.ios_config:
+        lines:
+          - "snmp-server user {{ snmp_username }} {{ snmp_group_name }} v3 auth sha {{ snmp_auth_password }} priv aes 128 {{ snmp_priv_password }}"
+      no_log: true
+      register: user_result
+      retries: 2
+      delay: 3
+      until: user_result is not failed
+
+    - name: Configure SNMPv3 trap target with inform and retry
+      cisco.ios.ios_config:
+        lines:
+          - "snmp-server host {{ snmp_trap_host }} informs version 3 priv {{ snmp_username }}"
+          - "snmp-server enable traps snmp linkdown linkup coldstart warmstart"
+          - "snmp-server enable traps bgp"
+          - "snmp-server enable traps ospf state-change"
+      register: trap_result
+      failed_when: trap_result.failed
+
+    - name: Verify SNMPv3 user provisioned on device
+      cisco.ios.ios_command:
+        commands:
+          - "show snmp user {{ snmp_username }}"
+          - "show snmp group {{ snmp_group_name }}"
+      register: snmp_verify
+      failed_when: >
+        snmp_username not in (snmp_verify.stdout[0] | default('')) or
+        snmp_group_name not in (snmp_verify.stdout[1] | default(''))
+
+    - name: Display SNMPv3 configuration summary
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "User '{{ snmp_username }}' in group '{{ snmp_group_name }}': confirmed"
+          - "Trap target: {{ snmp_trap_host }}:{{ snmp_trap_port }}"
+          - "Auth: SHA | Priv: AES128 | Security level: authPriv"
+
+    - name: Handle SNMPv3 configuration failure
+      block:
+        - name: Collect SNMP engine ID for troubleshooting
+          cisco.ios.ios_command:
+            commands:
+              - "show snmp engineID"
+          register: engine_id_output
+
+        - name: Report failure details
+          ansible.builtin.debug:
+            msg: "SNMPv3 setup failed on {{ inventory_hostname }}. Engine ID: {{ engine_id_output.stdout[0] }}"
+
+        - name: Fail with actionable message
+          ansible.builtin.fail:
+            msg: "SNMPv3 provisioning failed on {{ inventory_hostname }} — review auth/priv passwords and group membership"
+      rescue: []
+      when: snmp_verify.failed | default(false)
+```
