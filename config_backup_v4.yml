@@ -1,0 +1,111 @@
+---
+# running_startup_sync.yml
+#
+# Detects running vs startup configuration drift on Cisco IOS devices and
+# optionally reconciles by writing memory. Intended for post-change-window
+# sweeps to ensure all applied changes survive a reboot.
+#
+# Differs from config_backup.yml (which archives to a file) — this playbook
+# audits intra-device consistency and optionally self-heals.
+#
+# Vault variables (group_vars/all/vault.yml, encrypted with ansible-vault):
+#   vault_ansible_user: netadmin
+#   vault_ansible_password: <ssh password>
+#   vault_ansible_become_password: <enable secret>
+#
+# Inventory example:
+#   [ios_devices]
+#   rtr-core-01  ansible_host=10.0.1.1
+#   rtr-core-02  ansible_host=10.0.1.2
+#   sw-dist-01   ansible_host=10.0.2.1
+#
+#   [ios_devices:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_ansible_user }}
+#   ansible_password={{ vault_ansible_password }}
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_ansible_become_password }}
+#
+# Usage:
+#   ansible-playbook running_startup_sync.yml               # audit only
+#   ansible-playbook running_startup_sync.yml -e auto_save=true  # audit + save
+
+- name: Audit and reconcile running vs startup config drift on IOS devices
+  hosts: ios_devices
+  gather_facts: false
+  vars:
+    auto_save: false
+
+  tasks:
+    - name: Check for unsaved changes using archive diff
+      block:
+        - name: Query config diff between running and startup
+          cisco.ios.ios_command:
+            commands:
+              - show archive config differences nvram:startup-config system:running-config
+          register: diff_result
+          retries: 3
+          delay: 10
+          until: diff_result is not failed
+
+        - name: Determine whether drift exists
+          ansible.builtin.set_fact:
+            has_drift: >-
+              {{
+                diff_result.stdout[0] | length > 0
+                and '!!!' not in diff_result.stdout[0]
+                and 'No changes' not in diff_result.stdout[0]
+              }}
+
+        - name: Display drift details when found
+          ansible.builtin.debug:
+            msg:
+              - "HOST: {{ inventory_hostname }} — drift DETECTED"
+              - "{{ diff_result.stdout[0].splitlines()[:20] }}"
+          when: has_drift | bool
+
+        - name: Confirm clean state when no drift found
+          ansible.builtin.debug:
+            msg: "{{ inventory_hostname }}: Running config matches startup — no action needed."
+          when: not (has_drift | bool)
+
+        - name: Persist running config when drift detected and auto_save enabled
+          block:
+            - name: Write memory to NVRAM
+              cisco.ios.ios_command:
+                commands:
+                  - write memory
+              register: save_result
+              failed_when: >-
+                save_result.stdout[0] is defined
+                and '[OK]' not in save_result.stdout[0]
+                and 'Building configuration' not in save_result.stdout[0]
+
+            - name: Confirm save outcome
+              ansible.builtin.debug:
+                msg: "{{ inventory_hostname }}: Config saved — {{ save_result.stdout[0] | trim }}"
+          when:
+            - has_drift | bool
+            - auto_save | bool
+
+        - name: Warn when drift present but auto_save is disabled
+          ansible.builtin.debug:
+            msg: >-
+              WARNING: {{ inventory_hostname }} has unsaved changes.
+              Rerun with -e auto_save=true or manually execute 'write memory'.
+          when:
+            - has_drift | bool
+            - not (auto_save | bool)
+
+      rescue:
+        - name: Record failure details
+          ansible.builtin.debug:
+            msg:
+              - "FAILED: {{ inventory_hostname }}"
+              - "Task: {{ ansible_failed_task.name }}"
+              - "Error: {{ ansible_failed_result.msg | default('see stdout above') }}"
+
+        - name: Abort this host gracefully
+          ansible.builtin.meta: end_host
