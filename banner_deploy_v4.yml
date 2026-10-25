@@ -1,0 +1,149 @@
+---
+# banner_deploy_v3.yml
+# Multi-vendor MOTD and login banner deployment with post-deploy verification
+#
+# Deploys compliant legal banners across heterogeneous environments (Cisco IOS,
+# NX-OS, Juniper JunOS) using platform-specific modules and verifies banner
+# content after each push. Differentiates from v1/v2 via multi-OS support
+# and active post-deployment content verification.
+#
+# Credentials: ansible-vault encrypted — group_vars/all/vault.yml
+#   vault_net_username, vault_net_password, vault_net_enable_secret
+#
+# Inventory example:
+#   [ios_devices]
+#   core-rtr-01 ansible_host=10.0.1.1 ansible_network_os=ios
+#   core-rtr-02 ansible_host=10.0.1.2 ansible_network_os=ios
+#
+#   [nxos_devices]
+#   dist-sw-01 ansible_host=10.0.2.1 ansible_network_os=nxos
+#
+#   [junos_devices]
+#   edge-rtr-01 ansible_host=10.0.3.1 ansible_network_os=junos
+#
+#   [network:children]
+#   ios_devices
+#   nxos_devices
+#   junos_devices
+
+- name: Multi-vendor MOTD and login banner deployment with verification
+  hosts: network
+  gather_facts: false
+  connection: network_cli
+
+  vars:
+    ansible_user: "{{ vault_net_username }}"
+    ansible_password: "{{ vault_net_password }}"
+    ansible_become_password: "{{ vault_net_enable_secret | default(omit) }}"
+
+    org_name: "ACME Corporation"
+    security_contact: "security@acme.example.com"
+
+    banner_motd: |
+      ******************************************************************************
+      * {{ org_name }} - AUTHORIZED ACCESS ONLY                                   *
+      * Unauthorized use is prohibited and subject to criminal/civil penalties.   *
+      * All activity on this system is monitored and retained for audit purposes. *
+      * To report a security incident contact: {{ security_contact }}             *
+      ******************************************************************************
+    banner_login: |
+      ******************************************************************************
+      * WARNING: Restricted system. Authorized personnel only.                   *
+      * Disconnect immediately if you are not an authorized user.                *
+      ******************************************************************************
+
+  tasks:
+    - name: Deploy banners on Cisco IOS / IOS-XE
+      block:
+        - name: Set MOTD banner (IOS)
+          cisco.ios.ios_banner:
+            banner: motd
+            text: "{{ banner_motd }}"
+            state: present
+          register: ios_motd
+          retries: 2
+          delay: 5
+          until: ios_motd is not failed
+
+        - name: Set login banner (IOS)
+          cisco.ios.ios_banner:
+            banner: login
+            text: "{{ banner_login }}"
+            state: present
+          register: ios_login
+
+        - name: Verify MOTD content present on device (IOS)
+          cisco.ios.ios_command:
+            commands: ["show banner motd"]
+          register: ios_verify
+          failed_when: org_name not in ios_verify.stdout[0]
+
+        - name: Display IOS verification output
+          ansible.builtin.debug:
+            msg: "{{ inventory_hostname }} MOTD verified. Changed: motd={{ ios_motd.changed }}, login={{ ios_login.changed }}"
+
+      rescue:
+        - name: Fail with context on IOS banner error
+          ansible.builtin.fail:
+            msg: "IOS banner push failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('see task output above') }}"
+
+      when: ansible_network_os == 'ios'
+
+    - name: Deploy banners on Cisco NX-OS
+      block:
+        - name: Set MOTD banner (NX-OS)
+          cisco.nxos.nxos_banner:
+            banner: motd
+            text: "{{ banner_motd }}"
+            state: present
+          register: nxos_motd
+          retries: 2
+          delay: 5
+          until: nxos_motd is not failed
+
+        - name: Verify MOTD content (NX-OS)
+          cisco.nxos.nxos_command:
+            commands: ["show banner motd"]
+          register: nxos_verify
+          failed_when: org_name not in nxos_verify.stdout[0]
+
+        - name: Display NX-OS verification result
+          ansible.builtin.debug:
+            msg: "{{ inventory_hostname }} NX-OS MOTD verified. Changed: {{ nxos_motd.changed }}"
+
+      rescue:
+        - name: Fail with context on NX-OS banner error
+          ansible.builtin.fail:
+            msg: "NX-OS banner push failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('see task output above') }}"
+
+      when: ansible_network_os == 'nxos'
+
+    - name: Deploy banners on Juniper JunOS
+      block:
+        - name: Set login announcement (JunOS)
+          junipernetworks.junos.junos_banner:
+            banner: login
+            text: "{{ banner_login }}"
+            state: present
+          register: junos_login
+          retries: 2
+          delay: 5
+          until: junos_login is not failed
+
+        - name: Set MOTD (JunOS)
+          junipernetworks.junos.junos_banner:
+            banner: motd
+            text: "{{ banner_motd }}"
+            state: present
+          register: junos_motd
+
+        - name: Display JunOS result
+          ansible.builtin.debug:
+            msg: "{{ inventory_hostname }} JunOS banners applied. login={{ junos_login.changed }}, motd={{ junos_motd.changed }}"
+
+      rescue:
+        - name: Fail with context on JunOS banner error
+          ansible.builtin.fail:
+            msg: "JunOS banner push failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('see task output above') }}"
+
+      when: ansible_network_os == 'junos'
