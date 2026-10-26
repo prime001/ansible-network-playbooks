@@ -1,0 +1,144 @@
+---
+# Port Channel / Link Aggregation Configuration Playbook
+# Configures port channels (LAG/EtherChannel) across network device types
+# Supports: Cisco IOS, IOS-XR, NXOS, and Juniper Junos devices
+
+- name: Deploy Port Channel Configuration on Network Devices
+  hosts: network_devices
+  gather_facts: no
+  connection: network_cli
+  
+  vars:
+    # Device credentials stored in vault: ansible-vault create group_vars/network_devices/vault.yml
+    # ansible_user: "{{ vault_network_username }}"
+    # ansible_password: "{{ vault_network_password }}"
+    
+    port_channel_config:
+      ios:
+        - name: "Port-channel1"
+          description: "Uplink to Core"
+          members: ["GigabitEthernet0/0/0", "GigabitEthernet0/0/1"]
+          lacp_mode: "active"
+      nxos:
+        - name: "port-channel1"
+          description: "Uplink to Core"
+          members: ["Ethernet1/1", "Ethernet1/2"]
+          lacp_mode: "active"
+  
+  tasks:
+    - name: Gather network device facts
+      gather_network_resources:
+        resources: interfaces
+      register: device_facts
+      ignore_errors: yes
+    
+    - name: Configure port channel on Cisco IOS devices
+      block:
+        - name: Create IOS port channel interface
+          ios_config:
+            lines:
+              - "description {{ item.description }}"
+              - "no shutdown"
+            parents: "interface {{ item.name }}"
+          loop: "{{ port_channel_config.ios }}"
+          register: ios_pc_created
+          when: ansible_network_os == 'ios'
+        
+        - name: Configure IOS member interfaces
+          ios_config:
+            lines:
+              - "channel-group 1 mode {{ item[1].lacp_mode }}"
+              - "no shutdown"
+            parents: "interface {{ item[0] }}"
+          loop: "{{ port_channel_config.ios[0].members | product(['dummy']) | list }}"
+          loop_control:
+            index_var: idx
+          vars:
+            pc_config: "{{ port_channel_config.ios[0] }}"
+            member_interface: "{{ item[0] }}"
+          register: ios_members_added
+          retries: 3
+          delay: 5
+          until: ios_members_added is not failed
+          when: ansible_network_os == 'ios'
+      
+      rescue:
+        - name: Log IOS port channel configuration error
+          debug:
+            msg: "Failed to configure port channel on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('Unknown error') }}"
+    
+    - name: Configure port channel on NXOS devices
+      block:
+        - name: Create NXOS port channel
+          nxos_config:
+            lines:
+              - "description {{ item.description }}"
+              - "no shutdown"
+            parents: "interface {{ item.name }}"
+          loop: "{{ port_channel_config.nxos }}"
+          register: nxos_pc_created
+          when: ansible_network_os == 'nxos'
+        
+        - name: Configure NXOS member interfaces
+          nxos_config:
+            lines:
+              - "channel-group 1 force mode {{ port_channel_config.nxos[0].lacp_mode }}"
+              - "no shutdown"
+            parents: "interface {{ member_int }}"
+          loop: "{{ port_channel_config.nxos[0].members }}"
+          loop_control:
+            loop_var: member_int
+          register: nxos_members_added
+          retries: 3
+          delay: 5
+          until: nxos_members_added is not failed
+          when: ansible_network_os == 'nxos'
+      
+      rescue:
+        - name: Log NXOS port channel configuration error
+          debug:
+            msg: "Failed to configure port channel on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('Unknown error') }}"
+    
+    - name: Verify port channel status
+      block:
+        - name: Verify IOS port channel
+          ios_command:
+            commands: "show interfaces port-channel summary"
+          register: ios_pc_status
+          when: ansible_network_os == 'ios'
+        
+        - name: Verify NXOS port channel
+          nxos_command:
+            commands: "show port-channel summary"
+          register: nxos_pc_status
+          when: ansible_network_os == 'nxos'
+      
+      rescue:
+        - name: Handle verification failure
+          debug:
+            msg: "Port channel verification failed on {{ inventory_hostname }}"
+    
+    - name: Display port channel configuration results
+      debug:
+        msg: |
+          Port Channel Configuration Report
+          ==================================
+          Device: {{ inventory_hostname }}
+          Network OS: {{ ansible_network_os }}
+          Config Changed: {{ ios_pc_created.changed | default(nxos_pc_created.changed) | default(false) }}
+          IOS Status: {{ ios_pc_status.stdout | default('N/A') }}
+          NXOS Status: {{ nxos_pc_status.stdout | default('N/A') }}
+
+# Inventory Example:
+# [network_devices]
+# core-switch-01 ansible_host=192.168.1.10 ansible_network_os=ios
+# core-switch-02 ansible_host=192.168.1.20 ansible_network_os=nxos
+# access-switch-01 ansible_host=192.168.1.30 ansible_network_os=iosxr
+# juniper-gateway ansible_host=192.168.1.40 ansible_network_os=junos
+#
+# [network_devices:vars]
+# ansible_user=admin
+# ansible_password={{ vault_network_password }}
+# ansible_connection=network_cli
+# ansible_become=yes
+# ansible_become_method=enable
