@@ -1,0 +1,115 @@
+```yaml
+---
+# AAA Authentication Infrastructure Playbook
+# Configures TACACS+/RADIUS server groups and AAA policies on Cisco IOS devices.
+# Local user accounts: see user_management.yml / user_management_v2.yml
+#
+# Inventory example:
+#   [core_routers]
+#   rtr-core-01 ansible_host=192.168.1.1
+#   rtr-core-02 ansible_host=192.168.1.2
+#
+#   [core_routers:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_net_user }}        # vars/vault.yml (ansible-vault encrypted)
+#   ansible_password={{ vault_net_password }}
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_enable_secret }}
+
+- name: Configure AAA authentication (TACACS+/RADIUS) on IOS devices
+  hosts: core_routers
+  gather_facts: false
+
+  vars:
+    tacacs_servers:
+      - name: tac-primary
+        host: 10.0.0.10
+        key: "{{ vault_tacacs_key }}"         # ansible-vault encrypted
+        timeout: 5
+      - name: tac-secondary
+        host: 10.0.0.11
+        key: "{{ vault_tacacs_key }}"
+        timeout: 5
+    radius_server:
+      host: 10.0.0.20
+      auth_port: 1812
+      acct_port: 1813
+      key: "{{ vault_radius_key }}"           # ansible-vault encrypted
+    aaa_local_fallback: true
+
+  tasks:
+    - name: Apply AAA configuration block
+      block:
+        - name: Enable AAA new-model and configure TACACS+ servers
+          cisco.ios.ios_config:
+            lines:
+              - "aaa new-model"
+              - "tacacs server {{ item.name }}"
+              - " address ipv4 {{ item.host }}"
+              - " key {{ item.key }}"
+              - " timeout {{ item.timeout }}"
+          loop: "{{ tacacs_servers }}"
+          register: tacacs_result
+          retries: 2
+          delay: 5
+          until: tacacs_result is not failed
+
+        - name: Configure RADIUS server
+          cisco.ios.ios_config:
+            lines:
+              - "radius server RADIUS-PRIMARY"
+              - " address ipv4 {{ radius_server.host }} auth-port {{ radius_server.auth_port }} acct-port {{ radius_server.acct_port }}"
+              - " key {{ radius_server.key }}"
+          register: radius_result
+
+        - name: Configure AAA server groups and authentication/authorization policies
+          cisco.ios.ios_config:
+            lines:
+              - "aaa group server tacacs+ TACACS-GROUP"
+              - " server name tac-primary"
+              - " server name tac-secondary"
+              - "aaa authentication login default group TACACS-GROUP{{ ' local' if aaa_local_fallback else '' }}"
+              - "aaa authentication enable default group TACACS-GROUP enable"
+              - "aaa authorization exec default group TACACS-GROUP{{ ' local' if aaa_local_fallback else '' }}"
+              - "aaa authorization commands 15 default group TACACS-GROUP none"
+              - "aaa accounting exec default start-stop group TACACS-GROUP"
+              - "aaa accounting commands 15 default start-stop group TACACS-GROUP"
+          register: aaa_policy_result
+          failed_when:
+            - aaa_policy_result.failed
+            - "'% Invalid' in (aaa_policy_result.msg | default(''))"
+
+        - name: Verify TACACS+ server reachability
+          cisco.ios.ios_command:
+            commands: "test aaa group TACACS-GROUP {{ vault_net_user }} {{ vault_net_password }} legacy"
+          register: aaa_test
+          failed_when: "'PASS' not in aaa_test.stdout[0]"
+          ignore_errors: true
+
+        - name: Display AAA test result
+          ansible.builtin.debug:
+            msg: "AAA server test: {{ 'PASS' if 'PASS' in (aaa_test.stdout[0] | default('')) else 'FAIL or skipped' }}"
+
+      rescue:
+        - name: Log AAA configuration failure
+          ansible.builtin.debug:
+            msg: >
+              AAA configuration failed on {{ inventory_hostname }}.
+              TACACS result: {{ tacacs_result | default('not run') }}.
+              Verify server IPs and vault_tacacs_key are correct.
+
+        - name: Fail with clear message
+          ansible.builtin.fail:
+            msg: "AAA configuration aborted on {{ inventory_hostname }} — manual remediation required."
+
+    - name: Show running AAA config for audit trail
+      cisco.ios.ios_command:
+        commands: "show running-config | section ^aaa"
+      register: aaa_running_config
+
+    - name: Display AAA running configuration
+      ansible.builtin.debug:
+        var: aaa_running_config.stdout_lines
+```
