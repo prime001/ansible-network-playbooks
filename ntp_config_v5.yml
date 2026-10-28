@@ -1,0 +1,109 @@
+---
+# Ansible Playbook: NTP Authentication Hardening
+#
+# Configures NTP MD5 authentication and access-group restrictions on Cisco IOS.
+# Pairs with ntp_config.yml (basic server config) — this layer adds crypto auth
+# and access control to harden against rogue NTP sources.
+#
+# Credentials: reference an Ansible Vault file, e.g.:
+#   ansible-vault create group_vars/all/vault.yml
+#   vault vars: vault_ansible_user, vault_ansible_password, vault_enable_password
+#
+# Inventory example:
+#   [core_routers]
+#   rtr-01 ansible_host=10.0.1.1
+#   rtr-02 ansible_host=10.0.1.2
+#
+#   [core_routers:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_ansible_user }}
+#   ansible_password={{ vault_ansible_password }}
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_enable_password }}
+
+- name: Harden NTP with MD5 authentication and access-group restrictions
+  hosts: core_routers
+  gather_facts: false
+
+  vars:
+    ntp_auth_key_id: 1
+    # ntp_auth_key_secret loaded from vault: vault_ntp_md5_key
+    ntp_trusted_servers:
+      - 10.0.0.10
+      - 10.0.0.11
+    ntp_acl_name: "NTP_PERMIT"
+    ntp_acl_permit_src: "10.0.0.0 0.0.0.255"
+
+  tasks:
+    - name: Apply NTP authentication and access-group config
+      block:
+        - name: Configure NTP MD5 key, authentication, and access restrictions
+          cisco.ios.ios_config:
+            lines:
+              - "ntp authenticate"
+              - "ntp authentication-key {{ ntp_auth_key_id }} md5 {{ vault_ntp_md5_key }}"
+              - "ntp trusted-key {{ ntp_auth_key_id }}"
+            save_when: changed
+
+        - name: Configure NTP ACL to restrict query sources
+          cisco.ios.ios_config:
+            lines:
+              - "permit {{ ntp_acl_permit_src }}"
+            parents: "ip access-list standard {{ ntp_acl_name }}"
+            save_when: changed
+
+        - name: Bind NTP servers with authentication key
+          cisco.ios.ios_config:
+            lines:
+              - "ntp server {{ item }} key {{ ntp_auth_key_id }}"
+            save_when: changed
+          loop: "{{ ntp_trusted_servers }}"
+
+        - name: Apply NTP access-group to restrict queries
+          cisco.ios.ios_config:
+            lines:
+              - "ntp access-group peer {{ ntp_acl_name }}"
+              - "ntp access-group serve-only {{ ntp_acl_name }}"
+            save_when: changed
+
+        - name: Verify NTP authentication status
+          cisco.ios.ios_command:
+            commands:
+              - show ntp status
+              - show ntp associations detail
+            wait_for:
+              - result[0] contains "Clock is"
+            retries: 3
+            interval: 10
+          register: ntp_auth_status
+          failed_when: "'unsynchronised' in ntp_auth_status.stdout[0] and 'Clock is synchronized' not in ntp_auth_status.stdout[0]"
+
+      rescue:
+        - name: Log failure and collect diagnostic output
+          cisco.ios.ios_command:
+            commands:
+              - show ntp status
+              - show ntp associations
+              - show running-config | section ntp
+          register: ntp_diag
+          ignore_errors: true
+
+        - name: Report NTP hardening failure with diagnostics
+          ansible.builtin.debug:
+            msg:
+              - "NTP hardening FAILED on {{ inventory_hostname }}"
+              - "NTP status: {{ ntp_diag.stdout[0] | default('unavailable') }}"
+              - "NTP associations: {{ ntp_diag.stdout[1] | default('unavailable') }}"
+
+        - name: Fail the play after capturing diagnostics
+          ansible.builtin.fail:
+            msg: "NTP authentication hardening failed on {{ inventory_hostname }} — see diagnostics above"
+
+    - name: Display NTP authentication verification results
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "NTP Status: {{ ntp_auth_status.stdout[0] }}"
+          - "Association Detail: {{ ntp_auth_status.stdout[1] }}
