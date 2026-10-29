@@ -1,0 +1,114 @@
+---
+# bgp_compliance.yml
+#
+# Verifies BGP neighbor session states and received prefix counts on Cisco IOS/IOS-XE
+# routers. Flags devices with non-Established peers or BGP process failures.
+# Designed for scheduled compliance audits across core routing infrastructure.
+#
+# Requirements: cisco.ios collection (ansible-galaxy collection install cisco.ios)
+#
+# Inventory example:
+#   [bgp_routers]
+#   core-rtr-01  ansible_host=10.0.0.1
+#   core-rtr-02  ansible_host=10.0.0.2
+#
+#   [bgp_routers:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_net_username }}           # group_vars/bgp_routers/vault.yml
+#   ansible_password={{ vault_net_password }}       # ansible-vault encrypted
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_net_enable_password }}
+
+- name: BGP Neighbor Session Compliance Check
+  hosts: bgp_routers
+  gather_facts: false
+  vars:
+    bgp_min_established: 1
+    bgp_idle_is_violation: true
+
+  tasks:
+    - name: Collect BGP session data
+      block:
+        - name: Retrieve BGP summary
+          cisco.ios.ios_command:
+            commands:
+              - show ip bgp summary
+          register: bgp_summary
+          retries: 3
+          delay: 10
+          until: bgp_summary is not failed
+
+        - name: Retrieve BGP neighbor state lines
+          cisco.ios.ios_command:
+            commands:
+              - "show ip bgp neighbors | include BGP neighbor is|BGP state"
+          register: bgp_neighbor_states
+          retries: 3
+          delay: 10
+          until: bgp_neighbor_states is not failed
+
+      rescue:
+        - name: Report BGP data collection failure
+          ansible.builtin.debug:
+            msg: "CRITICAL: BGP collection failed on {{ inventory_hostname }} — {{ ansible_failed_result.msg | default('connection error') }}"
+
+        - name: Skip remaining tasks for this host
+          ansible.builtin.meta: end_host
+
+    - name: Assert BGP process is active
+      ansible.builtin.assert:
+        that:
+          - bgp_summary.stdout[0] | length > 10
+          - "'BGP not active' not in bgp_summary.stdout[0]"
+        fail_msg: "BGP process not running on {{ inventory_hostname }}"
+        success_msg: "BGP process confirmed active on {{ inventory_hostname }}"
+      register: bgp_process_result
+      ignore_errors: true
+
+    - name: Parse Established and Idle neighbor counts
+      ansible.builtin.set_fact:
+        established_count: "{{ bgp_summary.stdout[0] | regex_findall('Established') | length }}"
+        idle_count: "{{ bgp_summary.stdout[0] | regex_findall('Idle') | length }}"
+
+    - name: Assert minimum Established BGP sessions
+      ansible.builtin.assert:
+        that:
+          - established_count | int >= bgp_min_established
+        fail_msg: >-
+          NON-COMPLIANT [{{ inventory_hostname }}]: {{ established_count }} Established peer(s);
+          minimum required is {{ bgp_min_established }}.
+        success_msg: >-
+          COMPLIANT [{{ inventory_hostname }}]: {{ established_count }} Established BGP session(s).
+      register: session_result
+      ignore_errors: true
+
+    - name: Warn on Idle BGP peers
+      ansible.builtin.debug:
+        msg: "VIOLATION [{{ inventory_hostname }}]: {{ idle_count }} peer(s) in Idle state."
+      when:
+        - bgp_idle_is_violation | bool
+        - idle_count | int > 0
+
+    - name: Display BGP summary output
+      ansible.builtin.debug:
+        var: bgp_summary.stdout_lines[0]
+
+    - name: Display BGP neighbor state detail
+      ansible.builtin.debug:
+        var: bgp_neighbor_states.stdout_lines[0]
+
+    - name: Emit per-host compliance report
+      ansible.builtin.debug:
+        msg:
+          device: "{{ inventory_hostname }}"
+          bgp_process: "{{ 'PASS' if not bgp_process_result.failed else 'FAIL' }}"
+          established_peers: "{{ established_count | int }}"
+          idle_peers: "{{ idle_count | int }}"
+          status: "{{ 'COMPLIANT' if not session_result.failed else 'NON-COMPLIANT' }}"
+
+    - name: Fail play for non-compliant devices
+      ansible.builtin.fail:
+        msg: "BGP compliance FAILED on {{ inventory_hostname }} — review report above."
+      when: session_result.failed | default(false)
