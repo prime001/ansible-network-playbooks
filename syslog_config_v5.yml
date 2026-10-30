@@ -1,0 +1,100 @@
+---
+# Ansible Playbook: Buffered Logging and Console Log Management
+#
+# Configures local logging buffers, per-facility severity levels,
+# and logging rate-limits on IOS/IOS-XE devices. This complements
+# remote syslog server configuration by hardening on-device log
+# retention and noise control.
+#
+# Credentials: store ansible_user and ansible_password in Ansible Vault
+#   ansible-vault encrypt_string 'secret' --name 'ansible_password'
+#
+# Inventory example:
+#   [core_switches]
+#   sw-core-01 ansible_host=10.0.1.1
+#   sw-core-02 ansible_host=10.0.1.2
+#
+#   [core_switches:vars]
+#   ansible_network_os=ios
+#   ansible_connection=network_cli
+#   ansible_user={{ vault_net_user }}
+#   ansible_password={{ vault_net_password }}
+#   ansible_become=yes
+#   ansible_become_method=enable
+#   ansible_become_password={{ vault_enable_password }}
+
+- name: Configure buffered logging, console severity, and rate-limiting on IOS devices
+  hosts: core_switches
+  gather_facts: false
+
+  vars:
+    log_buffer_size: 65536
+    log_buffer_severity: debugging
+    log_console_severity: warnings
+    log_monitor_severity: informational
+    # Rate-limit: max messages per interval to prevent log flooding
+    log_rate_limit_per_second: 100
+    log_rate_limit_except_severity: critical
+    # Facility alignment with syslog server (set in syslog_config.yml)
+    log_facility: local6
+
+  tasks:
+    - name: Gather current logging state
+      cisco.ios.ios_command:
+        commands:
+          - show logging
+          - show logging count
+      register: logging_current_state
+      retries: 2
+      delay: 5
+
+    - name: Display current logging configuration
+      ansible.builtin.debug:
+        msg: "{{ logging_current_state.stdout_lines[0][:30] }}"
+
+    - name: Apply buffered logging and facility configuration
+      block:
+        - name: Set log buffer size, severity levels, and facility
+          cisco.ios.ios_config:
+            lines:
+              - "logging buffered {{ log_buffer_size }} {{ log_buffer_severity }}"
+              - "logging console {{ log_console_severity }}"
+              - "logging monitor {{ log_monitor_severity }}"
+              - "logging facility {{ log_facility }}"
+              - "logging rate-limit {{ log_rate_limit_per_second }} except {{ log_rate_limit_except_severity }}"
+            save_when: changed
+
+        - name: Verify buffer size took effect
+          cisco.ios.ios_command:
+            commands:
+              - show logging | include Buffer logging|buffer
+          register: buffer_verify
+          failed_when:
+            - buffer_verify.stdout[0] is not search(log_buffer_size | string)
+
+        - name: Clear log buffer to start fresh after config change
+          cisco.ios.ios_command:
+            commands:
+              - clear logging
+          when: buffer_verify is changed
+
+      rescue:
+        - name: Log configuration failure
+          ansible.builtin.debug:
+            msg: >
+              FAILED to apply logging config on {{ inventory_hostname }}.
+              Error: {{ ansible_failed_result.msg | default('unknown') }}
+
+        - name: Fail the play with descriptive message
+          ansible.builtin.fail:
+            msg: "Logging configuration failed on {{ inventory_hostname }}. Manual review required."
+
+    - name: Confirm final logging state
+      cisco.ios.ios_command:
+        commands:
+          - show logging | include Syslog logging|Console logging|Buffer logging|Trap logging|Facility
+      register: final_logging_summary
+
+    - name: Display final logging summary
+      ansible.builtin.debug:
+        var: final_logging_summary.stdout_lines
